@@ -67,10 +67,13 @@ class ActorCritic(nn.Module):
 
 
 class TeacherGoalPolicy(nn.Module):
-    """Maps an observation to a bounded goal delta.
+    """Stochastic PPO policy that maps an observation to a goal delta.
 
-    The actual goal is ``reference_obs + delta``. The network output is squashed
-    so that each delta component lies in ``[delta_low, delta_high]``.
+    The actor outputs a Gaussian over an unbounded raw delta; the raw sample is
+    squashed externally (see ``_squash_delta``) so that each delta component lies
+    in ``[delta_low, delta_high]`` and the actual goal is ``reference_obs + delta``.
+    PPO trains on the raw (pre-squash) action, mirroring how the student uses the
+    ``ClipAction`` wrapper.
     """
 
     obs_dim: int
@@ -117,13 +120,11 @@ class TeacherGoalPolicy(nn.Module):
             256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_h)
         actor_h = activation(actor_h)
-        raw = nn.Dense(
+        actor_mean = nn.Dense(
             self.obs_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_h)
-        # Squash to [delta_low, delta_high].
-        delta = self.delta_low + (self.delta_high - self.delta_low) * 0.5 * (
-            jnp.tanh(raw) + 1.0
-        )
+        actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.obs_dim,))
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
         critic_h = nn.Dense(
             256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic_in)
@@ -135,7 +136,7 @@ class TeacherGoalPolicy(nn.Module):
         value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic_h
         )
-        return delta, jnp.squeeze(value, axis=-1)
+        return pi, jnp.squeeze(value, axis=-1)
 
 
 class Transition(NamedTuple):
@@ -146,6 +147,26 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
+
+
+class TeacherTransition(NamedTuple):
+    """One teacher transition = one completed student episode."""
+
+    done: jnp.ndarray
+    action: jnp.ndarray  # raw (pre-squash) delta
+    value: jnp.ndarray
+    reward: jnp.ndarray  # learning progress for that episode
+    log_prob: jnp.ndarray
+    obs: jnp.ndarray  # teacher input = [reference_obs, avg_success_rate]
+
+
+class PendingTeacher(NamedTuple):
+    """Per-env components of the goal proposal currently active for an episode."""
+
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    value: jnp.ndarray
+    log_prob: jnp.ndarray
 
 
 def make_train(config):
@@ -202,11 +223,34 @@ def make_train(config):
     teacher_num_probing_states = int(config.get("TEACHER_NUM_PROBING_STATES", 8))
     teacher_probe_agg = config.get("TEACHER_PROBE_AGG", "mean")
 
+    # Teacher PPO hyper-parameters. The teacher acts on the student-episode
+    # timeline: one transition per completed student episode and one teacher
+    # episode (== one teacher rollout) every TEACHER_EPISODE_LENGTH episodes.
+    teacher_episode_length = int(config.get("TEACHER_EPISODE_LENGTH", 8))
+    if teacher_episode_length < 1:
+        raise ValueError("TEACHER_EPISODE_LENGTH must be >= 1")
+    teacher_lr = config.get("TEACHER_LR", config["LR"])
+    teacher_gamma = config.get("TEACHER_GAMMA", config["GAMMA"])
+    teacher_gae_lambda = config.get("TEACHER_GAE_LAMBDA", config["GAE_LAMBDA"])
+    teacher_clip_eps = config.get("TEACHER_CLIP_EPS", config["CLIP_EPS"])
+    teacher_ent_coef = config.get("TEACHER_ENT_COEF", config["ENT_COEF"])
+    teacher_vf_coef = config.get("TEACHER_VF_COEF", config["VF_COEF"])
+    teacher_max_grad_norm = config.get("TEACHER_MAX_GRAD_NORM", config["MAX_GRAD_NORM"])
+    teacher_update_epochs = int(config.get("TEACHER_UPDATE_EPOCHS", config["UPDATE_EPOCHS"]))
+    teacher_num_minibatches = int(config.get("TEACHER_NUM_MINIBATCHES", 1))
+    teacher_batch_size = teacher_episode_length * config["NUM_ENVS"]
+    if teacher_batch_size % teacher_num_minibatches != 0:
+        raise ValueError(
+            "TEACHER_EPISODE_LENGTH * NUM_ENVS must be divisible by "
+            "TEACHER_NUM_MINIBATCHES"
+        )
+    config["TEACHER_MINIBATCH_SIZE"] = teacher_batch_size // teacher_num_minibatches
+
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"]
     )
 
-    # Frozen teacher policy: maps a reference observation to a bounded goal delta.
+    # Trainable teacher policy: maps a reference observation to a goal delta.
     teacher_network = TeacherGoalPolicy(
         obs_dim=base_obs_dim,
         student_obs_dim=policy_obs_dim,
@@ -224,21 +268,47 @@ def make_train(config):
         teacher_rng, jnp.zeros((base_obs_dim + 1,)), network.apply, dummy_student_params
     )
 
-    def _teacher_goals(reference_obs, avg_success_rate, student_params):
-        """Generate goals as ``reference_obs + teacher_delta(reference_obs)``."""
+    def _teacher_input(reference_obs, avg_success_rate):
+        """Build the teacher observation ``[reference_obs, avg_success_rate]``."""
         avg_success_rate = jnp.asarray(avg_success_rate, dtype=reference_obs.dtype)
         if reference_obs.ndim == 1:
-            teacher_input = jnp.concatenate(
+            return jnp.concatenate(
                 [reference_obs, jnp.reshape(avg_success_rate, (1,))], axis=-1
             )
-        else:
-            teacher_input = jnp.concatenate(
-                [reference_obs, avg_success_rate[..., None]], axis=-1
-            )
-        delta, _ = teacher_network.apply(
+        return jnp.concatenate([reference_obs, avg_success_rate[..., None]], axis=-1)
+
+    def _squash_delta(raw):
+        """Squash an unbounded raw delta into ``[delta_low, delta_high]``."""
+        return teacher_delta_low + (teacher_delta_high - teacher_delta_low) * 0.5 * (
+            jnp.tanh(raw) + 1.0
+        )
+
+    def _teacher_apply(teacher_params, teacher_input, student_params):
+        return teacher_network.apply(
             teacher_params, teacher_input, network.apply, student_params
         )
-        return reference_obs + delta
+
+    def _teacher_sample(
+        teacher_params, reference_obs, avg_success_rate, student_params, rng
+    ):
+        """Sample a goal from the teacher policy.
+
+        Returns ``(goal, teacher_input, raw_action, log_prob, value)`` so the
+        proposal can be stored as a PPO transition.
+        """
+        teacher_input = _teacher_input(reference_obs, avg_success_rate)
+        pi, value = _teacher_apply(teacher_params, teacher_input, student_params)
+        raw_action = pi.sample(seed=rng)
+        log_prob = pi.log_prob(raw_action)
+        goal = reference_obs + _squash_delta(raw_action)
+        return goal, teacher_input, raw_action, log_prob, value
+
+    def _teacher_goal_det(teacher_params, reference_obs, avg_success_rate, student_params):
+        """Deterministic goal (uses the policy mean) for eval/rendering."""
+        pi, _ = _teacher_apply(
+            teacher_params, _teacher_input(reference_obs, avg_success_rate), student_params
+        )
+        return reference_obs + _squash_delta(pi.mean())
 
     def _concat_goal(obs, goals):
         if not goal_conditioned:
@@ -296,11 +366,11 @@ def make_train(config):
         pi, _ = network.apply(params, policy_obs)
         return jnp.clip(pi.mean(), action_low, action_high)
 
-    def _render_rollout_impl(params, rng, obs_mean, obs_var):
+    def _render_rollout_impl(params, teacher_params, rng, obs_mean, obs_var):
         rng, reset_rng = jax.random.split(rng)
         state = base_env.reset(reset_rng)
         norm_obs0 = _normalize_eval_obs(state.obs, obs_mean, obs_var)
-        eval_goal = _teacher_goals(norm_obs0, 0.0, params)
+        eval_goal = _teacher_goal_det(teacher_params, norm_obs0, 0.0, params)
 
         def step_fn(carry, _):
             state, goal = carry
@@ -316,7 +386,11 @@ def make_train(config):
             norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
             goal_dist = jnp.sqrt(jnp.sum(jnp.square(norm_obs - goal)))
             reached = goal_dist <= goal_reached_threshold
-            goal = jnp.where(reached, _teacher_goals(norm_obs, 0.0, params), goal)
+            goal = jnp.where(
+                reached,
+                _teacher_goal_det(teacher_params, norm_obs, 0.0, params),
+                goal,
+            )
             return (state, goal), state.pipeline_state
 
         _, pipeline_states = jax.lax.scan(
@@ -340,13 +414,15 @@ def make_train(config):
             for i in range(n)
         ]
 
-    def render_eval_episode(params, rng, final_env_state):
+    def render_eval_episode(params, teacher_params, rng, final_env_state):
         """Runs one eval rollout and logs rendered HTML to wandb."""
         if config.get("WANDB_MODE", "disabled") != "online":
             return
         try:
             obs_mean, obs_var = _obs_norm_stats_for_render(final_env_state)
-            pipeline_states = _run_render_rollout(params, rng, obs_mean, obs_var)
+            pipeline_states = _run_render_rollout(
+                params, teacher_params, rng, obs_mean, obs_var
+            )
             pipeline_states = _subsample_pipeline_states(
                 pipeline_states, render_max_frames
             )
@@ -401,13 +477,56 @@ def make_train(config):
             tx=tx,
         )
 
+        # INIT TEACHER (PPO agent operating on the student-episode timeline)
+        teacher_tx = optax.chain(
+            optax.clip_by_global_norm(teacher_max_grad_norm),
+            optax.adam(teacher_lr, eps=1e-5),
+        )
+        teacher_train_state = TrainState.create(
+            apply_fn=teacher_network.apply,
+            params=teacher_params,
+            tx=teacher_tx,
+        )
+
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
         avg_success_rate = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
-        # Teacher generates the initial goal from each env's initial observation.
-        goal_batch = _teacher_goals(obsv, avg_success_rate, train_state.params)
+        # Teacher proposes the initial goal (sampled) from each env's initial obs.
+        rng, _rng = jax.random.split(rng)
+        teacher_rng, sample_rng = jax.random.split(_rng)
+        (
+            goal_batch,
+            init_t_obs,
+            init_t_action,
+            init_t_log_prob,
+            init_t_value,
+        ) = _teacher_sample(
+            teacher_train_state.params,
+            obsv,
+            avg_success_rate,
+            train_state.params,
+            sample_rng,
+        )
+        pending = PendingTeacher(
+            obs=init_t_obs,
+            action=init_t_action,
+            value=init_t_value,
+            log_prob=init_t_log_prob,
+        )
+        # Teacher rollout buffer: one slot per completed student episode, plus a
+        # trailing padding row that absorbs out-of-bounds / invalid writes.
+        _buf_rows = teacher_episode_length + 1
+        teacher_buffer = TeacherTransition(
+            done=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
+            action=jnp.zeros((_buf_rows, config["NUM_ENVS"], base_obs_dim)),
+            value=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
+            reward=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
+            log_prob=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
+            obs=jnp.zeros((_buf_rows, config["NUM_ENVS"], base_obs_dim + 1)),
+        )
+        teacher_buffer_count = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
 
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
@@ -425,6 +544,11 @@ def make_train(config):
                     prev_episode_success,
                     prev_goal_ep_return,
                     rng,
+                    teacher_train_state,
+                    teacher_buffer,
+                    teacher_buffer_count,
+                    pending,
+                    teacher_rng,
                 ) = runner_state
 
                 # SELECT ACTION
@@ -465,7 +589,20 @@ def make_train(config):
                         done_mask, updated_avg_success_rate, avg_success_rate
                     )
                     refresh = sample_on_done
-                    new_goals = _teacher_goals(obsv, avg_success_rate, train_state.params)
+                    teacher_rng, sample_rng = jax.random.split(teacher_rng)
+                    (
+                        new_goals,
+                        new_t_obs,
+                        new_t_action,
+                        new_t_log_prob,
+                        new_t_value,
+                    ) = _teacher_sample(
+                        teacher_train_state.params,
+                        obsv,
+                        avg_success_rate,
+                        train_state.params,
+                        sample_rng,
+                    )
                     goal_batch = jnp.where(refresh[:, None], new_goals, goal_batch)
                     episode_counts = completed_episode_counts
                     reached_any_in_episode = jnp.where(
@@ -506,6 +643,50 @@ def make_train(config):
                 prev_goal_ep_return = jnp.where(
                     done_mask, current_goal_return, prev_goal_ep_return
                 )
+
+                if goal_conditioned:
+                    # TEACHER COLLECTION: emit one transition per env that just
+                    # completed an episode, using the proposal that was active
+                    # during it (the current `pending`). Writes land at row=count
+                    # for that env; invalid / over-capacity writes are routed to
+                    # the trailing padding row and discarded.
+                    env_idx = jnp.arange(config["NUM_ENVS"])
+                    can_record = done_mask & (
+                        teacher_buffer_count < teacher_episode_length
+                    )
+                    write_row = jnp.where(
+                        can_record, teacher_buffer_count, teacher_episode_length
+                    )
+                    teacher_buffer = TeacherTransition(
+                        done=teacher_buffer.done.at[write_row, env_idx].set(
+                            jnp.zeros_like(teacher_reward)
+                        ),
+                        action=teacher_buffer.action.at[write_row, env_idx].set(
+                            pending.action
+                        ),
+                        value=teacher_buffer.value.at[write_row, env_idx].set(
+                            pending.value
+                        ),
+                        reward=teacher_buffer.reward.at[write_row, env_idx].set(
+                            teacher_reward
+                        ),
+                        log_prob=teacher_buffer.log_prob.at[write_row, env_idx].set(
+                            pending.log_prob
+                        ),
+                        obs=teacher_buffer.obs.at[write_row, env_idx].set(pending.obs),
+                    )
+                    teacher_buffer_count = teacher_buffer_count + can_record.astype(
+                        jnp.int32
+                    )
+                    # Adopt the freshly sampled proposal for envs that resampled.
+                    refresh_col = refresh[:, None]
+                    pending = PendingTeacher(
+                        obs=jnp.where(refresh_col, new_t_obs, pending.obs),
+                        action=jnp.where(refresh_col, new_t_action, pending.action),
+                        value=jnp.where(refresh, new_t_value, pending.value),
+                        log_prob=jnp.where(refresh, new_t_log_prob, pending.log_prob),
+                    )
+
                 info = dict(info)
                 info["goal_reward_term"] = goal_reward_term
                 info["shaped_reward"] = reward
@@ -527,6 +708,11 @@ def make_train(config):
                     prev_episode_success,
                     prev_goal_ep_return,
                     rng,
+                    teacher_train_state,
+                    teacher_buffer,
+                    teacher_buffer_count,
+                    pending,
+                    teacher_rng,
                 )
                 return runner_state, transition
 
@@ -547,6 +733,11 @@ def make_train(config):
                 prev_episode_success,
                 prev_goal_ep_return,
                 rng,
+                teacher_train_state,
+                teacher_buffer,
+                teacher_buffer_count,
+                pending,
+                teacher_rng,
             ) = runner_state
             last_policy_obs = _concat_goal(last_obs, goal_batch)
             _, last_val = network.apply(train_state.params, last_policy_obs)
@@ -675,6 +866,165 @@ def make_train(config):
                 else config["LR"]
             )
 
+            # ----- TEACHER PPO UPDATE -----
+            # Fires (via lax.cond) once every env has collected a full teacher
+            # episode (TEACHER_EPISODE_LENGTH student episodes). One teacher
+            # rollout == one teacher episode; buffer/counts reset afterwards.
+            def _teacher_calculate_gae(traj, last_val):
+                def _get_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done, value, reward = (
+                        transition.done,
+                        transition.value,
+                        transition.reward,
+                    )
+                    delta = reward + teacher_gamma * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + teacher_gamma * teacher_gae_lambda * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+
+                _, advantages = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(last_val), last_val),
+                    traj,
+                    reverse=True,
+                    unroll=16,
+                )
+                return advantages, advantages + traj.value
+
+            def _run_teacher_update(operands):
+                t_train_state, t_buffer, t_count, t_rng, pend = operands
+                # Drop the trailing padding row; the rollout is one teacher episode.
+                traj = jax.tree_util.tree_map(
+                    lambda x: x[:teacher_episode_length], t_buffer
+                )
+                # Truncation bootstrap: value of the next (currently pending) proposal.
+                last_val = pend.value
+                advantages, targets = _teacher_calculate_gae(traj, last_val)
+
+                def _t_update_epoch(update_state, unused):
+                    def _t_update_minibatch(t_state, batch_info):
+                        traj_b, gae_b, tgt_b = batch_info
+
+                        def _t_loss_fn(params, traj_b, gae, targets):
+                            # Recompute with the current student params so the
+                            # learnable probing states keep receiving gradients.
+                            pi, value = _teacher_apply(
+                                params, traj_b.obs, train_state.params
+                            )
+                            log_prob = pi.log_prob(traj_b.action)
+                            value_pred_clipped = traj_b.value + (
+                                value - traj_b.value
+                            ).clip(-teacher_clip_eps, teacher_clip_eps)
+                            value_losses = jnp.square(value - targets)
+                            value_losses_clipped = jnp.square(
+                                value_pred_clipped - targets
+                            )
+                            value_loss = 0.5 * jnp.maximum(
+                                value_losses, value_losses_clipped
+                            ).mean()
+                            ratio = jnp.exp(log_prob - traj_b.log_prob)
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                            loss_actor1 = ratio * gae
+                            loss_actor2 = (
+                                jnp.clip(
+                                    ratio,
+                                    1.0 - teacher_clip_eps,
+                                    1.0 + teacher_clip_eps,
+                                )
+                                * gae
+                            )
+                            loss_actor = -jnp.minimum(loss_actor1, loss_actor2).mean()
+                            entropy = pi.entropy().mean()
+                            total_loss = (
+                                loss_actor
+                                + teacher_vf_coef * value_loss
+                                - teacher_ent_coef * entropy
+                            )
+                            return total_loss, (value_loss, loss_actor, entropy)
+
+                        grad_fn = jax.value_and_grad(_t_loss_fn, has_aux=True)
+                        total_loss, grads = grad_fn(
+                            t_state.params, traj_b, gae_b, tgt_b
+                        )
+                        t_state = t_state.apply_gradients(grads=grads)
+                        return t_state, total_loss
+
+                    t_state, traj, advantages, targets, rng = update_state
+                    rng, _rng = jax.random.split(rng)
+                    permutation = jax.random.permutation(_rng, teacher_batch_size)
+                    batch = (traj, advantages, targets)
+                    batch = jax.tree_util.tree_map(
+                        lambda x: x.reshape((teacher_batch_size,) + x.shape[2:]),
+                        batch,
+                    )
+                    shuffled_batch = jax.tree_util.tree_map(
+                        lambda x: jnp.take(x, permutation, axis=0), batch
+                    )
+                    minibatches = jax.tree_util.tree_map(
+                        lambda x: jnp.reshape(
+                            x, [teacher_num_minibatches, -1] + list(x.shape[1:])
+                        ),
+                        shuffled_batch,
+                    )
+                    t_state, total_loss = jax.lax.scan(
+                        _t_update_minibatch, t_state, minibatches
+                    )
+                    update_state = (t_state, traj, advantages, targets, rng)
+                    return update_state, total_loss
+
+                t_rng, epoch_rng = jax.random.split(t_rng)
+                update_state = (t_train_state, traj, advantages, targets, epoch_rng)
+                update_state, t_loss_info = jax.lax.scan(
+                    _t_update_epoch, update_state, None, teacher_update_epochs
+                )
+                t_train_state = update_state[0]
+                new_buffer = jax.tree_util.tree_map(jnp.zeros_like, t_buffer)
+                new_count = jnp.zeros_like(t_count)
+                metrics = (
+                    t_loss_info[0].mean(),
+                    t_loss_info[1][0].mean(),
+                    t_loss_info[1][1].mean(),
+                    t_loss_info[1][2].mean(),
+                    jnp.array(1.0, dtype=jnp.float32),
+                )
+                return t_train_state, new_buffer, new_count, t_rng, metrics
+
+            def _skip_teacher_update(operands):
+                t_train_state, t_buffer, t_count, t_rng, pend = operands
+                z = jnp.array(0.0, dtype=jnp.float32)
+                return t_train_state, t_buffer, t_count, t_rng, (z, z, z, z, z)
+
+            teacher_should_update = jnp.all(
+                teacher_buffer_count >= teacher_episode_length
+            )
+            (
+                teacher_train_state,
+                teacher_buffer,
+                teacher_buffer_count,
+                teacher_rng,
+                teacher_metrics,
+            ) = jax.lax.cond(
+                teacher_should_update,
+                _run_teacher_update,
+                _skip_teacher_update,
+                (
+                    teacher_train_state,
+                    teacher_buffer,
+                    teacher_buffer_count,
+                    teacher_rng,
+                    pending,
+                ),
+            )
+            (
+                teacher_total_loss,
+                teacher_value_loss,
+                teacher_actor_loss,
+                teacher_entropy,
+                teacher_did_update,
+            ) = teacher_metrics
 
             if config.get("DEBUG"):
 
@@ -695,7 +1045,19 @@ def make_train(config):
             if config.get("WANDB_MODE", "disabled") == "online":
 
                 def wandb_callback(args):
-                    info, total_loss, value_loss, actor_loss, entropy, current_lr = args
+                    (
+                        info,
+                        total_loss,
+                        value_loss,
+                        actor_loss,
+                        entropy,
+                        current_lr,
+                        teacher_total_loss,
+                        teacher_value_loss,
+                        teacher_actor_loss,
+                        teacher_entropy,
+                        teacher_did_update,
+                    ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
                     return_values = info["returned_episode_returns"][
@@ -742,10 +1104,33 @@ def make_train(config):
                         },
                         step=step,
                     )
+                    # Teacher losses are only meaningful on steps where it updated.
+                    if float(teacher_did_update) > 0.0:
+                        wandb.log(
+                            {
+                                "teacher/total_loss": float(teacher_total_loss),
+                                "teacher/value_loss": float(teacher_value_loss),
+                                "teacher/actor_loss": float(teacher_actor_loss),
+                                "teacher/entropy": float(teacher_entropy),
+                            },
+                            step=step,
+                        )
 
                 jax.debug.callback(
                     wandb_callback,
-                    (metric, total_loss, value_loss, actor_loss, entropy, current_lr),
+                    (
+                        metric,
+                        total_loss,
+                        value_loss,
+                        actor_loss,
+                        entropy,
+                        current_lr,
+                        teacher_total_loss,
+                        teacher_value_loss,
+                        teacher_actor_loss,
+                        teacher_entropy,
+                        teacher_did_update,
+                    ),
                 )
 
             runner_state = (
@@ -760,6 +1145,11 @@ def make_train(config):
                 prev_episode_success,
                 prev_goal_ep_return,
                 rng,
+                teacher_train_state,
+                teacher_buffer,
+                teacher_buffer_count,
+                pending,
+                teacher_rng,
             )
             return runner_state, metric
 
@@ -781,6 +1171,11 @@ def make_train(config):
             prev_episode_success,
             prev_goal_ep_return,
             _rng,
+            teacher_train_state,
+            teacher_buffer,
+            teacher_buffer_count,
+            pending,
+            teacher_rng,
         )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
@@ -835,7 +1230,19 @@ def main():
         "TEACHER_SAMPLE_EVERY_N_EPISODES": 1,
         "GOAL_REACHED_THRESHOLD": 0.1,
         "SUCCESS_RATE_ALPHA": 0.05,
-        "TEACHER_REWARD_TYPE": "goal_return",  # or "goal_return"
+        "TEACHER_REWARD_TYPE": "goal_return",  # or "success_rate"
+        # Teacher PPO hyper-parameters. TEACHER_EPISODE_LENGTH is the number of
+        # student episodes per teacher episode == one teacher rollout/update.
+        "TEACHER_EPISODE_LENGTH": 8,
+        "TEACHER_LR": 3e-4,
+        "TEACHER_GAMMA": 0.99,
+        "TEACHER_GAE_LAMBDA": 0.95,
+        "TEACHER_CLIP_EPS": 0.2,
+        "TEACHER_ENT_COEF": 0.0,
+        "TEACHER_VF_COEF": 0.5,
+        "TEACHER_MAX_GRAD_NORM": 0.5,
+        "TEACHER_UPDATE_EPOCHS": 4,
+        "TEACHER_NUM_MINIBATCHES": 4,
     }
 
     wandb.init(
@@ -852,10 +1259,17 @@ def main():
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
     jax.block_until_ready(train_output["runner_state"][6])
-    final_train_state, final_env_state, _, _, _, _, _, _, _, _, final_rng = train_output[
-        "runner_state"
-    ]
-    render_eval_episode(final_train_state.params, final_rng, final_env_state)
+    runner_state = train_output["runner_state"]
+    final_train_state = runner_state[0]
+    final_env_state = runner_state[1]
+    final_rng = runner_state[10]
+    final_teacher_train_state = runner_state[11]
+    render_eval_episode(
+        final_train_state.params,
+        final_teacher_train_state.params,
+        final_rng,
+        final_env_state,
+    )
 
 
 if __name__ == "__main__":
