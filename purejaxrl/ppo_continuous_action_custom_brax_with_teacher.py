@@ -192,6 +192,11 @@ def make_train(config):
     teacher_delta_high = config.get("TEACHER_DELTA_HIGH", 1.0)
     goal_reached_threshold = config.get("GOAL_REACHED_THRESHOLD", 0.1)
     success_rate_alpha = config.get("SUCCESS_RATE_ALPHA", 0.05)
+    teacher_reward_type = config.get("TEACHER_REWARD_TYPE", "success_rate")
+    if teacher_reward_type not in ("success_rate", "goal_return"):
+        raise ValueError(
+            "TEACHER_REWARD_TYPE must be 'success_rate' or 'goal_return'"
+        )
     base_obs_dim = int(env.observation_space(env_params).shape[0])
     policy_obs_dim = base_obs_dim * 2 if goal_conditioned else base_obs_dim
     teacher_num_probing_states = int(config.get("TEACHER_NUM_PROBING_STATES", 8))
@@ -417,6 +422,8 @@ def make_train(config):
                     episode_counts,
                     avg_success_rate,
                     reached_any_in_episode,
+                    prev_episode_success,
+                    prev_goal_ep_return,
                     rng,
                 ) = runner_state
 
@@ -434,6 +441,7 @@ def make_train(config):
                     rng_step, env_state, action, env_params
                 )
                 goal_reward_term = jnp.zeros_like(reward)
+                episode_success = jnp.zeros_like(reward)
                 if goal_conditioned:
                     goal_penalty = -jnp.sum(jnp.square(obsv - goal_batch), axis=-1)
                     goal_reward_term = goal_reward_weight * goal_penalty
@@ -449,7 +457,7 @@ def make_train(config):
                     sample_on_done = done_mask & (
                         (completed_episode_counts % teacher_sample_every_n_episodes) == 0
                     )
-                    episode_success = reached_any_in_episode.astype(avg_success_rate.dtype)
+                    episode_success = reached_any_in_episode.astype(reward.dtype)
                     updated_avg_success_rate = avg_success_rate + success_rate_alpha * (
                         episode_success - avg_success_rate
                     )
@@ -480,11 +488,30 @@ def make_train(config):
                 goal_ep_returns = jnp.where(
                     done_mask, jnp.zeros_like(goal_ep_returns), goal_ep_returns
                 )
+                # TEACHER REWARD = learning progress on reaching the proposed goal.
+                # Computed per env only on episode completion as the difference
+                # between the current and previous episode's value.
+                current_success = episode_success
+                current_goal_return = returned_goal_ep_returns
+                if teacher_reward_type == "success_rate":
+                    progress = current_success - prev_episode_success
+                else:
+                    progress = current_goal_return - prev_goal_ep_return
+                teacher_reward = jnp.where(
+                    done_mask, progress, jnp.zeros_like(progress)
+                )
+                prev_episode_success = jnp.where(
+                    done_mask, current_success, prev_episode_success
+                )
+                prev_goal_ep_return = jnp.where(
+                    done_mask, current_goal_return, prev_goal_ep_return
+                )
                 info = dict(info)
                 info["goal_reward_term"] = goal_reward_term
                 info["shaped_reward"] = reward
                 info["returned_goal_reward_episode_returns"] = returned_goal_ep_returns
                 info["returned_goal_reward_episode"] = done_mask
+                info["teacher_reward"] = teacher_reward
                 transition = Transition(
                     done, action, value, reward, log_prob, policy_obs, info
                 )
@@ -497,6 +524,8 @@ def make_train(config):
                     episode_counts,
                     avg_success_rate,
                     reached_any_in_episode,
+                    prev_episode_success,
+                    prev_goal_ep_return,
                     rng,
                 )
                 return runner_state, transition
@@ -515,6 +544,8 @@ def make_train(config):
                 episode_counts,
                 avg_success_rate,
                 reached_any_in_episode,
+                prev_episode_success,
+                prev_goal_ep_return,
                 rng,
             ) = runner_state
             last_policy_obs = _concat_goal(last_obs, goal_batch)
@@ -673,6 +704,9 @@ def make_train(config):
                     goal_return_values = info["returned_goal_reward_episode_returns"][
                         info["returned_goal_reward_episode"]
                     ]
+                    teacher_reward_values = info["teacher_reward"][
+                        info["returned_goal_reward_episode"]
+                    ]
                     if len(return_values) > 0:
                         wandb.log(
                             {"episodic_return": float(return_values.mean())},
@@ -683,6 +717,15 @@ def make_train(config):
                             {
                                 "episodic_goal_shaping_return": float(
                                     goal_return_values.mean()
+                                )
+                            },
+                            step=step,
+                        )
+                    if len(teacher_reward_values) > 0:
+                        wandb.log(
+                            {
+                                "teacher_learning_progress": float(
+                                    teacher_reward_values.mean()
                                 )
                             },
                             step=step,
@@ -714,6 +757,8 @@ def make_train(config):
                 episode_counts,
                 avg_success_rate,
                 reached_any_in_episode,
+                prev_episode_success,
+                prev_goal_ep_return,
                 rng,
             )
             return runner_state, metric
@@ -722,6 +767,8 @@ def make_train(config):
         goal_ep_returns = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
         episode_counts = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
         reached_any_in_episode = jnp.zeros((config["NUM_ENVS"],), dtype=bool)
+        prev_episode_success = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
+        prev_goal_ep_return = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
         runner_state = (
             train_state,
             env_state,
@@ -731,6 +778,8 @@ def make_train(config):
             episode_counts,
             avg_success_rate,
             reached_any_in_episode,
+            prev_episode_success,
+            prev_goal_ep_return,
             _rng,
         )
         runner_state, metric = jax.lax.scan(
@@ -786,6 +835,7 @@ def main():
         "TEACHER_SAMPLE_EVERY_N_EPISODES": 1,
         "GOAL_REACHED_THRESHOLD": 0.1,
         "SUCCESS_RATE_ALPHA": 0.05,
+        "TEACHER_REWARD_TYPE": "goal_return",  # or "goal_return"
     }
 
     wandb.init(
@@ -802,7 +852,7 @@ def main():
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
     jax.block_until_ready(train_output["runner_state"][6])
-    final_train_state, final_env_state, _, _, _, _, _, _, final_rng = train_output[
+    final_train_state, final_env_state, _, _, _, _, _, _, _, _, final_rng = train_output[
         "runner_state"
     ]
     render_eval_episode(final_train_state.params, final_rng, final_env_state)
