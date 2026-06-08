@@ -1,5 +1,6 @@
 import os
 import traceback
+import json
 os.environ["MUJOCO_GL"] = "osmesa"
 import jax
 import jax.numpy as jnp
@@ -11,8 +12,10 @@ from brax import envs as brax_envs
 from brax.io import html
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
+from dataclasses import dataclass, asdict
 from flax.training.train_state import TrainState
 import distrax
+import tyro
 from wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
@@ -25,6 +28,80 @@ try:
     from purejaxrl.envs.factory import make_custom_env
 except ImportError:
     from envs.factory import make_custom_env
+
+
+@dataclass
+class TrainConfig:
+    LR: float = 3e-4
+    NUM_ENVS: int = 16
+    NUM_STEPS: int = 32
+    TOTAL_TIMESTEPS: int = int(1e8)
+    UPDATE_EPOCHS: int = 4
+    NUM_MINIBATCHES: int = 32
+    GAMMA: float = 0.99
+    GAE_LAMBDA: float = 0.95
+    CLIP_EPS: float = 0.3
+    ENT_COEF: float = 0.0
+    VF_COEF: float = 0.5
+    MAX_GRAD_NORM: float = 0.5
+    ACTIVATION: str = "tanh"
+    ENV_NAME: str = "ant_u_maze_single_goal"
+    ENV_BACKEND: str | None = None
+    EPISODE_LENGTH: int = 1000
+    ACTION_REPEAT: int = 1
+    # Pass as JSON from CLI, e.g. --env-kwargs '{"foo": 1}'.
+    ENV_KWARGS: str = "{}"
+    ANNEAL_LR: bool = True
+    NORMALIZE_ENV: bool = True
+    DEBUG: bool = True
+    SEED: int = 30
+    WANDB_MODE: str = "online"
+    ENTITY: str = ""
+    PROJECT: str = "purejaxrl"
+    WANDB_LOG_EVERY_UPDATES: int = 1
+    EVAL_RENDER_STEPS: int = 300
+    EVAL_RENDER_MAX_FRAMES: int = 100
+    EVAL_RENDER_HEIGHT: int = 360
+    EVAL_RENDER_LOG_WANDB_HTML: bool = True
+    GOAL_CONDITIONED: bool = True
+    GOAL_REWARD_WEIGHT: float = 1.0
+    ANNEAL_GOAL_REWARD_WEIGHT: bool = True
+    TEACHER_DELTA_LOW: float = -10.0
+    TEACHER_DELTA_HIGH: float = 10.0
+    TEACHER_SEED: int = 0
+    TEACHER_NUM_PROBING_STATES: int = 100
+    TEACHER_PROBE_AGG: str = "concat"
+    TEACHER_SAMPLE_EVERY_N_EPISODES: int = 1
+    GOAL_REACHED_THRESHOLD: float = 0.1
+    SUCCESS_RATE_ALPHA: float = 0.05
+    TEACHER_REWARD_TYPE: str = "goal_return"
+    TEACHER_EPISODE_LENGTH: int = 8
+    TEACHER_LR: float = 3e-4
+    TEACHER_GAMMA: float = 1.0
+    TEACHER_GAE_LAMBDA: float = 0.95
+    TEACHER_CLIP_EPS: float = 0.3
+    TEACHER_ENT_COEF: float = 0.0
+    TEACHER_VF_COEF: float = 0.5
+    TEACHER_MAX_GRAD_NORM: float = 0.5
+    TEACHER_UPDATE_EPOCHS: int = 4
+    TEACHER_NUM_MINIBATCHES: int = 4
+
+    def to_dict(self) -> dict[str, Any]:
+        config = asdict(self)
+        try:
+            parsed_env_kwargs = json.loads(config["ENV_KWARGS"])
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON for ENV_KWARGS: {config['ENV_KWARGS']}"
+            ) from exc
+        if not isinstance(parsed_env_kwargs, dict):
+            raise ValueError("ENV_KWARGS must decode to a JSON object.")
+        config["ENV_KWARGS"] = parsed_env_kwargs
+        return config
+
+
+def parse_config_from_cli() -> TrainConfig:
+    return tyro.cli(TrainConfig)
 
 
 class ActorCritic(nn.Module):
@@ -204,6 +281,7 @@ def make_train(config):
 
     goal_conditioned = config.get("GOAL_CONDITIONED", False)
     goal_reward_weight = config.get("GOAL_REWARD_WEIGHT", 0.0)
+    anneal_goal_reward_weight = config.get("ANNEAL_GOAL_REWARD_WEIGHT", False)
     teacher_sample_every_n_episodes = int(
         config.get("TEACHER_SAMPLE_EVERY_N_EPISODES", 1)
     )
@@ -322,6 +400,12 @@ def make_train(config):
             / config["NUM_UPDATES"]
         )
         return config["LR"] * frac
+
+    def goal_reward_weight_schedule(update_idx):
+        if config["NUM_UPDATES"] <= 1:
+            return jnp.array(0.0, dtype=jnp.float32)
+        frac = 1.0 - (update_idx / (config["NUM_UPDATES"] - 1))
+        return jnp.clip(frac, 0.0, 1.0)
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
         """Find observation normalization stats in nested wrapped env state."""
@@ -457,6 +541,10 @@ def make_train(config):
             traceback.print_exc()
 
     def train(rng):
+        wandb_log_every_updates = int(config.get("WANDB_LOG_EVERY_UPDATES", 10))
+        if wandb_log_every_updates < 1:
+            raise ValueError("WANDB_LOG_EVERY_UPDATES must be >= 1")
+
         # INIT NETWORK
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros((policy_obs_dim,))
@@ -530,6 +618,11 @@ def make_train(config):
 
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
+            current_goal_reward_weight = (
+                goal_reward_weight_schedule(update_idx)
+                if anneal_goal_reward_weight
+                else jnp.asarray(goal_reward_weight, dtype=jnp.float32)
+            )
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
                 (
@@ -568,7 +661,7 @@ def make_train(config):
                 episode_success = jnp.zeros_like(reward)
                 if goal_conditioned:
                     goal_penalty = -jnp.sum(jnp.square(obsv - goal_batch), axis=-1)
-                    goal_reward_term = goal_reward_weight * goal_penalty
+                    goal_reward_term = current_goal_reward_weight * goal_penalty
                     reward = reward + goal_reward_term
                     # Refresh the goal when it is reached, or on done every N episodes.
                     goal_dist = jnp.sqrt(
@@ -631,9 +724,9 @@ def make_train(config):
                 current_success = episode_success
                 current_goal_return = returned_goal_ep_returns
                 if teacher_reward_type == "success_rate":
-                    progress = current_success - prev_episode_success
+                    progress = (current_success - prev_episode_success)
                 else:
-                    progress = current_goal_return - prev_goal_ep_return
+                    progress = (current_goal_return - prev_goal_ep_return)
                 teacher_reward = jnp.where(
                     done_mask, progress, jnp.zeros_like(progress)
                 )
@@ -1046,85 +1139,79 @@ def make_train(config):
 
                 def wandb_callback(args):
                     (
+                        update_idx,
                         info,
                         total_loss,
                         value_loss,
                         actor_loss,
                         entropy,
                         current_lr,
+                        current_goal_reward_weight,
                         teacher_total_loss,
                         teacher_value_loss,
                         teacher_actor_loss,
                         teacher_entropy,
                         teacher_did_update,
                     ) = args
+                    # Throttle logging to avoid very frequent wandb writes.
+                    if (int(update_idx) + 1) % wandb_log_every_updates != 0:
+                        return
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
                     ]
+                    # Only log when a student episode has completed.
+                    if len(return_values) == 0:
+                        return
                     goal_return_values = info["returned_goal_reward_episode_returns"][
                         info["returned_goal_reward_episode"]
                     ]
                     teacher_reward_values = info["teacher_reward"][
                         info["returned_goal_reward_episode"]
                     ]
-                    if len(return_values) > 0:
-                        wandb.log(
-                            {"episodic_return": float(return_values.mean())},
-                            step=step,
-                        )
+                    payload = {
+                        "episodic_return": float(return_values.mean()),
+                        "total_loss": float(total_loss),
+                        "value_loss": float(value_loss),
+                        "actor_loss": float(actor_loss),
+                        "entropy": float(entropy),
+                        "learning_rate": float(current_lr),
+                        "goal_reward_weight": float(current_goal_reward_weight),
+                        "goal_reward_term_mean": float(info["goal_reward_term"].mean()),
+                        "shaped_reward_mean": float(info["shaped_reward"].mean()),
+                    }
                     if len(goal_return_values) > 0:
-                        wandb.log(
-                            {
-                                "episodic_goal_shaping_return": float(
-                                    goal_return_values.mean()
-                                )
-                            },
-                            step=step,
+                        payload["episodic_goal_shaping_return"] = float(
+                            goal_return_values.mean()
                         )
                     if len(teacher_reward_values) > 0:
-                        wandb.log(
-                            {
-                                "teacher_learning_progress": float(
-                                    teacher_reward_values.mean()
-                                )
-                            },
-                            step=step,
+                        payload["teacher_learning_progress"] = float(
+                            teacher_reward_values.mean()
                         )
-                    wandb.log(
-                        {
-                            "total_loss": float(total_loss),
-                            "value_loss": float(value_loss),
-                            "actor_loss": float(actor_loss),
-                            "entropy": float(entropy),
-                            "learning_rate": float(current_lr),
-                            "goal_reward_term_mean": float(info["goal_reward_term"].mean()),
-                            "shaped_reward_mean": float(info["shaped_reward"].mean()),
-                        },
-                        step=step,
-                    )
                     # Teacher losses are only meaningful on steps where it updated.
                     if float(teacher_did_update) > 0.0:
-                        wandb.log(
+                        payload.update(
                             {
                                 "teacher/total_loss": float(teacher_total_loss),
                                 "teacher/value_loss": float(teacher_value_loss),
                                 "teacher/actor_loss": float(teacher_actor_loss),
                                 "teacher/entropy": float(teacher_entropy),
-                            },
-                            step=step,
+                            }
                         )
+                    wandb.log(payload, step=step)
 
                 jax.debug.callback(
                     wandb_callback,
                     (
+                        update_idx,
                         metric,
                         total_loss,
                         value_loss,
                         actor_loss,
                         entropy,
                         current_lr,
+                        current_goal_reward_weight,
                         teacher_total_loss,
                         teacher_value_loss,
                         teacher_actor_loss,
@@ -1189,61 +1276,8 @@ def make_train(config):
 
 
 def main():
-    config = {
-        "LR": 3e-4,
-        "NUM_ENVS": 16,
-        "NUM_STEPS": 32,
-        "TOTAL_TIMESTEPS": 1e8,
-        "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 32,
-        "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
-        "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.3,
-        "ENT_COEF": 0.0,
-        "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
-        "ACTIVATION": "tanh",
-        "ENV_NAME": "ant_u_maze",
-        "ENV_BACKEND": None,
-        "EPISODE_LENGTH": 1000,
-        "ACTION_REPEAT": 1,
-        "ENV_KWARGS": {},
-        "ANNEAL_LR": True,
-        "NORMALIZE_ENV": True,
-        "DEBUG": True,
-        "SEED": 30,
-        "WANDB_MODE": "online",  # set to "online" to activate wandb
-        "ENTITY": "",
-        "PROJECT": "purejaxrl",
-        "EVAL_RENDER_STEPS": 300,
-        "EVAL_RENDER_MAX_FRAMES": 100,
-        "EVAL_RENDER_HEIGHT": 360,
-        "EVAL_RENDER_LOG_WANDB_HTML": True,
-        "GOAL_CONDITIONED": True,
-        "GOAL_REWARD_WEIGHT": 1.0,
-        "TEACHER_DELTA_LOW": -1.0,
-        "TEACHER_DELTA_HIGH": 1.0,
-        "TEACHER_SEED": 0,
-        "TEACHER_NUM_PROBING_STATES": 8,
-        "TEACHER_PROBE_AGG": "mean",
-        "TEACHER_SAMPLE_EVERY_N_EPISODES": 1,
-        "GOAL_REACHED_THRESHOLD": 0.1,
-        "SUCCESS_RATE_ALPHA": 0.05,
-        "TEACHER_REWARD_TYPE": "goal_return",  # or "success_rate"
-        # Teacher PPO hyper-parameters. TEACHER_EPISODE_LENGTH is the number of
-        # student episodes per teacher episode == one teacher rollout/update.
-        "TEACHER_EPISODE_LENGTH": 8,
-        "TEACHER_LR": 3e-4,
-        "TEACHER_GAMMA": 1,
-        "TEACHER_GAE_LAMBDA": 0.95,
-        "TEACHER_CLIP_EPS": 0.3,
-        "TEACHER_ENT_COEF": 0.0,
-        "TEACHER_VF_COEF": 0.5,
-        "TEACHER_MAX_GRAD_NORM": 0.5,
-        "TEACHER_UPDATE_EPOCHS": 4,
-        "TEACHER_NUM_MINIBATCHES": 4,
-    }
+    config_obj = parse_config_from_cli()
+    config = config_obj.to_dict()
 
     wandb.init(
         entity=config["ENTITY"],
