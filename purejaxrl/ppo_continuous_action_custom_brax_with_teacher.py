@@ -1235,9 +1235,9 @@ def main():
         # student episodes per teacher episode == one teacher rollout/update.
         "TEACHER_EPISODE_LENGTH": 8,
         "TEACHER_LR": 3e-4,
-        "TEACHER_GAMMA": 0.99,
+        "TEACHER_GAMMA": 1,
         "TEACHER_GAE_LAMBDA": 0.95,
-        "TEACHER_CLIP_EPS": 0.2,
+        "TEACHER_CLIP_EPS": 0.3,
         "TEACHER_ENT_COEF": 0.0,
         "TEACHER_VF_COEF": 0.5,
         "TEACHER_MAX_GRAD_NORM": 0.5,
