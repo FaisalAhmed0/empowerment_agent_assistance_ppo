@@ -33,7 +33,7 @@ except ImportError:
 @dataclass
 class TrainConfig:
     LR: float = 3e-4
-    NUM_ENVS: int = 16
+    NUM_ENVS: int = 1024
     NUM_STEPS: int = 32
     TOTAL_TIMESTEPS: int = int(1e8)
     UPDATE_EPOCHS: int = 4
