@@ -66,9 +66,9 @@ class TrainConfig:
     GOAL_CONDITIONED: bool = True
     GOAL_REWARD_WEIGHT: float = 1.0
     ANNEAL_GOAL_REWARD_WEIGHT: bool = True
+    STUDENT_GOAL_REWARD_TYPE: str="sparse" # this can either sparse or dense
     TEACHER_DELTA_LOW: float = -10.0
     TEACHER_DELTA_HIGH: float = 10.0
-    TEACHER_SEED: int = 0
     TEACHER_NUM_PROBING_STATES: int = 100
     TEACHER_PROBE_AGG: str = "concat"
     TEACHER_SAMPLE_EVERY_N_EPISODES: int = 1
@@ -146,9 +146,10 @@ class ActorCritic(nn.Module):
 class TeacherGoalPolicy(nn.Module):
     """Stochastic PPO policy that maps an observation to a goal delta.
 
-    The actor outputs a Gaussian over an unbounded raw delta; the raw sample is
-    squashed externally (see ``_squash_delta``) so that each delta component lies
-    in ``[delta_low, delta_high]`` and the actual goal is ``reference_obs + delta``.
+    The actor outputs a Gaussian over an unbounded 2D raw delta (x/y only); the
+    raw sample is squashed externally (see ``_squash_delta``) so each component
+    lies in ``[delta_low, delta_high]`` and the goal is
+    ``reference_obs[..., :2] + delta_xy``.
     PPO trains on the raw (pre-squash) action, mirroring how the student uses the
     ``ClipAction`` wrapper.
     """
@@ -282,6 +283,11 @@ def make_train(config):
     goal_conditioned = config.get("GOAL_CONDITIONED", False)
     goal_reward_weight = config.get("GOAL_REWARD_WEIGHT", 0.0)
     anneal_goal_reward_weight = config.get("ANNEAL_GOAL_REWARD_WEIGHT", False)
+    student_goal_reward_type = config.get("STUDENT_GOAL_REWARD_TYPE", "sparse")
+    if student_goal_reward_type not in ("sparse", "dense"):
+        raise ValueError(
+            "STUDENT_GOAL_REWARD_TYPE must be 'sparse' or 'dense'"
+        )
     teacher_sample_every_n_episodes = int(
         config.get("TEACHER_SAMPLE_EVERY_N_EPISODES", 1)
     )
@@ -297,7 +303,8 @@ def make_train(config):
             "TEACHER_REWARD_TYPE must be 'success_rate' or 'goal_return'"
         )
     base_obs_dim = int(env.observation_space(env_params).shape[0])
-    policy_obs_dim = base_obs_dim * 2 if goal_conditioned else base_obs_dim
+    goal_dim = 2
+    policy_obs_dim = base_obs_dim + goal_dim if goal_conditioned else base_obs_dim
     teacher_num_probing_states = int(config.get("TEACHER_NUM_PROBING_STATES", 8))
     teacher_probe_agg = config.get("TEACHER_PROBE_AGG", "mean")
 
@@ -330,7 +337,7 @@ def make_train(config):
 
     # Trainable teacher policy: maps a reference observation to a goal delta.
     teacher_network = TeacherGoalPolicy(
-        obs_dim=base_obs_dim,
+        obs_dim=goal_dim,
         student_obs_dim=policy_obs_dim,
         num_probing_states=teacher_num_probing_states,
         delta_low=teacher_delta_low,
@@ -339,7 +346,7 @@ def make_train(config):
         activation=config["ACTIVATION"],
     )
     teacher_rng, student_dummy_rng = jax.random.split(
-        jax.random.PRNGKey(config.get("TEACHER_SEED", 0))
+        jax.random.PRNGKey(config.get("SEED", 0))
     )
     dummy_student_params = network.init(student_dummy_rng, jnp.zeros((policy_obs_dim,)))
     teacher_params = teacher_network.init(
@@ -378,7 +385,7 @@ def make_train(config):
         pi, value = _teacher_apply(teacher_params, teacher_input, student_params)
         raw_action = pi.sample(seed=rng)
         log_prob = pi.log_prob(raw_action)
-        goal = reference_obs + _squash_delta(raw_action)
+        goal = reference_obs[..., :2] + _squash_delta(raw_action)
         return goal, teacher_input, raw_action, log_prob, value
 
     def _teacher_goal_det(teacher_params, reference_obs, avg_success_rate, student_params):
@@ -386,12 +393,16 @@ def make_train(config):
         pi, _ = _teacher_apply(
             teacher_params, _teacher_input(reference_obs, avg_success_rate), student_params
         )
-        return reference_obs + _squash_delta(pi.mean())
+        return reference_obs[..., :2] + _squash_delta(pi.mean())
 
     def _concat_goal(obs, goals):
         if not goal_conditioned:
             return obs
         return jnp.concatenate([obs, goals], axis=-1)
+
+    def _goal_xy_delta(obs, goals):
+        # Goal reaching is defined in the positional plane only.
+        return obs[..., :2] - goals[..., :2]
 
     def linear_schedule(count):
         frac = (
@@ -468,7 +479,9 @@ def make_train(config):
             )
             # Refresh the goal once the current goal is reached.
             norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
-            goal_dist = jnp.sqrt(jnp.sum(jnp.square(norm_obs - goal)))
+            goal_dist = jnp.sqrt(
+                jnp.sum(jnp.square(_goal_xy_delta(norm_obs, goal)), axis=-1)
+            )
             reached = goal_dist <= goal_reached_threshold
             goal = jnp.where(
                 reached,
@@ -608,7 +621,7 @@ def make_train(config):
         _buf_rows = teacher_episode_length + 1
         teacher_buffer = TeacherTransition(
             done=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
-            action=jnp.zeros((_buf_rows, config["NUM_ENVS"], base_obs_dim)),
+            action=jnp.zeros((_buf_rows, config["NUM_ENVS"], goal_dim)),
             value=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
             reward=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
             log_prob=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
@@ -660,12 +673,21 @@ def make_train(config):
                 goal_reward_term = jnp.zeros_like(reward)
                 episode_success = jnp.zeros_like(reward)
                 if goal_conditioned:
-                    goal_penalty = -jnp.sum(jnp.square(obsv - goal_batch), axis=-1)
+                    if student_goal_reward_type == "sparse":
+                        goal_dist = jnp.sqrt(
+                            jnp.sum(jnp.square(_goal_xy_delta(obsv, goal_batch)), axis=-1)
+                        )
+                        goal_penalty = (goal_dist <= goal_reached_threshold).astype(reward.dtype)
+                    elif student_goal_reward_type == "dense":
+                        goal_penalty = -jnp.sum(
+                            jnp.square(_goal_xy_delta(obsv, goal_batch)), axis=-1
+                        )
+
                     goal_reward_term = current_goal_reward_weight * goal_penalty
                     reward = reward + goal_reward_term
                     # Refresh the goal when it is reached, or on done every N episodes.
                     goal_dist = jnp.sqrt(
-                        jnp.sum(jnp.square(obsv - goal_batch), axis=-1)
+                        jnp.sum(jnp.square(_goal_xy_delta(obsv, goal_batch)), axis=-1)
                     )
                     reached = goal_dist <= goal_reached_threshold
                     reached_any_in_episode = jnp.logical_or(reached_any_in_episode, reached)
