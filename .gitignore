@@ -2,8 +2,6 @@ __pycache__/
 ./*/__pycache__/
 ./*/*/__pycache__/
 ./*/*/*/__pycache__/
-train_teacher.sh
-train_teacher*
 job
 submit_job
 wandb
