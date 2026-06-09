@@ -35,7 +35,7 @@ class TrainConfig:
     LR: float = 3e-4
     NUM_ENVS: int = 1024
     NUM_STEPS: int = 64
-    TOTAL_TIMESTEPS: int = int(1e8)
+    TOTAL_TIMESTEPS: int = int(5e8)
     UPDATE_EPOCHS: int = 4
     NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
@@ -47,12 +47,12 @@ class TrainConfig:
     ACTIVATION: str = "tanh"
     ENV_NAME: str = "ant_u_maze_single_goal"
     ENV_BACKEND: str | None = None
-    EPISODE_LENGTH: int = 1000
+    EPISODE_LENGTH: int = 500
     ACTION_REPEAT: int = 1
     # Pass as JSON from CLI, e.g. --env-kwargs '{"foo": 1}'.
     ENV_KWARGS: str = "{}"
     ANNEAL_LR: bool = False
-    NORMALIZE_ENV: bool = True
+    NORMALIZE_ENV: bool = False
     DEBUG: bool = True
     SEED: int = 30
     WANDB_MODE: str = "online"
@@ -76,10 +76,19 @@ class TrainConfig:
     TEACHER_NUM_PROBING_STATES: int = 100
     TEACHER_PROBE_AGG: str = "concat"
     TEACHER_SAMPLE_EVERY_N_EPISODES: int = 1
-    GOAL_REACHED_THRESHOLD: float = 0.1
+    GOAL_REACHED_THRESHOLD: float = 0.5
     SUCCESS_RATE_ALPHA: float = 0.05
-    TEACHER_REWARD_TYPE: str = "goal_return"
-    TEACHER_EPISODE_LENGTH: int = 8
+    # "competence_lp" (default): teacher reward = student success-rate on the SAME
+    # proposed goal evaluated after vs. before that episode's student updates.
+    # "success_rate"/"goal_return": legacy cross-episode difference rewards.
+    TEACHER_REWARD_TYPE: str = "competence_lp"
+    TEACHER_TASK_RETURN_WEIGHT: float = 1.0
+    # Competence-LP eval settings (only used when TEACHER_REWARD_TYPE == "competence_lp").
+    TEACHER_EVAL_HORIZON: int = 500
+    TEACHER_EVAL_EPISODES: int = 1
+    TEACHER_EVAL_NUM_ENVS: int = 4
+    TEACHER_LP_ABSOLUTE: bool = False
+    TEACHER_EPISODE_LENGTH: int = 4
     TEACHER_LR: float = 3e-4
     TEACHER_GAMMA: float = 0.999
     TEACHER_GAE_LAMBDA: float = 0.95
@@ -249,6 +258,12 @@ class PendingTeacher(NamedTuple):
     action: jnp.ndarray
     value: jnp.ndarray
     log_prob: jnp.ndarray
+    # Student success rate on this proposal measured when it was proposed
+    # (the "before" term of the competence-LP teacher reward).
+    competence_before: jnp.ndarray
+    # The proposed goal in normalized obs space, kept so competence can be
+    # re-evaluated on the SAME goal at episode end.
+    goal: jnp.ndarray
 
 
 class GoalPenaltyNormState(NamedTuple):
@@ -268,6 +283,13 @@ class GoalPenaltyNormState(NamedTuple):
 def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    student_episode_length = int(config.get("EPISODE_LENGTH", 1000))
+    if student_episode_length < 1:
+        raise ValueError("EPISODE_LENGTH must be >= 1")
+    total_env_steps_per_env = config["TOTAL_TIMESTEPS"] // config["NUM_ENVS"]
+    config["NUM_STUDENT_EPISODES_PER_ENV"] = (
+        total_env_steps_per_env // student_episode_length
     )
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
@@ -322,11 +344,23 @@ def make_train(config):
     teacher_delta_high = config.get("TEACHER_DELTA_HIGH", 1.0)
     goal_reached_threshold = config.get("GOAL_REACHED_THRESHOLD", 0.1)
     success_rate_alpha = config.get("SUCCESS_RATE_ALPHA", 0.05)
-    teacher_reward_type = config.get("TEACHER_REWARD_TYPE", "success_rate")
-    if teacher_reward_type not in ("success_rate", "goal_return"):
+    teacher_reward_type = config.get("TEACHER_REWARD_TYPE", "competence_lp")
+    teacher_task_return_weight = float(config.get("TEACHER_TASK_RETURN_WEIGHT", 1.0))
+    if teacher_reward_type not in ("success_rate", "goal_return", "competence_lp"):
         raise ValueError(
-            "TEACHER_REWARD_TYPE must be 'success_rate' or 'goal_return'"
+            "TEACHER_REWARD_TYPE must be 'success_rate', 'goal_return' or "
+            "'competence_lp'"
         )
+    teacher_eval_horizon = int(config.get("TEACHER_EVAL_HORIZON", 250))
+    teacher_eval_episodes = int(config.get("TEACHER_EVAL_EPISODES", 1))
+    teacher_eval_num_envs = int(config.get("TEACHER_EVAL_NUM_ENVS", 4))
+    if teacher_eval_horizon < 1:
+        raise ValueError("TEACHER_EVAL_HORIZON must be >= 1")
+    if teacher_eval_episodes < 1:
+        raise ValueError("TEACHER_EVAL_EPISODES must be >= 1")
+    if teacher_eval_num_envs < 1:
+        raise ValueError("TEACHER_EVAL_NUM_ENVS must be >= 1")
+    teacher_lp_absolute = bool(config.get("TEACHER_LP_ABSOLUTE", False))
     base_obs_dim = int(env.observation_space(env_params).shape[0])
     goal_dim = 2
     policy_obs_dim = base_obs_dim + goal_dim if goal_conditioned else base_obs_dim
@@ -339,6 +373,14 @@ def make_train(config):
     teacher_episode_length = int(config.get("TEACHER_EPISODE_LENGTH", 8))
     if teacher_episode_length < 1:
         raise ValueError("TEACHER_EPISODE_LENGTH must be >= 1")
+    config["TEACHER_NUM_UPDATES"] = (
+        config["NUM_STUDENT_EPISODES_PER_ENV"] // teacher_episode_length
+    )
+    config["TEACHER_STUDENT_UPDATE_RATIO"] = (
+        config["TEACHER_NUM_UPDATES"] / config["NUM_UPDATES"]
+        if config["NUM_UPDATES"] > 0
+        else 0.0
+    )
     teacher_lr = config.get("TEACHER_LR", config["LR"])
     teacher_gamma = config.get("TEACHER_GAMMA", config["GAMMA"])
     teacher_gae_lambda = config.get("TEACHER_GAE_LAMBDA", config["GAE_LAMBDA"])
@@ -500,6 +542,53 @@ def make_train(config):
         pi, _ = network.apply(params, policy_obs)
         return jnp.clip(pi.mean(), action_low, action_high)
 
+    # Batched eval used by the "competence_lp" teacher reward: roll out the
+    # (deterministic) student conditioned on each proposed goal and measure the
+    # success rate of reaching it within ``goal_reached_threshold``.
+    _eval_env_reset = jax.vmap(base_env.reset)
+    _eval_env_step = jax.vmap(base_env.step)
+
+    def _eval_goal_competence(student_params, goals, obs_mean, obs_var, rng):
+        """Per-goal success rate of the deterministic student.
+
+        ``goals`` has shape ``[N, goal_dim]`` in normalized observation space.
+        For each goal we run ``TEACHER_EVAL_EPISODES * TEACHER_EVAL_NUM_ENVS``
+        independent fixed-horizon rollouts from fresh resets and return the
+        fraction that reach the goal, as ``[N]`` in ``[0, 1]``.
+        """
+        n_goals = goals.shape[0]
+        reps = teacher_eval_episodes * teacher_eval_num_envs
+        batch = n_goals * reps
+        # [N, reps, goal_dim] -> [N * reps, goal_dim] (goal index varies slowest).
+        goals_b = jnp.broadcast_to(
+            goals[:, None, :], (n_goals, reps, goals.shape[-1])
+        ).reshape(batch, goals.shape[-1])
+        rng, reset_rng = jax.random.split(rng)
+        reset_rngs = jax.random.split(reset_rng, batch)
+        state = _eval_env_reset(reset_rngs)
+
+        def step_fn(carry, _):
+            state, reached = carry
+            action = _eval_render_action(
+                student_params, state.obs, obs_mean, obs_var, goals_b
+            )
+            state = _eval_env_step(state, action)
+            norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
+            goal_dist = jnp.sqrt(
+                jnp.sum(jnp.square(_goal_xy_delta(norm_obs, goals_b)), axis=-1)
+            )
+            reached = jnp.logical_or(reached, goal_dist <= goal_reached_threshold)
+            return (state, reached), None
+
+        (_, reached), _ = jax.lax.scan(
+            step_fn,
+            (state, jnp.zeros((batch,), dtype=bool)),
+            None,
+            length=teacher_eval_horizon,
+        )
+        success = reached.astype(jnp.float32).reshape(n_goals, reps)
+        return jnp.mean(success, axis=-1)
+
     def _render_rollout_impl(params, teacher_params, rng, obs_mean, obs_var):
         rng, reset_rng = jax.random.split(rng)
         state = base_env.reset(reset_rng)
@@ -654,11 +743,34 @@ def make_train(config):
             train_state.params,
             sample_rng,
         )
+        # Initial "before" competence for the first proposed goal, measured with
+        # the freshly initialized student. Uses the post-reset obs-norm stats.
+        if teacher_reward_type == "competence_lp":
+            init_obs_mean, init_obs_var = _extract_obs_norm_stats(
+                env_state, base_obs_dim
+            )
+            if init_obs_mean is None:
+                init_obs_mean = jnp.zeros(base_obs_dim)
+                init_obs_var = jnp.ones(base_obs_dim)
+            teacher_rng, init_eval_rng = jax.random.split(teacher_rng)
+            init_competence_before = _eval_goal_competence(
+                train_state.params,
+                goal_batch,
+                init_obs_mean,
+                init_obs_var,
+                init_eval_rng,
+            )
+        else:
+            init_competence_before = jnp.zeros(
+                (config["NUM_ENVS"],), dtype=jnp.float32
+            )
         pending = PendingTeacher(
             obs=init_t_obs,
             action=init_t_action,
             value=init_t_value,
             log_prob=init_t_log_prob,
+            competence_before=init_competence_before,
+            goal=goal_batch,
         )
         # Teacher rollout buffer: one slot per completed student episode, plus a
         # trailing padding row that absorbs out-of-bounds / invalid writes.
@@ -719,6 +831,11 @@ def make_train(config):
                 goal_reward_term = jnp.zeros_like(reward)
                 episode_success = jnp.zeros_like(reward)
                 raw_goal_penalty = jnp.zeros_like(reward)
+                # Competence-LP scratch values (filled in the goal-conditioned
+                # branch when TEACHER_REWARD_TYPE == "competence_lp").
+                comp_after = jnp.zeros_like(reward)
+                comp_before_new = jnp.zeros_like(reward)
+                comp_before_old = jnp.zeros_like(reward)
                 if goal_conditioned:
                     if student_goal_reward_type == "sparse":
                         goal_dist = jnp.sqrt(
@@ -782,6 +899,42 @@ def make_train(config):
                         jnp.zeros_like(reached_any_in_episode),
                         reached_any_in_episode,
                     )
+                    # COMPETENCE-LP: at an episode boundary, re-evaluate the
+                    # student's success rate on the goal that was just active
+                    # (`pending.goal`, the "after" term) and on the freshly
+                    # proposed goal (the next episode's "before" term). The eval
+                    # runs only at boundaries via lax.cond (envs are synchronized
+                    # so done is all-or-none).
+                    if teacher_reward_type == "competence_lp":
+                        obs_mean, obs_var = _extract_obs_norm_stats(
+                            env_state, base_obs_dim
+                        )
+                        if obs_mean is None:
+                            obs_mean = jnp.zeros(base_obs_dim)
+                            obs_var = jnp.ones(base_obs_dim)
+
+                        def _do_competence_eval(operands):
+                            old_goals, fresh_goals, student_params, e_rng = operands
+                            r_after, r_before = jax.random.split(e_rng)
+                            c_after = _eval_goal_competence(
+                                student_params, old_goals, obs_mean, obs_var, r_after
+                            )
+                            c_before = _eval_goal_competence(
+                                student_params, fresh_goals, obs_mean, obs_var, r_before
+                            )
+                            return c_after, c_before
+
+                        def _skip_competence_eval(operands):
+                            zeros = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.float32)
+                            return zeros, zeros
+
+                        teacher_rng, eval_rng = jax.random.split(teacher_rng)
+                        comp_after, comp_before_new = jax.lax.cond(
+                            jnp.any(done_mask),
+                            _do_competence_eval,
+                            _skip_competence_eval,
+                            (pending.goal, new_goals, train_state.params, eval_rng),
+                        )
                 else:
                     done_mask = done.astype(bool)
                     episode_counts = episode_counts + done_mask.astype(jnp.int32)
@@ -802,13 +955,33 @@ def make_train(config):
                 # between the current and previous episode's value.
                 current_success = episode_success
                 current_goal_return = returned_goal_ep_returns
-                if teacher_reward_type == "success_rate":
-                    progress = (current_success - prev_episode_success) + student_reward
-                else:
-                    progress = (current_goal_return - prev_goal_ep_return) + student_reward
-                teacher_reward = jnp.where(
-                    done_mask, progress, jnp.zeros_like(progress)
+                task_episode_return = jnp.where(
+                    done_mask,
+                    info["returned_episode_returns"],
+                    jnp.zeros_like(reward),
                 )
+                weighted_task_return = teacher_task_return_weight * task_episode_return
+                if teacher_reward_type == "success_rate":
+                    progress = (current_success - prev_episode_success) + weighted_task_return
+                    teacher_reward = jnp.where(
+                        done_mask, progress, jnp.zeros_like(progress)
+                    )
+                elif teacher_reward_type == "goal_return":
+                    progress = (current_goal_return - prev_goal_ep_return) + weighted_task_return
+                    teacher_reward = jnp.where(
+                        done_mask, progress, jnp.zeros_like(progress)
+                    )
+                else:  # competence_lp
+                    # Same-goal learning progress: success rate after this
+                    # episode's student updates minus the success rate measured
+                    # when the goal was proposed.
+                    comp_before_old = pending.competence_before
+                    lp = comp_after - comp_before_old
+                    if teacher_lp_absolute:
+                        lp = jnp.abs(lp)
+                    teacher_reward = jnp.where(
+                        done_mask, lp + weighted_task_return, jnp.zeros_like(lp)
+                    )
                 prev_episode_success = jnp.where(
                     done_mask, current_success, prev_episode_success
                 )
@@ -857,6 +1030,10 @@ def make_train(config):
                         action=jnp.where(refresh_col, new_t_action, pending.action),
                         value=jnp.where(refresh, new_t_value, pending.value),
                         log_prob=jnp.where(refresh, new_t_log_prob, pending.log_prob),
+                        competence_before=jnp.where(
+                            refresh, comp_before_new, pending.competence_before
+                        ),
+                        goal=jnp.where(refresh_col, new_goals, pending.goal),
                     )
 
                 info = dict(info)
@@ -869,6 +1046,9 @@ def make_train(config):
                 info["returned_goal_reward_episode_returns"] = returned_goal_ep_returns
                 info["returned_goal_reward_episode"] = done_mask
                 info["teacher_reward"] = teacher_reward
+                # Competence-LP diagnostics (meaningful only on boundary steps).
+                info["teacher_competence_after"] = comp_after
+                info["teacher_competence_before"] = comp_before_old
                 transition = Transition(
                     done, action, value, reward, log_prob, policy_obs, info
                 )
@@ -1294,6 +1474,20 @@ def make_train(config):
                         payload["teacher_learning_progress"] = float(
                             teacher_reward_values.mean()
                         )
+                    if "teacher_competence_after" in info:
+                        comp_after_vals = info["teacher_competence_after"][
+                            info["returned_goal_reward_episode"]
+                        ]
+                        comp_before_vals = info["teacher_competence_before"][
+                            info["returned_goal_reward_episode"]
+                        ]
+                        if len(comp_after_vals) > 0:
+                            payload["teacher/competence_after"] = float(
+                                comp_after_vals.mean()
+                            )
+                            payload["teacher/competence_before"] = float(
+                                comp_before_vals.mean()
+                            )
                     # Teacher losses are only meaningful on steps where it updated.
                     if float(teacher_did_update) > 0.0:
                         payload.update(
@@ -1397,6 +1591,11 @@ def main():
 
     rng = jax.random.PRNGKey(config["SEED"])
     train_fn, render_eval_episode = make_train(config)
+    print(
+        f"Number of student updates: {config['NUM_UPDATES']}, "
+        f"teacher: {config['TEACHER_NUM_UPDATES']}, "
+        f"teacher/student ratio: {config['TEACHER_STUDENT_UPDATE_RATIO']:.6f}"
+    )
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
     jax.block_until_ready(train_output["runner_state"][6])
