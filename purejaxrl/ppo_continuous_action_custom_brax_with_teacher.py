@@ -34,14 +34,14 @@ except ImportError:
 class TrainConfig:
     LR: float = 3e-4
     NUM_ENVS: int = 1024
-    NUM_STEPS: int = 32
+    NUM_STEPS: int = 64
     TOTAL_TIMESTEPS: int = int(1e8)
     UPDATE_EPOCHS: int = 4
-    NUM_MINIBATCHES: int = 32
+    NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.95
     CLIP_EPS: float = 0.3
-    ENT_COEF: float = 0.0
+    ENT_COEF: float = 0.001
     VF_COEF: float = 0.5
     MAX_GRAD_NORM: float = 0.5
     ACTIVATION: str = "tanh"
@@ -51,7 +51,7 @@ class TrainConfig:
     ACTION_REPEAT: int = 1
     # Pass as JSON from CLI, e.g. --env-kwargs '{"foo": 1}'.
     ENV_KWARGS: str = "{}"
-    ANNEAL_LR: bool = True
+    ANNEAL_LR: bool = False
     NORMALIZE_ENV: bool = True
     DEBUG: bool = True
     SEED: int = 30
@@ -65,8 +65,12 @@ class TrainConfig:
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     GOAL_CONDITIONED: bool = True
     GOAL_REWARD_WEIGHT: float = 1.0
-    ANNEAL_GOAL_REWARD_WEIGHT: bool = True
+    ANNEAL_GOAL_REWARD_WEIGHT: bool = False
     STUDENT_GOAL_REWARD_TYPE: str="sparse" # this can either sparse or dense
+    # Optional goal-penalty normalization: "none", "running_std" (per-env running
+    # std) or "batch_minmax" (per-rollout min-max, applied before GAE).
+    GOAL_PENALTY_NORM_TYPE: str = "none"
+    GOAL_PENALTY_NORM_EPS: float = 1e-8
     TEACHER_DELTA_LOW: float = -10.0
     TEACHER_DELTA_HIGH: float = 10.0
     TEACHER_NUM_PROBING_STATES: int = 100
@@ -77,10 +81,10 @@ class TrainConfig:
     TEACHER_REWARD_TYPE: str = "goal_return"
     TEACHER_EPISODE_LENGTH: int = 8
     TEACHER_LR: float = 3e-4
-    TEACHER_GAMMA: float = 1.0
+    TEACHER_GAMMA: float = 0.999
     TEACHER_GAE_LAMBDA: float = 0.95
     TEACHER_CLIP_EPS: float = 0.3
-    TEACHER_ENT_COEF: float = 0.0
+    TEACHER_ENT_COEF: float = 0.05
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 0.5
     TEACHER_UPDATE_EPOCHS: int = 4
@@ -247,6 +251,20 @@ class PendingTeacher(NamedTuple):
     log_prob: jnp.ndarray
 
 
+class GoalPenaltyNormState(NamedTuple):
+    """Per-environment running mean/variance for the goal penalty.
+
+    Used by ``GOAL_PENALTY_NORM_TYPE == "running_std"`` to divide the goal
+    penalty by its per-env running standard deviation. Variance is initialized
+    to 1 (and count to a small value) so early normalization stays numerically
+    stable, mirroring the standard ``RunningMeanStd`` used for reward scaling.
+    """
+
+    mean: jnp.ndarray  # [NUM_ENVS]
+    var: jnp.ndarray  # [NUM_ENVS]
+    count: jnp.ndarray  # [NUM_ENVS]
+
+
 def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -288,6 +306,13 @@ def make_train(config):
         raise ValueError(
             "STUDENT_GOAL_REWARD_TYPE must be 'sparse' or 'dense'"
         )
+    goal_penalty_norm_type = config.get("GOAL_PENALTY_NORM_TYPE", "none")
+    if goal_penalty_norm_type not in ("none", "running_std", "batch_minmax"):
+        raise ValueError(
+            "GOAL_PENALTY_NORM_TYPE must be 'none', 'running_std' or "
+            "'batch_minmax'"
+        )
+    goal_penalty_norm_eps = float(config.get("GOAL_PENALTY_NORM_EPS", 1e-8))
     teacher_sample_every_n_episodes = int(
         config.get("TEACHER_SAMPLE_EVERY_N_EPISODES", 1)
     )
@@ -403,6 +428,20 @@ def make_train(config):
     def _goal_xy_delta(obs, goals):
         # Goal reaching is defined in the positional plane only.
         return obs[..., :2] - goals[..., :2]
+
+    def _update_goal_penalty_norm(norm_state, x):
+        """Per-env RunningMeanStd update with one new sample per env (batch=1)."""
+        delta = x - norm_state.mean
+        tot_count = norm_state.count + 1.0
+        mean = norm_state.mean + delta / tot_count
+        m_a = norm_state.var * norm_state.count
+        m2 = m_a + jnp.square(delta) * norm_state.count / tot_count
+        var = m2 / tot_count
+        return GoalPenaltyNormState(mean=mean, var=var, count=tot_count)
+
+    def _goal_penalty_running_std(norm_state):
+        """Per-env running standard deviation (variance floored by eps)."""
+        return jnp.sqrt(norm_state.var + goal_penalty_norm_eps)
 
     def linear_schedule(count):
         frac = (
@@ -594,6 +633,11 @@ def make_train(config):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
         avg_success_rate = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
+        goal_penalty_norm_state = GoalPenaltyNormState(
+            mean=jnp.zeros((config["NUM_ENVS"],), dtype=jnp.float32),
+            var=jnp.ones((config["NUM_ENVS"],), dtype=jnp.float32),
+            count=jnp.full((config["NUM_ENVS"],), 1e-4, dtype=jnp.float32),
+        )
         # Teacher proposes the initial goal (sampled) from each env's initial obs.
         rng, _rng = jax.random.split(rng)
         teacher_rng, sample_rng = jax.random.split(_rng)
@@ -655,6 +699,7 @@ def make_train(config):
                     teacher_buffer_count,
                     pending,
                     teacher_rng,
+                    goal_penalty_norm_state,
                 ) = runner_state
 
                 # SELECT ACTION
@@ -670,8 +715,10 @@ def make_train(config):
                 obsv, env_state, reward, done, info = env.step(
                     rng_step, env_state, action, env_params
                 )
+                student_reward = reward
                 goal_reward_term = jnp.zeros_like(reward)
                 episode_success = jnp.zeros_like(reward)
+                raw_goal_penalty = jnp.zeros_like(reward)
                 if goal_conditioned:
                     if student_goal_reward_type == "sparse":
                         goal_dist = jnp.sqrt(
@@ -682,6 +729,16 @@ def make_train(config):
                         goal_penalty = -jnp.sum(
                             jnp.square(_goal_xy_delta(obsv, goal_batch)), axis=-1
                         )
+
+                    # Keep the unnormalized penalty for logging and for the
+                    # batch_minmax path (applied post-rollout, before GAE).
+                    raw_goal_penalty = goal_penalty
+                    if goal_penalty_norm_type == "running_std":
+                        goal_penalty_norm_state = _update_goal_penalty_norm(
+                            goal_penalty_norm_state, raw_goal_penalty
+                        )
+                        running_std = _goal_penalty_running_std(goal_penalty_norm_state)
+                        goal_penalty = raw_goal_penalty / running_std
 
                     goal_reward_term = current_goal_reward_weight * goal_penalty
                     reward = reward + goal_reward_term
@@ -746,9 +803,9 @@ def make_train(config):
                 current_success = episode_success
                 current_goal_return = returned_goal_ep_returns
                 if teacher_reward_type == "success_rate":
-                    progress = (current_success - prev_episode_success)
+                    progress = (current_success - prev_episode_success) + student_reward
                 else:
-                    progress = (current_goal_return - prev_goal_ep_return)
+                    progress = (current_goal_return - prev_goal_ep_return) + student_reward
                 teacher_reward = jnp.where(
                     done_mask, progress, jnp.zeros_like(progress)
                 )
@@ -805,6 +862,10 @@ def make_train(config):
                 info = dict(info)
                 info["goal_reward_term"] = goal_reward_term
                 info["shaped_reward"] = reward
+                # Raw (unnormalized) penalty and base env reward, kept so the
+                # batch_minmax mode can rebuild the shaped reward post-rollout.
+                info["goal_penalty_raw"] = raw_goal_penalty
+                info["base_reward"] = student_reward
                 info["returned_goal_reward_episode_returns"] = returned_goal_ep_returns
                 info["returned_goal_reward_episode"] = done_mask
                 info["teacher_reward"] = teacher_reward
@@ -828,6 +889,7 @@ def make_train(config):
                     teacher_buffer_count,
                     pending,
                     teacher_rng,
+                    goal_penalty_norm_state,
                 )
                 return runner_state, transition
 
@@ -853,9 +915,26 @@ def make_train(config):
                 teacher_buffer_count,
                 pending,
                 teacher_rng,
+                goal_penalty_norm_state,
             ) = runner_state
             last_policy_obs = _concat_goal(last_obs, goal_batch)
             _, last_val = network.apply(train_state.params, last_policy_obs)
+
+            # BATCH MIN-MAX NORMALIZATION (applied after rollout collection,
+            # before GAE). Rebuilds the student shaped reward from the base env
+            # reward plus the weight-scaled, min-max normalized goal penalty
+            # over the whole just-collected rollout batch.
+            if goal_conditioned and goal_penalty_norm_type == "batch_minmax":
+                gp = traj_batch.info["goal_penalty_raw"]
+                gp_min = jnp.min(gp)
+                gp_max = jnp.max(gp)
+                gp_norm = (gp - gp_min) / (gp_max - gp_min + goal_penalty_norm_eps)
+                new_goal_reward_term = current_goal_reward_weight * gp_norm
+                new_reward = traj_batch.info["base_reward"] + new_goal_reward_term
+                new_info = dict(traj_batch.info)
+                new_info["goal_reward_term"] = new_goal_reward_term
+                new_info["shaped_reward"] = new_reward
+                traj_batch = traj_batch._replace(reward=new_reward, info=new_info)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -1202,6 +1281,10 @@ def make_train(config):
                         "goal_reward_weight": float(current_goal_reward_weight),
                         "goal_reward_term_mean": float(info["goal_reward_term"].mean()),
                         "shaped_reward_mean": float(info["shaped_reward"].mean()),
+                        "goal_penalty_raw_mean": float(info["goal_penalty_raw"].mean()),
+                        "goal_penalty_raw_std": float(info["goal_penalty_raw"].std()),
+                        "goal_penalty_raw_min": float(info["goal_penalty_raw"].min()),
+                        "goal_penalty_raw_max": float(info["goal_penalty_raw"].max()),
                     }
                     if len(goal_return_values) > 0:
                         payload["episodic_goal_shaping_return"] = float(
@@ -1259,6 +1342,7 @@ def make_train(config):
                 teacher_buffer_count,
                 pending,
                 teacher_rng,
+                goal_penalty_norm_state,
             )
             return runner_state, metric
 
@@ -1285,6 +1369,7 @@ def make_train(config):
             teacher_buffer_count,
             pending,
             teacher_rng,
+            goal_penalty_norm_state,
         )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
