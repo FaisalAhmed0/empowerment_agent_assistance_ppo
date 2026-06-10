@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="teacher_single_student_2"
+WANDB_PROJECT_NAME="teacher_single_student_bounded_variance_in_policy"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
 
 ENV_NAMES=("ant_u_maze_single_goal")
@@ -9,12 +9,14 @@ TOTAL_TIMESTEPS_=(500000000)
 LRS=(0.0003)
 SEEDS=(30)
 
+BOUND_STUDENT_VARIANCE="--BOUND_STUDENT_VARIANCE"
+BOUND_TEACHER_VARIANCE="--BOUND_TEACHER_VARIANCE"
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 TEACHER_PROBE_AGG=(concat)
 TEACHER_REWARD_TYPE=(competence_lp)
 STUDENT_GOAL_REWARD_TYPE=(sparse dense)
-NUM_ENVSS=(1024)
+NUM_ENVSS=(256 1024)
 TEACHER_LR=(0.001)
 TEACHER_EPISODE_LENGTH=(4 8)
 TEACHER_SAMPLE_EVERY_N_EPISODES=(1)
@@ -50,6 +52,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --LR=${LR} \
                         --SEED=${SEED} \
                         ${ANNEAL_GOAL_REWARD_WEIGHT} \
+                        ${BOUND_STUDENT_VARIANCE} \
+                        ${BOUND_TEACHER_VARIANCE} \
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
                         --NUM_STEPS=${num_steps} \

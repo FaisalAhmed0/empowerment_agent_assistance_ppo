@@ -10,3 +10,4 @@ brax
 wandb
 flashbax
 navix
+matplotlib

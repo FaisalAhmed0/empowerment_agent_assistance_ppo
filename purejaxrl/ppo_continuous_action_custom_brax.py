@@ -487,9 +487,9 @@ def make_train(config):
 def main():
     config = {
         "LR": 3e-4,
-        "NUM_ENVS": 2048,
+        "NUM_ENVS": 1024,
         "NUM_STEPS": 64,
-        "TOTAL_TIMESTEPS": 1e8,
+        "TOTAL_TIMESTEPS": 5e8,
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 32,
         "GAMMA": 0.99,
@@ -500,9 +500,9 @@ def main():
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
-        "ENV_NAME": "ant_u_maze",
+        "ENV_NAME": "ant_u_maze_single_goal",
         "ENV_BACKEND": None,
-        "EPISODE_LENGTH": 1000,
+        "EPISODE_LENGTH": 500,
         "ACTION_REPEAT": 1,
         "ENV_KWARGS": {},
         "ANNEAL_LR": True,

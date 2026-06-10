@@ -98,6 +98,16 @@ class TrainConfig:
     TEACHER_MAX_GRAD_NORM: float = 0.5
     TEACHER_UPDATE_EPOCHS: int = 4
     TEACHER_NUM_MINIBATCHES: int = 4
+    # Teacher goal visualization: scatter the last N proposed goals together
+    # with the agent's starting x/y position.
+    TEACHER_GOAL_VIZ_BUFFER_SIZE: int = 10000
+    TEACHER_GOAL_VIZ_LOG_EVERY_UPDATES: int = 100
+    TEACHER_GOAL_VIZ_LOG_WANDB: bool = True
+
+
+    ### Bounding the studnet variacne
+    BOUND_STUDENT_VARIANCE: bool = False
+    BOUND_TEACHER_VARIANCE: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         config = asdict(self)
@@ -120,6 +130,7 @@ def parse_config_from_cli() -> TrainConfig:
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
+    bound_variance: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -139,7 +150,10 @@ class ActorCritic(nn.Module):
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        if self.bound_student_variance:
+            pi = distrax.MultivariateNormalDiag(actor_mean, 1.5 * jax.nn.sigmoid(actor_logtstd))
+        else: 
+            pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
         critic = nn.Dense(
             256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
@@ -174,6 +188,7 @@ class TeacherGoalPolicy(nn.Module):
     delta_high: float = 1.0
     probe_agg: str = "mean"
     activation: str = "tanh"
+    bound_variance: bool = False
 
     @nn.compact
     def __call__(self, x, student_apply, student_params):
@@ -215,7 +230,10 @@ class TeacherGoalPolicy(nn.Module):
             self.obs_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_h)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.obs_dim,))
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        if self.bound_variance:
+            pi = distrax.MultivariateNormalDiag(actor_mean, 1.5 * jax.nn.sigmoid(actor_logtstd))
+        else: 
+            pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
         critic_h = nn.Dense(
             256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic_in)
@@ -280,6 +298,109 @@ class GoalPenaltyNormState(NamedTuple):
     count: jnp.ndarray  # [NUM_ENVS]
 
 
+class TeacherGoalVizBuffer(NamedTuple):
+    """Fixed-size ring buffer holding the most recent teacher-proposed goals.
+
+    ``goals`` keeps the last ``buffer_size`` 2D goals; ``write_idx`` is the next
+    slot to overwrite and ``count`` is ``min(total_written, buffer_size)``.
+    """
+
+    goals: jnp.ndarray  # [buffer_size, 2]
+    write_idx: jnp.ndarray  # scalar int32
+    count: jnp.ndarray  # scalar int32
+
+
+def _append_teacher_goals(buf, new_goals, record):
+    """Append ``new_goals`` (``[N, 2]``) into the ring buffer when ``record``.
+
+    Writing happens in a JAX-pure way: ``N`` consecutive (wrapped) slots are
+    overwritten starting at ``write_idx``. When ``record`` is false the buffer
+    is returned unchanged so this is safe to call every env step.
+    """
+    n = new_goals.shape[0]
+    buffer_size = buf.goals.shape[0]
+    idx = (buf.write_idx + jnp.arange(n)) % buffer_size
+    updated_goals = buf.goals.at[idx].set(new_goals)
+    goals = jnp.where(record, updated_goals, buf.goals)
+    write_idx = jnp.where(record, (buf.write_idx + n) % buffer_size, buf.write_idx)
+    count = jnp.where(
+        record, jnp.minimum(buf.count + n, buffer_size), buf.count
+    )
+    return TeacherGoalVizBuffer(goals=goals, write_idx=write_idx, count=count)
+
+
+def _extract_teacher_goals(buf) -> np.ndarray:
+    """Return the valid goals from a (host-side) buffer as ``[M, 2]`` numpy."""
+    goals = np.asarray(buf.goals)
+    count = int(buf.count)
+    buffer_size = goals.shape[0]
+    if count >= buffer_size:
+        return goals
+    return goals[:count]
+
+
+def _denorm_xy(xy, obs_mean, obs_var):
+    """Invert ``NormalizeVecObservation`` on the x/y dims for plotting."""
+    if obs_mean is None or obs_var is None:
+        return xy
+    mean_xy = np.asarray(obs_mean)[:2]
+    std_xy = np.sqrt(np.asarray(obs_var)[:2] + 1e-8)
+    return np.asarray(xy) * std_xy + mean_xy
+
+
+def plot_teacher_goals(start_xy, goals, *, ax=None, title=None, save_path=None):
+    """Scatter the agent start position and the teacher-proposed goals.
+
+    ``start_xy`` is the agent's starting ``(x, y)`` and ``goals`` is an
+    ``[M, 2]`` array of proposed goals. Returns ``(fig, ax)``.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    else:
+        fig = ax.figure
+
+    goals = np.asarray(goals)
+    if goals.size > 0:
+        ax.scatter(
+            goals[:, 0],
+            goals[:, 1],
+            s=12,
+            c="tab:blue",
+            alpha=0.9,
+            edgecolors="none",
+            label=f"Teacher goals (n={goals.shape[0]})",
+        )
+
+    start_xy = np.asarray(start_xy).reshape(-1)
+    ax.scatter(
+        start_xy[0],
+        start_xy[1],
+        s=200,
+        marker="*",
+        c="tab:green",
+        edgecolors="black",
+        linewidths=0.5,
+        zorder=3,
+        label="Agent start",
+    )
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    if title is not None:
+        ax.set_title(title)
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig, ax
+
+
 def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -323,6 +444,19 @@ def make_train(config):
     goal_conditioned = config.get("GOAL_CONDITIONED", False)
     goal_reward_weight = config.get("GOAL_REWARD_WEIGHT", 0.0)
     anneal_goal_reward_weight = config.get("ANNEAL_GOAL_REWARD_WEIGHT", False)
+    teacher_goal_viz_buffer_size = int(
+        config.get("TEACHER_GOAL_VIZ_BUFFER_SIZE", 10000)
+    )
+    bound_student_variance = config.get("BOUND_STUDENT_VARIANCE", False)
+    bound_teacher_variance = config.get("BOUND_TEACHER_VARIANCE", False)
+    if teacher_goal_viz_buffer_size < 1:
+        raise ValueError("TEACHER_GOAL_VIZ_BUFFER_SIZE must be >= 1")
+    teacher_goal_viz_log_every_updates = int(
+        config.get("TEACHER_GOAL_VIZ_LOG_EVERY_UPDATES", 100)
+    )
+    if teacher_goal_viz_log_every_updates < 1:
+        raise ValueError("TEACHER_GOAL_VIZ_LOG_EVERY_UPDATES must be >= 1")
+    teacher_goal_viz_log_wandb = bool(config.get("TEACHER_GOAL_VIZ_LOG_WANDB", True))
     student_goal_reward_type = config.get("STUDENT_GOAL_REWARD_TYPE", "sparse")
     if student_goal_reward_type not in ("sparse", "dense"):
         raise ValueError(
@@ -399,7 +533,7 @@ def make_train(config):
     config["TEACHER_MINIBATCH_SIZE"] = teacher_batch_size // teacher_num_minibatches
 
     network = ActorCritic(
-        env.action_space(env_params).shape[0], activation=config["ACTIVATION"]
+        env.action_space(env_params).shape[0], activation=config["ACTIVATION"], bound_variance=bound_student_variance
     )
 
     # Trainable teacher policy: maps a reference observation to a goal delta.
@@ -411,6 +545,7 @@ def make_train(config):
         delta_high=teacher_delta_high,
         probe_agg=teacher_probe_agg,
         activation=config["ACTIVATION"],
+        bound_variance=bound_teacher_variance
     )
     teacher_rng, student_dummy_rng = jax.random.split(
         jax.random.PRNGKey(config.get("SEED", 0))
@@ -681,6 +816,49 @@ def make_train(config):
             print(f"[render_eval_episode] skipped video logging: {err}")
             traceback.print_exc()
 
+    def log_teacher_goal_viz_plot(goal_viz_buffer, agent_start_xy, final_env_state, step):
+        """Plot the agent start and teacher-proposed goals; log to wandb."""
+        try:
+            import matplotlib.pyplot as plt
+
+            buffer_host = jax.device_get(goal_viz_buffer)
+            start_xy = np.asarray(jax.device_get(agent_start_xy)).reshape(-1)
+            goals = _extract_teacher_goals(buffer_host)
+
+            obs_mean, obs_var = _extract_obs_norm_stats(final_env_state, base_obs_dim)
+            if config.get("NORMALIZE_ENV", False) and obs_mean is not None:
+                obs_mean = jax.device_get(obs_mean)
+                obs_var = jax.device_get(obs_var)
+                start_xy = _denorm_xy(start_xy, obs_mean, obs_var)
+                if goals.shape[0] > 0:
+                    goals = _denorm_xy(goals, obs_mean, obs_var)
+
+            if goals.shape[0] == 0:
+                print("[log_teacher_goal_viz_plot] goal buffer empty; plotting start only.")
+
+            exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
+            exp_name = (
+                wandb.run.name
+                if wandb.run is not None and wandb.run.name
+                else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+            )
+            save_path = os.path.join(exp_dir, f"{exp_name}_teacher_goals_{step}.png")
+            fig, _ = plot_teacher_goals(
+                start_xy,
+                goals,
+                title=f'Teacher goals @ step {step} ({config["ENV_NAME"]})',
+                save_path=save_path,
+            )
+            if (
+                teacher_goal_viz_log_wandb
+                and config.get("WANDB_MODE", "disabled") == "online"
+            ):
+                wandb.log({"teacher/goal_scatter": wandb.Image(fig)}, step=step)
+            plt.close(fig)
+        except Exception as err:
+            print(f"[log_teacher_goal_viz_plot] skipped goal plot: {err}")
+            traceback.print_exc()
+
     def train(rng):
         wandb_log_every_updates = int(config.get("WANDB_LOG_EVERY_UPDATES", 10))
         if wandb_log_every_updates < 1:
@@ -785,6 +963,18 @@ def make_train(config):
         )
         teacher_buffer_count = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
 
+        # Agent starting x/y (mean across parallel envs) for the goal viz plot.
+        agent_start_xy = jnp.mean(obsv[:, :2], axis=0)
+        # Ring buffer of recent teacher-proposed goals (seeded with the first proposal).
+        goal_viz_buffer = TeacherGoalVizBuffer(
+            goals=jnp.zeros((teacher_goal_viz_buffer_size, goal_dim)),
+            write_idx=jnp.int32(0),
+            count=jnp.int32(0),
+        )
+        goal_viz_buffer = _append_teacher_goals(
+            goal_viz_buffer, goal_batch, jnp.bool_(goal_conditioned)
+        )
+
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
             current_goal_reward_weight = (
@@ -812,6 +1002,7 @@ def make_train(config):
                     pending,
                     teacher_rng,
                     goal_penalty_norm_state,
+                    goal_viz_buffer,
                 ) = runner_state
 
                 # SELECT ACTION
@@ -893,6 +1084,10 @@ def make_train(config):
                         sample_rng,
                     )
                     goal_batch = jnp.where(refresh[:, None], new_goals, goal_batch)
+                    # Record the freshly proposed goals for visualization.
+                    goal_viz_buffer = _append_teacher_goals(
+                        goal_viz_buffer, new_goals, jnp.any(refresh)
+                    )
                     episode_counts = completed_episode_counts
                     reached_any_in_episode = jnp.where(
                         done_mask,
@@ -1070,6 +1265,7 @@ def make_train(config):
                     pending,
                     teacher_rng,
                     goal_penalty_norm_state,
+                    goal_viz_buffer,
                 )
                 return runner_state, transition
 
@@ -1096,6 +1292,7 @@ def make_train(config):
                 pending,
                 teacher_rng,
                 goal_penalty_norm_state,
+                goal_viz_buffer,
             ) = runner_state
             last_policy_obs = _concat_goal(last_obs, goal_batch)
             _, last_val = network.apply(train_state.params, last_policy_obs)
@@ -1519,6 +1716,29 @@ def make_train(config):
                     ),
                 )
 
+                if goal_conditioned:
+
+                    def goal_viz_callback(args):
+                        update_idx, info, buf, start_xy, env_state = args
+                        # import pdb; pdb.set_trace()
+                        if (
+                            int(update_idx) + 1
+                        ) % teacher_goal_viz_log_every_updates != 0:
+                            return
+                        step = int(info["timestep"].max() * config["NUM_ENVS"])
+                        log_teacher_goal_viz_plot(buf, start_xy, env_state, step)
+
+                    jax.debug.callback(
+                        goal_viz_callback,
+                        (
+                            update_idx,
+                            metric,
+                            goal_viz_buffer,
+                            agent_start_xy,
+                            env_state,
+                        ),
+                    )
+
             runner_state = (
                 train_state,
                 env_state,
@@ -1537,6 +1757,7 @@ def make_train(config):
                 pending,
                 teacher_rng,
                 goal_penalty_norm_state,
+                goal_viz_buffer,
             )
             return runner_state, metric
 
@@ -1564,6 +1785,7 @@ def make_train(config):
             pending,
             teacher_rng,
             goal_penalty_norm_state,
+            goal_viz_buffer,
         )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
@@ -1571,9 +1793,11 @@ def make_train(config):
         return {
             "runner_state": runner_state,
             "metrics": metric,
+            "teacher_goal_viz": runner_state[-1],
+            "agent_start_xy": agent_start_xy,
         }
 
-    return train, render_eval_episode
+    return train, render_eval_episode, log_teacher_goal_viz_plot
 
 
 def main():
@@ -1590,7 +1814,7 @@ def main():
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
-    train_fn, render_eval_episode = make_train(config)
+    train_fn, render_eval_episode, log_teacher_goal_viz_plot = make_train(config)
     print(
         f"Number of student updates: {config['NUM_UPDATES']}, "
         f"teacher: {config['TEACHER_NUM_UPDATES']}, "
@@ -1610,6 +1834,13 @@ def main():
         final_rng,
         final_env_state,
     )
+    if config.get("GOAL_CONDITIONED", False):
+        log_teacher_goal_viz_plot(
+            train_output["teacher_goal_viz"],
+            train_output["agent_start_xy"],
+            final_env_state,
+            step=int(config["TOTAL_TIMESTEPS"]),
+        )
 
 
 if __name__ == "__main__":
