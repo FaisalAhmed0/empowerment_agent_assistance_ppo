@@ -36,7 +36,7 @@ class TrainConfig:
     NUM_ENVS: int = 1024
     NUM_STEPS: int = 64
     TOTAL_TIMESTEPS: int = int(5e8)
-    UPDATE_EPOCHS: int = 4
+    UPDATE_EPOCHS: int = 8
     NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.95
