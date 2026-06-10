@@ -40,7 +40,7 @@ class TrainConfig:
     NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.95
-    CLIP_EPS: float = 0.3
+    CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.001
     VF_COEF: float = 0.5
     MAX_GRAD_NORM: float = 0.5
@@ -92,7 +92,7 @@ class TrainConfig:
     TEACHER_LR: float = 3e-4
     TEACHER_GAMMA: float = 0.999
     TEACHER_GAE_LAMBDA: float = 0.95
-    TEACHER_CLIP_EPS: float = 0.3
+    TEACHER_CLIP_EPS: float = 0.2
     TEACHER_ENT_COEF: float = 0.05
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 0.5

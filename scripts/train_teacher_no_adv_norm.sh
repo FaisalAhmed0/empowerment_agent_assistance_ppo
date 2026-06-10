@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="teacher_single_student_bounded_variance_in_policy"
+WANDB_PROJECT_NAME="teacher_single_student_no_adv_norm"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
 
 ENV_NAMES=("ant_u_maze_single_goal")
