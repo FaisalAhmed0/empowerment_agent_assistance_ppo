@@ -71,8 +71,8 @@ class TrainConfig:
     # std) or "batch_minmax" (per-rollout min-max, applied before GAE).
     GOAL_PENALTY_NORM_TYPE: str = "none"
     GOAL_PENALTY_NORM_EPS: float = 1e-8
-    TEACHER_DELTA_LOW: float = -10.0
-    TEACHER_DELTA_HIGH: float = 10.0
+    TEACHER_DELTA_LOW: float = -8.0
+    TEACHER_DELTA_HIGH: float = 8.0
     TEACHER_NUM_PROBING_STATES: int = 100
     TEACHER_PROBE_AGG: str = "concat"
     TEACHER_SAMPLE_EVERY_N_EPISODES: int = 1
@@ -100,14 +100,17 @@ class TrainConfig:
     TEACHER_NUM_MINIBATCHES: int = 4
     # Teacher goal visualization: scatter the last N proposed goals together
     # with the agent's starting x/y position.
-    TEACHER_GOAL_VIZ_BUFFER_SIZE: int = 10000
-    TEACHER_GOAL_VIZ_LOG_EVERY_UPDATES: int = 100
+    TEACHER_GOAL_VIZ_BUFFER_SIZE: int = 5000
+    TEACHER_GOAL_VIZ_LOG_EVERY_UPDATES: int = 500
     TEACHER_GOAL_VIZ_LOG_WANDB: bool = True
 
 
     ### Bounding the studnet variacne
     BOUND_STUDENT_VARIANCE: bool = False
     BOUND_TEACHER_VARIANCE: bool = False
+    # Per-minibatch advantage normalization: (gae - mean) / (std + eps).
+    NORMALIZE_STUDENT_ADVANTAGE: bool = True
+    NORMALIZE_TEACHER_ADVANTAGE: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         config = asdict(self)
@@ -151,7 +154,7 @@ class ActorCritic(nn.Module):
         )(actor_mean)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
         if self.bound_variance:
-            pi = distrax.MultivariateNormalDiag(actor_mean, 1.5 * jax.nn.sigmoid(actor_logtstd))
+            pi = distrax.MultivariateNormalDiag(actor_mean,  jax.nn.sigmoid(actor_logtstd))
         else: 
             pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
@@ -231,7 +234,7 @@ class TeacherGoalPolicy(nn.Module):
         )(actor_h)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.obs_dim,))
         if self.bound_variance:
-            pi = distrax.MultivariateNormalDiag(actor_mean, 1.5 * jax.nn.sigmoid(actor_logtstd))
+            pi = distrax.MultivariateNormalDiag(actor_mean, jax.nn.sigmoid(actor_logtstd))
         else: 
             pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
         critic_h = nn.Dense(
@@ -449,6 +452,12 @@ def make_train(config):
     )
     bound_student_variance = config.get("BOUND_STUDENT_VARIANCE", False)
     bound_teacher_variance = config.get("BOUND_TEACHER_VARIANCE", False)
+    normalize_student_advantage = bool(
+        config.get("NORMALIZE_STUDENT_ADVANTAGE", True)
+    )
+    normalize_teacher_advantage = bool(
+        config.get("NORMALIZE_TEACHER_ADVANTAGE", True)
+    )
     if teacher_goal_viz_buffer_size < 1:
         raise ValueError("TEACHER_GOAL_VIZ_BUFFER_SIZE must be >= 1")
     teacher_goal_viz_log_every_updates = int(
@@ -1361,7 +1370,8 @@ def make_train(config):
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        if normalize_student_advantage:
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -1497,7 +1507,8 @@ def make_train(config):
                                 value_losses, value_losses_clipped
                             ).mean()
                             ratio = jnp.exp(log_prob - traj_b.log_prob)
-                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                            if normalize_teacher_advantage:
+                                gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                             loss_actor1 = ratio * gae
                             loss_actor2 = (
                                 jnp.clip(
