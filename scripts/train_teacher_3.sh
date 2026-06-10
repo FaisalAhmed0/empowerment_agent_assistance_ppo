@@ -46,7 +46,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for rwd_norm_type in "${RWD_NORM_TYPE[@]}"; do
                         for num_envs in "${NUM_ENVSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_teacherlr${teacher_lr}_probeagg${teacher_probe_agg}_treward${teacher_reward_type}_sgoal${student_goal_reward_type}_teplen${teacher_episode_length}_sampleevery${teacher_sample_every_n_episodes}"
-                      CMD="sbatch submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py \
+                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py \
                         --ENV_NAME=${ENV_NAME} \
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \

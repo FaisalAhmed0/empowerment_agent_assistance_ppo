@@ -150,7 +150,7 @@ class ActorCritic(nn.Module):
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
-        if self.bound_student_variance:
+        if self.bound_variance:
             pi = distrax.MultivariateNormalDiag(actor_mean, 1.5 * jax.nn.sigmoid(actor_logtstd))
         else: 
             pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
