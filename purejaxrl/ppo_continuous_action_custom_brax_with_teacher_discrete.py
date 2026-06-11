@@ -71,8 +71,18 @@ class TrainConfig:
     # std) or "batch_minmax" (per-rollout min-max, applied before GAE).
     GOAL_PENALTY_NORM_TYPE: str = "none"
     GOAL_PENALTY_NORM_EPS: float = 1e-8
+    # Legacy continuous-delta bounds (unused in this discrete-teacher script,
+    # kept so existing CLI invocations do not break).
     TEACHER_DELTA_LOW: float = -8.0
     TEACHER_DELTA_HIGH: float = 8.0
+    # Discrete teacher action space: a grid of (x, y) offsets built with
+    # linspace + meshgrid. The teacher emits a categorical index into this grid
+    # and the goal is reference_obs[:2] + offset_grid[index].
+    TEACHER_OFFSET_X_LOW: float = 0.0
+    TEACHER_OFFSET_X_HIGH: float = 8.0
+    TEACHER_OFFSET_Y_LOW: float = 0.0
+    TEACHER_OFFSET_Y_HIGH: float = 10.0
+    TEACHER_NUM_OFFSET_POINTS: int = 30  # points per axis; grid = points^2 actions
     TEACHER_NUM_PROBING_STATES: int = 100
     TEACHER_PROBE_AGG: str = "concat"
     TEACHER_SAMPLE_EVERY_N_EPISODES: int = 1
@@ -174,24 +184,19 @@ class ActorCritic(nn.Module):
 
 
 class TeacherGoalPolicy(nn.Module):
-    """Stochastic PPO policy that maps an observation to a goal delta.
+    """Categorical (softmax) PPO policy over a discrete grid of goal offsets.
 
-    The actor outputs a Gaussian over an unbounded 2D raw delta (x/y only); the
-    raw sample is squashed externally (see ``_squash_delta``) so each component
-    lies in ``[delta_low, delta_high]`` and the goal is
-    ``reference_obs[..., :2] + delta_xy``.
-    PPO trains on the raw (pre-squash) action, mirroring how the student uses the
-    ``ClipAction`` wrapper.
+    The actor outputs ``num_actions`` logits, one per ``(x, y)`` offset in a
+    precomputed grid (see ``offset_grid`` in ``make_train``). The teacher emits a
+    categorical index; the goal is ``reference_obs[..., :2] + offset_grid[index]``.
+    PPO trains directly on the discrete action index.
     """
 
-    obs_dim: int
+    num_actions: int
     student_obs_dim: int
     num_probing_states: int
-    delta_low: float = -1.0
-    delta_high: float = 1.0
     probe_agg: str = "mean"
     activation: str = "tanh"
-    bound_variance: bool = False
 
     @nn.compact
     def __call__(self, x, student_apply, student_params):
@@ -229,14 +234,10 @@ class TeacherGoalPolicy(nn.Module):
             256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_h)
         actor_h = activation(actor_h)
-        actor_mean = nn.Dense(
-            self.obs_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        logits = nn.Dense(
+            self.num_actions, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_h)
-        actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.obs_dim,))
-        if self.bound_variance:
-            pi = distrax.MultivariateNormalDiag(actor_mean, jax.nn.sigmoid(actor_logtstd))
-        else: 
-            pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        pi = distrax.Categorical(logits=logits)
         critic_h = nn.Dense(
             256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic_in)
@@ -510,6 +511,28 @@ def make_train(config):
     teacher_num_probing_states = int(config.get("TEACHER_NUM_PROBING_STATES", 8))
     teacher_probe_agg = config.get("TEACHER_PROBE_AGG", "mean")
 
+    # Discrete teacher action space: a grid of (x, y) offsets. The teacher emits
+    # a categorical index into ``offset_grid`` and the goal is
+    # ``reference_obs[:2] + offset_grid[index]``.
+    teacher_offset_x_low = float(config.get("TEACHER_OFFSET_X_LOW", 0.0))
+    teacher_offset_x_high = float(config.get("TEACHER_OFFSET_X_HIGH", 8.0))
+    teacher_offset_y_low = float(config.get("TEACHER_OFFSET_Y_LOW", 0.0))
+    teacher_offset_y_high = float(config.get("TEACHER_OFFSET_Y_HIGH", 10.0))
+    teacher_num_offset_points = int(config.get("TEACHER_NUM_OFFSET_POINTS", 30))
+    if teacher_num_offset_points < 1:
+        raise ValueError("TEACHER_NUM_OFFSET_POINTS must be >= 1")
+    _offset_xs = jnp.linspace(
+        teacher_offset_x_low, teacher_offset_x_high, teacher_num_offset_points
+    )
+    _offset_ys = jnp.linspace(
+        teacher_offset_y_low, teacher_offset_y_high, teacher_num_offset_points
+    )
+    _offset_gx, _offset_gy = jnp.meshgrid(_offset_xs, _offset_ys)
+    offset_grid = jnp.stack(
+        [_offset_gx.reshape(-1), _offset_gy.reshape(-1)], axis=-1
+    )  # [num_actions, 2]
+    num_teacher_actions = teacher_num_offset_points * teacher_num_offset_points
+
     # Teacher PPO hyper-parameters. The teacher acts on the student-episode
     # timeline: one transition per completed student episode and one teacher
     # episode (== one teacher rollout) every TEACHER_EPISODE_LENGTH episodes.
@@ -545,16 +568,14 @@ def make_train(config):
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], bound_variance=bound_student_variance
     )
 
-    # Trainable teacher policy: maps a reference observation to a goal delta.
+    # Trainable teacher policy: maps a reference observation to a categorical
+    # distribution over the discrete grid of goal offsets.
     teacher_network = TeacherGoalPolicy(
-        obs_dim=goal_dim,
+        num_actions=num_teacher_actions,
         student_obs_dim=policy_obs_dim,
         num_probing_states=teacher_num_probing_states,
-        delta_low=teacher_delta_low,
-        delta_high=teacher_delta_high,
         probe_agg=teacher_probe_agg,
         activation=config["ACTIVATION"],
-        bound_variance=bound_teacher_variance
     )
     teacher_rng, student_dummy_rng = jax.random.split(
         jax.random.PRNGKey(config.get("SEED", 0))
@@ -573,11 +594,9 @@ def make_train(config):
             )
         return jnp.concatenate([reference_obs, avg_success_rate[..., None]], axis=-1)
 
-    def _squash_delta(raw):
-        """Squash an unbounded raw delta into ``[delta_low, delta_high]``."""
-        return teacher_delta_low + (teacher_delta_high - teacher_delta_low) * 0.5 * (
-            jnp.tanh(raw) + 1.0
-        )
+    def _index_to_offset(action):
+        """Map a categorical action index to its ``(x, y)`` offset on the grid."""
+        return offset_grid[action]
 
     def _teacher_apply(teacher_params, teacher_input, student_params):
         return teacher_network.apply(
@@ -589,22 +608,23 @@ def make_train(config):
     ):
         """Sample a goal from the teacher policy.
 
-        Returns ``(goal, teacher_input, raw_action, log_prob, value)`` so the
-        proposal can be stored as a PPO transition.
+        Returns ``(goal, teacher_input, action, log_prob, value)`` where
+        ``action`` is the discrete grid index, so the proposal can be stored as a
+        PPO transition.
         """
         teacher_input = _teacher_input(reference_obs, avg_success_rate)
         pi, value = _teacher_apply(teacher_params, teacher_input, student_params)
-        raw_action = pi.sample(seed=rng)
-        log_prob = pi.log_prob(raw_action)
-        goal = reference_obs[..., :2] + _squash_delta(raw_action)
-        return goal, teacher_input, raw_action, log_prob, value
+        action = pi.sample(seed=rng)
+        log_prob = pi.log_prob(action)
+        goal = reference_obs[..., :2] + _index_to_offset(action)
+        return goal, teacher_input, action, log_prob, value
 
     def _teacher_goal_det(teacher_params, reference_obs, avg_success_rate, student_params):
-        """Deterministic goal (uses the policy mean) for eval/rendering."""
+        """Deterministic goal (uses the most-likely action) for eval/rendering."""
         pi, _ = _teacher_apply(
             teacher_params, _teacher_input(reference_obs, avg_success_rate), student_params
         )
-        return reference_obs[..., :2] + _squash_delta(pi.mean())
+        return reference_obs[..., :2] + _index_to_offset(pi.mode())
 
     def _concat_goal(obs, goals):
         if not goal_conditioned:
@@ -964,7 +984,7 @@ def make_train(config):
         _buf_rows = teacher_episode_length + 1
         teacher_buffer = TeacherTransition(
             done=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
-            action=jnp.zeros((_buf_rows, config["NUM_ENVS"], goal_dim)),
+            action=jnp.zeros((_buf_rows, config["NUM_ENVS"]), dtype=jnp.int32),
             value=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
             reward=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
             log_prob=jnp.zeros((_buf_rows, config["NUM_ENVS"])),
@@ -1231,7 +1251,7 @@ def make_train(config):
                     refresh_col = refresh[:, None]
                     pending = PendingTeacher(
                         obs=jnp.where(refresh_col, new_t_obs, pending.obs),
-                        action=jnp.where(refresh_col, new_t_action, pending.action),
+                        action=jnp.where(refresh, new_t_action, pending.action),
                         value=jnp.where(refresh, new_t_value, pending.value),
                         log_prob=jnp.where(refresh, new_t_log_prob, pending.log_prob),
                         competence_before=jnp.where(
