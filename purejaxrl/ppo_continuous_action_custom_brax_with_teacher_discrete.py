@@ -405,6 +405,58 @@ def plot_teacher_goals(start_xy, goals, *, ax=None, title=None, save_path=None):
     return fig, ax
 
 
+def plot_teacher_softmax(
+    goal_grid_xy, probs, num_points, *, start_xy=None, title=None, save_path=None
+):
+    """Heatmap of the teacher's categorical distribution over its goal grid.
+
+    ``goal_grid_xy`` is an ``[num_actions, 2]`` array of (de-normalized) goal
+    positions (one per grid offset) and ``probs`` is the matching
+    ``[num_actions]`` softmax probability vector. Both are reshaped to a
+    ``[num_points, num_points]`` grid and drawn with ``pcolormesh``. Returns
+    ``(fig, ax)``.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+
+    goal_grid_xy = np.asarray(goal_grid_xy)
+    probs = np.asarray(probs).reshape(-1)
+    gx = goal_grid_xy[:, 0].reshape(num_points, num_points)
+    gy = goal_grid_xy[:, 1].reshape(num_points, num_points)
+    pgrid = probs.reshape(num_points, num_points)
+
+    mesh = ax.pcolormesh(gx, gy, pgrid, shading="nearest", cmap="viridis")
+    fig.colorbar(mesh, ax=ax, label="P(goal)")
+
+    if start_xy is not None:
+        start_xy = np.asarray(start_xy).reshape(-1)
+        ax.scatter(
+            start_xy[0],
+            start_xy[1],
+            s=200,
+            marker="*",
+            c="tab:red",
+            edgecolors="black",
+            linewidths=0.5,
+            zorder=3,
+            label="Agent start",
+        )
+        ax.legend(loc="best")
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="datalim")
+    if title is not None:
+        ax.set_title(title)
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig, ax
+
+
 def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -886,6 +938,58 @@ def make_train(config):
             plt.close(fig)
         except Exception as err:
             print(f"[log_teacher_goal_viz_plot] skipped goal plot: {err}")
+            traceback.print_exc()
+
+    def log_teacher_softmax_viz_plot(
+        teacher_params, student_params, ref_obs, avg_sr, final_env_state, step
+    ):
+        """Plot the teacher's softmax distribution over the goal grid; log to wandb."""
+        try:
+            import matplotlib.pyplot as plt
+
+            ref_obs = jnp.asarray(jax.device_get(ref_obs)).reshape(-1)
+            avg_sr = jnp.asarray(jax.device_get(avg_sr)).reshape(())
+            pi, _ = _teacher_apply(
+                teacher_params, _teacher_input(ref_obs, avg_sr), student_params
+            )
+            probs = np.asarray(jax.device_get(pi.probs)).reshape(-1)
+            goal_grid_xy = np.asarray(
+                jax.device_get(ref_obs[:2] + offset_grid)
+            )
+            start_xy = np.asarray(jax.device_get(ref_obs[:2])).reshape(-1)
+
+            obs_mean, obs_var = _extract_obs_norm_stats(final_env_state, base_obs_dim)
+            if config.get("NORMALIZE_ENV", False) and obs_mean is not None:
+                obs_mean = jax.device_get(obs_mean)
+                obs_var = jax.device_get(obs_var)
+                goal_grid_xy = _denorm_xy(goal_grid_xy, obs_mean, obs_var)
+                start_xy = _denorm_xy(start_xy, obs_mean, obs_var)
+
+            exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
+            exp_name = (
+                wandb.run.name
+                if wandb.run is not None and wandb.run.name
+                else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+            )
+            save_path = os.path.join(
+                exp_dir, f"{exp_name}_teacher_softmax_{step}.png"
+            )
+            fig, _ = plot_teacher_softmax(
+                goal_grid_xy,
+                probs,
+                teacher_num_offset_points,
+                start_xy=start_xy,
+                title=f'Teacher softmax @ step {step} ({config["ENV_NAME"]})',
+                save_path=save_path,
+            )
+            if (
+                teacher_goal_viz_log_wandb
+                and config.get("WANDB_MODE", "disabled") == "online"
+            ):
+                wandb.log({"teacher/goal_softmax": wandb.Image(fig)}, step=step)
+            plt.close(fig)
+        except Exception as err:
+            print(f"[log_teacher_softmax_viz_plot] skipped softmax plot: {err}")
             traceback.print_exc()
 
     def train(rng):
@@ -1750,7 +1854,17 @@ def make_train(config):
                 if goal_conditioned:
 
                     def goal_viz_callback(args):
-                        update_idx, info, buf, start_xy, env_state = args
+                        (
+                            update_idx,
+                            info,
+                            buf,
+                            start_xy,
+                            env_state,
+                            t_params,
+                            s_params,
+                            ref_obs,
+                            avg_sr,
+                        ) = args
                         # import pdb; pdb.set_trace()
                         if (
                             int(update_idx) + 1
@@ -1758,6 +1872,9 @@ def make_train(config):
                             return
                         step = int(info["timestep"].max() * config["NUM_ENVS"])
                         log_teacher_goal_viz_plot(buf, start_xy, env_state, step)
+                        log_teacher_softmax_viz_plot(
+                            t_params, s_params, ref_obs, avg_sr, env_state, step
+                        )
 
                     jax.debug.callback(
                         goal_viz_callback,
@@ -1767,6 +1884,10 @@ def make_train(config):
                             goal_viz_buffer,
                             agent_start_xy,
                             env_state,
+                            teacher_train_state.params,
+                            train_state.params,
+                            obsv[0],
+                            avg_success_rate.mean(),
                         ),
                     )
 
@@ -1826,9 +1947,15 @@ def make_train(config):
             "metrics": metric,
             "teacher_goal_viz": runner_state[-1],
             "agent_start_xy": agent_start_xy,
+            "agent_start_obs": obsv[0],
         }
 
-    return train, render_eval_episode, log_teacher_goal_viz_plot
+    return (
+        train,
+        render_eval_episode,
+        log_teacher_goal_viz_plot,
+        log_teacher_softmax_viz_plot,
+    )
 
 
 def main():
@@ -1845,7 +1972,12 @@ def main():
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
-    train_fn, render_eval_episode, log_teacher_goal_viz_plot = make_train(config)
+    (
+        train_fn,
+        render_eval_episode,
+        log_teacher_goal_viz_plot,
+        log_teacher_softmax_viz_plot,
+    ) = make_train(config)
     print(
         f"Number of student updates: {config['NUM_UPDATES']}, "
         f"teacher: {config['TEACHER_NUM_UPDATES']}, "
@@ -1869,6 +2001,14 @@ def main():
         log_teacher_goal_viz_plot(
             train_output["teacher_goal_viz"],
             train_output["agent_start_xy"],
+            final_env_state,
+            step=int(config["TOTAL_TIMESTEPS"]),
+        )
+        log_teacher_softmax_viz_plot(
+            final_teacher_train_state.params,
+            final_train_state.params,
+            train_output["agent_start_obs"],
+            runner_state[6].mean(),
             final_env_state,
             step=int(config["TOTAL_TIMESTEPS"]),
         )
