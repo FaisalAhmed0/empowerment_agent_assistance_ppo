@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="teacher_single_student_no_adv_norm"
+WANDB_PROJECT_NAME="teacher_single_student_no_adv_norm_more_seeds"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
 
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(500000000)
 LRS=(0.0003)
-SEEDS=(30)
+SEEDS=(1 30 557 8903 75949)
 
-BOUND_STUDENT_VARIANCE="--no-BOUND_STUDENT_VARIANCE"
+BOUND_STUDENT_VARIANCE="--BOUND_STUDENT_VARIANCE"
 BOUND_TEACHER_VARIANCE="--no-BOUND_TEACHER_VARIANCE"
 NORMALIZE_STUDENT_ADVANTAGE="--no-NORMALIZE_STUDENT_ADVANTAGE"
 NORMALIZE_TEACHER_ADVANTAGE="--no-NORMALIZE_TEACHER_ADVANTAGE"
@@ -17,16 +17,16 @@ NORMALIZE_TEACHER_ADVANTAGE="--no-NORMALIZE_TEACHER_ADVANTAGE"
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 TEACHER_PROBE_AGG=(concat)
 TEACHER_REWARD_TYPE=(competence_lp)
-STUDENT_GOAL_REWARD_TYPE=(sparse dense)
-NUM_ENVSS=(256 1024)
+STUDENT_GOAL_REWARD_TYPE=(sparse)
+NUM_ENVSS=(1024)
 TEACHER_LR=(0.001)
-TEACHER_EPISODE_LENGTH=(4 8)
+TEACHER_EPISODE_LENGTH=(4)
 TEACHER_SAMPLE_EVERY_N_EPISODES=(1)
-TEACHER_NUM_MINIBATCHES_=(1 2)
-TEACHER_UPDATE_EPOCHS_=(1 2 4)
-NUM_STEPS_=(10 64)
-TEACHER_ENTROPY_COFFS=(0 0.05 0.005)
-STUDENT_ENTROPY_COFFS=(0 0.005)
+TEACHER_NUM_MINIBATCHES_=(2)
+TEACHER_UPDATE_EPOCHS_=(1)
+NUM_STEPS_=(10)
+TEACHER_ENTROPY_COFFS=(0)
+STUDENT_ENTROPY_COFFS=(0)
 
 
 run_count=0
@@ -48,7 +48,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for student_entropy_coef in "${STUDENT_ENTROPY_COFFS[@]}"; do
                         for num_envs in "${NUM_ENVSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_teacherlr${teacher_lr}_probeagg${teacher_probe_agg}_treward${teacher_reward_type}_sgoal${student_goal_reward_type}_teplen${teacher_episode_length}_sampleevery${teacher_sample_every_n_episodes}"
-                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py \
+                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_discrete.py \
                         --ENV_NAME=${ENV_NAME} \
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \
