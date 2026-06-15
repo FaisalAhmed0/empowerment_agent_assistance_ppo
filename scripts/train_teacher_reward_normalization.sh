@@ -1,30 +1,32 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="teacher_single_student_bounded_variance_in_policy"
+WANDB_PROJECT_NAME="teacher_single_student_reward_normalization_more_seeds"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
 
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(500000000)
 LRS=(0.0003)
-SEEDS=(30)
+SEEDS=(1 30 557 8903 75949)
 
-BOUND_STUDENT_VARIANCE="--no-BOUND_STUDENT_VARIANCE"
+BOUND_STUDENT_VARIANCE="--BOUND_STUDENT_VARIANCE"
 BOUND_TEACHER_VARIANCE="--no-BOUND_TEACHER_VARIANCE"
+NORMALIZE_STUDENT_ADVANTAGE="--no-NORMALIZE_STUDENT_ADVANTAGE"
+NORMALIZE_TEACHER_ADVANTAGE="--no-NORMALIZE_TEACHER_ADVANTAGE"
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 TEACHER_PROBE_AGG=(concat)
 TEACHER_REWARD_TYPE=(competence_lp)
-STUDENT_GOAL_REWARD_TYPE=(sparse dense)
-NUM_ENVSS=(256 1024)
+STUDENT_GOAL_REWARD_TYPE=(sparse)
+NUM_ENVSS=(1024)
 TEACHER_LR=(0.001)
-TEACHER_EPISODE_LENGTH=(4 8)
+TEACHER_EPISODE_LENGTH=(4)
 TEACHER_SAMPLE_EVERY_N_EPISODES=(1)
-TEACHER_NUM_MINIBATCHES_=(1 2)
-TEACHER_UPDATE_EPOCHS_=(1 2)
-NUM_STEPS_=(10 64)
-TEACHER_ENTROPY_COFFS=(0 0.05 0.005)
-STUDENT_ENTROPY_COFFS=(0 0.005)
+TEACHER_NUM_MINIBATCHES_=(2)
+TEACHER_UPDATE_EPOCHS_=(1)
+NUM_STEPS_=(10)
+TEACHER_ENTROPY_COFFS=(0)
+STUDENT_ENTROPY_COFFS=(0)
 RWD_NORM_TYPE=(running_std batch_minmax)
 GOAL_REWARD_WEIGHTS=(1 0.1 0.01 0.001)
 
@@ -63,6 +65,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --GOAL_REWARD_WEIGHT=${goal_reward_weight} \
                         --NUM_STEPS=${num_steps} \
                         --GOAL_PENALTY_NORM_TYPE=${rwd_norm_type} \
+                        ${NORMALIZE_STUDENT_ADVANTAGE} \
+                        ${NORMALIZE_TEACHER_ADVANTAGE} \
                         --NUM_ENVS=${num_envs} \
                         --PROJECT=\"${WANDB_PROJECT_NAME}\" \
                         --TEACHER_PROBE_AGG=${teacher_probe_agg} \
