@@ -66,11 +66,13 @@ class TrainConfig:
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     GOAL_CONDITIONED: bool = True
+    TASK_REWARD_WEIGHT: float = 1.0
     GOAL_REWARD_WEIGHT: float = 1.0
     ANNEAL_GOAL_REWARD_WEIGHT: bool = False
     # When True, the student uses two separate value heads: one for the task
-    # (base env) reward and one for the (unweighted) goal-reaching reward. The
-    # actor advantage is combined as ``adv_task + GOAL_REWARD_WEIGHT * adv_goal``
+    # (weighted base env) reward and one for the (unweighted) goal-reaching
+    # reward. The actor advantage is combined as
+    # ``adv_task + GOAL_REWARD_WEIGHT * adv_goal``
     # while the total critic loss is the unweighted sum of both value losses.
     USE_SEPARATE_STUDENT_VALUE_FUNCTIONS: bool = False
     STUDENT_GOAL_REWARD_TYPE: str="sparse" # this can either sparse or dense
@@ -529,6 +531,7 @@ def make_train(config):
         env = NormalizeVecReward(env, config["GAMMA"])
 
     goal_conditioned = config.get("GOAL_CONDITIONED", False)
+    task_reward_weight = float(config.get("TASK_REWARD_WEIGHT", 1.0))
     goal_reward_weight = config.get("GOAL_REWARD_WEIGHT", 0.0)
     anneal_goal_reward_weight = config.get("ANNEAL_GOAL_REWARD_WEIGHT", False)
     use_separate_student_value_functions = bool(
@@ -1192,12 +1195,14 @@ def make_train(config):
                     rng_step, env_state, action, env_params
                 )
                 student_reward = reward
+                task_reward_term = task_reward_weight * student_reward
                 goal_reward_term = jnp.zeros_like(reward)
                 # Unweighted (post-normalization) goal-reaching reward. The goal
                 # value head regresses to this stream so GOAL_REWARD_WEIGHT only
                 # trades off optimization in the actor advantage, not in the
                 # critic target.
                 goal_reward_unweighted = jnp.zeros_like(reward)
+                reward = task_reward_term
                 episode_success = jnp.zeros_like(reward)
                 raw_goal_penalty = jnp.zeros_like(reward)
                 # Competence-LP scratch values (filled in the goal-conditioned
@@ -1228,7 +1233,7 @@ def make_train(config):
 
                     goal_reward_unweighted = goal_penalty
                     goal_reward_term = current_goal_reward_weight * goal_penalty
-                    reward = reward + goal_reward_term
+                    reward = task_reward_term + goal_reward_term
                     # Refresh the goal when it is reached, or on done every N episodes.
                     goal_dist = jnp.sqrt(
                         jnp.sum(jnp.square(_goal_xy_delta(obsv, goal_batch)), axis=-1)
@@ -1411,13 +1416,14 @@ def make_train(config):
                     )
 
                 info = dict(info)
+                info["task_reward_term"] = task_reward_term
                 info["goal_reward_term"] = goal_reward_term
                 info["goal_reward_unweighted"] = goal_reward_unweighted
                 info["shaped_reward"] = reward
                 # Raw (unnormalized) penalty and base env reward, kept so the
                 # batch_minmax mode can rebuild the shaped reward post-rollout.
                 info["goal_penalty_raw"] = raw_goal_penalty
-                info["base_reward"] = student_reward
+                info["base_reward"] = task_reward_term
                 info["returned_goal_reward_episode_returns"] = returned_goal_ep_returns
                 info["returned_goal_reward_episode"] = done_mask
                 info["teacher_reward"] = teacher_reward
@@ -1903,7 +1909,9 @@ def make_train(config):
                         "actor_loss": float(actor_loss),
                         "entropy": float(entropy),
                         "learning_rate": float(current_lr),
+                        "task_reward_weight": float(task_reward_weight),
                         "goal_reward_weight": float(current_goal_reward_weight),
+                        "task_reward_term_mean": float(info["task_reward_term"].mean()),
                         "goal_reward_term_mean": float(info["goal_reward_term"].mean()),
                         "shaped_reward_mean": float(info["shaped_reward"].mean()),
                         "goal_penalty_raw_mean": float(info["goal_penalty_raw"].mean()),
