@@ -124,8 +124,8 @@ BIG_MAZE = [
 
 BIG_MAZE_SINGLE_GOAL = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 0, 0, 1, 1, G, G, 1],
-    [1, 0, 0, 1, 0, 0, G, 1],
+    [1, 0, 0, 1, 1, 0, G, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1],
     [1, 1, 0, 0, 0, 1, 1, 1],
     [1, 0, 0, 1, 0, 0, 0, 1],
     [1, 0, 1, 0, 0, 1, 0, 1],
@@ -220,6 +220,8 @@ def sample_goals(structure, rng, size_scaling=4):
     '''Sample goals given a maze structure'''
     possible_goals = find_goals(structure, size_scaling)
     idx = jax.random.randint(rng, (1,), 0, len(possible_goals))
+    print(possible_goals[idx])
+    jax.debug.print("possible_goals: {possible_goals}", possible_goals=possible_goals)
     return jnp.array(possible_goals[idx])[0]
     
 

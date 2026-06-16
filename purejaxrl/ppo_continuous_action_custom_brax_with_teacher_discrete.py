@@ -49,6 +49,8 @@ class TrainConfig:
     ENV_BACKEND: str | None = None
     EPISODE_LENGTH: int = 500
     ACTION_REPEAT: int = 1
+    HIDDEN_DIM: int = 256
+    TEACHER_HIDDEN_DIM: int = 256
     # Pass as JSON from CLI, e.g. --env-kwargs '{"foo": 1}'.
     ENV_KWARGS: str = "{}"
     ANNEAL_LR: bool = False
@@ -66,6 +68,11 @@ class TrainConfig:
     GOAL_CONDITIONED: bool = True
     GOAL_REWARD_WEIGHT: float = 1.0
     ANNEAL_GOAL_REWARD_WEIGHT: bool = False
+    # When True, the student uses two separate value heads: one for the task
+    # (base env) reward and one for the (unweighted) goal-reaching reward. The
+    # actor advantage is combined as ``adv_task + GOAL_REWARD_WEIGHT * adv_goal``
+    # while the total critic loss is the unweighted sum of both value losses.
+    USE_SEPARATE_STUDENT_VALUE_FUNCTIONS: bool = False
     STUDENT_GOAL_REWARD_TYPE: str="sparse" # this can either sparse or dense
     # Optional goal-penalty normalization: "none", "running_std" (per-env running
     # std) or "batch_minmax" (per-rollout min-max, applied before GAE).
@@ -144,6 +151,11 @@ class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
     bound_variance: bool = False
+    hidden_dim: int = 256
+    # When True, a second critic trunk/head is added so the module returns a
+    # stacked value of shape ``(..., 2)`` = (task_value, goal_value). When False
+    # the module returns a single squeezed value, preserving legacy behavior.
+    separate_value_functions: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -152,11 +164,11 @@ class ActorCritic(nn.Module):
         else:
             activation = nn.tanh
         actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
@@ -168,19 +180,37 @@ class ActorCritic(nn.Module):
         else: 
             pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        def _critic_head(name_prefix):
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name=f"{name_prefix}_dense0",
+            )(x)
+            h = activation(h)
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name=f"{name_prefix}_dense1",
+            )(h)
+            h = activation(h)
+            v = nn.Dense(
+                1,
+                kernel_init=orthogonal(1.0),
+                bias_init=constant(0.0),
+                name=f"{name_prefix}_out",
+            )(h)
+            return jnp.squeeze(v, axis=-1)
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        if self.separate_value_functions:
+            task_value = _critic_head("critic_task")
+            goal_value = _critic_head("critic_goal")
+            value = jnp.stack([task_value, goal_value], axis=-1)
+        else:
+            value = _critic_head("critic")
+
+        return pi, value
 
 
 class TeacherGoalPolicy(nn.Module):
@@ -197,6 +227,7 @@ class TeacherGoalPolicy(nn.Module):
     num_probing_states: int
     probe_agg: str = "mean"
     activation: str = "tanh"
+    hidden_dim: int = 256
 
     @nn.compact
     def __call__(self, x, student_apply, student_params):
@@ -227,11 +258,11 @@ class TeacherGoalPolicy(nn.Module):
         critic_in = jnp.concatenate([x, probe_b], axis=-1)
 
         actor_h = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_in)
         actor_h = activation(actor_h)
         actor_h = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_h)
         actor_h = activation(actor_h)
         logits = nn.Dense(
@@ -239,11 +270,11 @@ class TeacherGoalPolicy(nn.Module):
         )(actor_h)
         pi = distrax.Categorical(logits=logits)
         critic_h = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic_in)
         critic_h = activation(critic_h)
         critic_h = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic_h)
         critic_h = activation(critic_h)
         value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
@@ -500,6 +531,9 @@ def make_train(config):
     goal_conditioned = config.get("GOAL_CONDITIONED", False)
     goal_reward_weight = config.get("GOAL_REWARD_WEIGHT", 0.0)
     anneal_goal_reward_weight = config.get("ANNEAL_GOAL_REWARD_WEIGHT", False)
+    use_separate_student_value_functions = bool(
+        config.get("USE_SEPARATE_STUDENT_VALUE_FUNCTIONS", False)
+    )
     teacher_goal_viz_buffer_size = int(
         config.get("TEACHER_GOAL_VIZ_BUFFER_SIZE", 10000)
     )
@@ -616,8 +650,12 @@ def make_train(config):
         )
     config["TEACHER_MINIBATCH_SIZE"] = teacher_batch_size // teacher_num_minibatches
 
+    hidden_dim = config.get("HIDDEN_DIM", 256)
+    teacher_hidden_dim = config.get("TEACHER_HIDDEN_DIM", 256)
+
     network = ActorCritic(
-        env.action_space(env_params).shape[0], activation=config["ACTIVATION"], bound_variance=bound_student_variance
+        env.action_space(env_params).shape[0], activation=config["ACTIVATION"], bound_variance=bound_student_variance, hidden_dim=hidden_dim,
+        separate_value_functions=use_separate_student_value_functions,
     )
 
     # Trainable teacher policy: maps a reference observation to a categorical
@@ -628,6 +666,7 @@ def make_train(config):
         num_probing_states=teacher_num_probing_states,
         probe_agg=teacher_probe_agg,
         activation=config["ACTIVATION"],
+        hidden_dim=teacher_hidden_dim
     )
     teacher_rng, student_dummy_rng = jax.random.split(
         jax.random.PRNGKey(config.get("SEED", 0))
@@ -1032,6 +1071,7 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
+        # jax.debug.print("obsv: {obsv}", obsv=obsv)
         avg_success_rate = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
         goal_penalty_norm_state = GoalPenaltyNormState(
             mean=jnp.zeros((config["NUM_ENVS"],), dtype=jnp.float32),
@@ -1153,6 +1193,11 @@ def make_train(config):
                 )
                 student_reward = reward
                 goal_reward_term = jnp.zeros_like(reward)
+                # Unweighted (post-normalization) goal-reaching reward. The goal
+                # value head regresses to this stream so GOAL_REWARD_WEIGHT only
+                # trades off optimization in the actor advantage, not in the
+                # critic target.
+                goal_reward_unweighted = jnp.zeros_like(reward)
                 episode_success = jnp.zeros_like(reward)
                 raw_goal_penalty = jnp.zeros_like(reward)
                 # Competence-LP scratch values (filled in the goal-conditioned
@@ -1181,6 +1226,7 @@ def make_train(config):
                         running_std = _goal_penalty_running_std(goal_penalty_norm_state)
                         goal_penalty = raw_goal_penalty / running_std
 
+                    goal_reward_unweighted = goal_penalty
                     goal_reward_term = current_goal_reward_weight * goal_penalty
                     reward = reward + goal_reward_term
                     # Refresh the goal when it is reached, or on done every N episodes.
@@ -1366,6 +1412,7 @@ def make_train(config):
 
                 info = dict(info)
                 info["goal_reward_term"] = goal_reward_term
+                info["goal_reward_unweighted"] = goal_reward_unweighted
                 info["shaped_reward"] = reward
                 # Raw (unnormalized) penalty and base env reward, kept so the
                 # batch_minmax mode can rebuild the shaped reward post-rollout.
@@ -1443,6 +1490,7 @@ def make_train(config):
                 new_reward = traj_batch.info["base_reward"] + new_goal_reward_term
                 new_info = dict(traj_batch.info)
                 new_info["goal_reward_term"] = new_goal_reward_term
+                new_info["goal_reward_unweighted"] = gp_norm
                 new_info["shaped_reward"] = new_reward
                 traj_batch = traj_batch._replace(reward=new_reward, info=new_info)
 
@@ -1470,7 +1518,49 @@ def make_train(config):
                 )
                 return advantages, advantages + traj_batch.value
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+            def _calculate_gae_stream(rewards, values, dones, last_value):
+                """GAE for a single reward/value stream (separate-critic mode)."""
+                def _get_advantages(gae_and_next_value, xs):
+                    gae, next_value = gae_and_next_value
+                    done, value, reward = xs
+                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+
+                _, advantages = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(last_value), last_value),
+                    (dones, values, rewards),
+                    reverse=True,
+                    unroll=16,
+                )
+                return advantages, advantages + values
+
+            if use_separate_student_value_functions:
+                # Two value heads stacked as (..., 2) = (task, goal). The goal
+                # critic regresses to the UNWEIGHTED goal reward so that
+                # GOAL_REWARD_WEIGHT only trades off optimization in the actor
+                # advantage below, not in the critic targets.
+                task_values = traj_batch.value[..., 0]
+                goal_values = traj_batch.value[..., 1]
+                base_reward = traj_batch.info["base_reward"]
+                goal_reward_unweighted = traj_batch.info["goal_reward_unweighted"]
+                adv_task, target_task = _calculate_gae_stream(
+                    base_reward, task_values, traj_batch.done, last_val[..., 0]
+                )
+                adv_goal, target_goal = _calculate_gae_stream(
+                    goal_reward_unweighted,
+                    goal_values,
+                    traj_batch.done,
+                    last_val[..., 1],
+                )
+                advantages = adv_task + current_goal_reward_weight * adv_goal
+                targets = jnp.stack([target_task, target_goal], axis=-1)
+            else:
+                advantages, targets = _calculate_gae(traj_batch, last_val)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -1488,9 +1578,22 @@ def make_train(config):
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-                        )
+                        if use_separate_student_value_functions:
+                            # value/targets are (..., 2) = (task, goal). The total
+                            # critic loss is the UNWEIGHTED sum of both heads.
+                            per_head = 0.5 * jnp.maximum(
+                                value_losses, value_losses_clipped
+                            )
+                            value_loss_task = per_head[..., 0].mean()
+                            value_loss_goal = per_head[..., 1].mean()
+                            value_loss = value_loss_task + value_loss_goal
+                        else:
+                            value_loss = (
+                                0.5
+                                * jnp.maximum(value_losses, value_losses_clipped).mean()
+                            )
+                            value_loss_task = value_loss
+                            value_loss_goal = jnp.zeros_like(value_loss)
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
@@ -1514,7 +1617,13 @@ def make_train(config):
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
-                        return total_loss, (value_loss, loss_actor, entropy)
+                        return total_loss, (
+                            value_loss,
+                            loss_actor,
+                            entropy,
+                            value_loss_task,
+                            value_loss_goal,
+                        )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
@@ -1561,6 +1670,8 @@ def make_train(config):
             value_loss = loss_info[1][0].mean()
             actor_loss = loss_info[1][1].mean()
             entropy = loss_info[1][2].mean()
+            value_loss_task = loss_info[1][3].mean()
+            value_loss_goal = loss_info[1][4].mean()
             current_lr = (
                 linear_schedule(
                     update_idx
@@ -1765,6 +1876,8 @@ def make_train(config):
                         teacher_actor_loss,
                         teacher_entropy,
                         teacher_did_update,
+                        value_loss_task,
+                        value_loss_goal,
                     ) = args
                     # Throttle logging to avoid very frequent wandb writes.
                     if (int(update_idx) + 1) % wandb_log_every_updates != 0:
@@ -1798,6 +1911,9 @@ def make_train(config):
                         "goal_penalty_raw_min": float(info["goal_penalty_raw"].min()),
                         "goal_penalty_raw_max": float(info["goal_penalty_raw"].max()),
                     }
+                    if use_separate_student_value_functions:
+                        payload["value_loss_task"] = float(value_loss_task)
+                        payload["value_loss_goal"] = float(value_loss_goal)
                     if len(goal_return_values) > 0:
                         payload["episodic_goal_shaping_return"] = float(
                             goal_return_values.mean()
@@ -1848,6 +1964,8 @@ def make_train(config):
                         teacher_actor_loss,
                         teacher_entropy,
                         teacher_did_update,
+                        value_loss_task,
+                        value_loss_goal,
                     ),
                 )
 

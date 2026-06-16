@@ -7,7 +7,9 @@ ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(500000000)
 LRS=(0.0003)
-SEEDS=(1 30 557 8903 75949)
+SEEDS=(1 30 557)
+NUM_EPOCHS_=(4 8 10)
+CLIP_EPS_=(0.1 0.3)
 
 BOUND_STUDENT_VARIANCE="--BOUND_STUDENT_VARIANCE"
 BOUND_TEACHER_VARIANCE="--no-BOUND_TEACHER_VARIANCE"
@@ -17,14 +19,17 @@ TEACHER_PROBE_AGG=(concat)
 TEACHER_REWARD_TYPE=(competence_lp)
 STUDENT_GOAL_REWARD_TYPE=(sparse)
 NUM_ENVSS=(1024)
-TEACHER_LR=(0.001)
+TEACHER_LR=(0.001 0.0003)
+HIDDEN_DIM=(256 1024)
+TEACHER_HIDDEN_DIM=(256 1024)
 TEACHER_EPISODE_LENGTH=(4)
 TEACHER_SAMPLE_EVERY_N_EPISODES=(1)
 TEACHER_NUM_MINIBATCHES_=(2)
 TEACHER_UPDATE_EPOCHS_=(1)
 NUM_STEPS_=(10)
-TEACHER_ENTROPY_COFFS=(0)
+TEACHER_ENTROPY_COFFS=(0 0.05)
 STUDENT_ENTROPY_COFFS=(0)
+GOAL_REWARD_WEIGHTS=(1)
 
 
 run_count=0
@@ -45,6 +50,11 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for teacher_entropy_coef in "${TEACHER_ENTROPY_COFFS[@]}"; do
                         for student_entropy_coef in "${STUDENT_ENTROPY_COFFS[@]}"; do
                         for num_envs in "${NUM_ENVSS[@]}"; do
+                        for hidden_dim in "${HIDDEN_DIM[@]}"; do
+                        for teacher_hidden_dim in "${TEACHER_HIDDEN_DIM[@]}"; do
+                        for num_epochs in "${NUM_EPOCHS_[@]}"; do
+                        for goal_reward_weight in "${GOAL_REWARD_WEIGHTS[@]}"; do
+                        for clip_eps in "${CLIP_EPS_[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_teacherlr${teacher_lr}_probeagg${teacher_probe_agg}_treward${teacher_reward_type}_sgoal${student_goal_reward_type}_teplen${teacher_episode_length}_sampleevery${teacher_sample_every_n_episodes}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_discrete.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -57,8 +67,14 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
                         --NUM_STEPS=${num_steps} \
+                        --CLIP_EPS=${clip_eps} \
+                        --TEACHER_CLIP_EPS=${clip_eps} \
+                        --GOAL_REWARD_WEIGHT=${goal_reward_weight} \
                         --NUM_ENVS=${num_envs} \
                         --PROJECT=\"${WANDB_PROJECT_NAME}\" \
+                        --UPDATE_EPOCHS=${num_epochs} \
+                        --HIDDEN_DIM=${hidden_dim} \
+                        --TEACHER_HIDDEN_DIM=${teacher_hidden_dim} \
                         --TEACHER_PROBE_AGG=${teacher_probe_agg} \
                         --TEACHER_REWARD_TYPE=${teacher_reward_type} \
                         --STUDENT_GOAL_REWARD_TYPE=${student_goal_reward_type} \
@@ -80,9 +96,14 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
     done
     done
     done
+    done
   done
   done
   done 
+  done
+  done
+  done
+  done
   done
   done
 
