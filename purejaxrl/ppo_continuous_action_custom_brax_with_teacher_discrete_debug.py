@@ -105,7 +105,7 @@ class TrainConfig:
     # Competence-LP eval settings (only used when TEACHER_REWARD_TYPE == "competence_lp").
     TEACHER_EVAL_HORIZON: int = 500
     TEACHER_EVAL_EPISODES: int = 1
-    TEACHER_EVAL_NUM_ENVS: int = 10
+    TEACHER_EVAL_NUM_ENVS: int = 4
     TEACHER_LP_ABSOLUTE: bool = False
     TEACHER_EPISODE_LENGTH: int = 4
     TEACHER_LR: float = 3e-4
@@ -132,7 +132,6 @@ class TrainConfig:
     NORMALIZE_TEACHER_ADVANTAGE: bool = True
     USE_ACTOR_PROBING_STATES: bool = False
     USE_CRITIC_PROBING_STATES: bool = True
-    layer_norm: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         config = asdict(self)
@@ -161,7 +160,6 @@ class ActorCritic(nn.Module):
     # stacked value of shape ``(..., 2)`` = (task_value, goal_value). When False
     # the module returns a single squeezed value, preserving legacy behavior.
     separate_value_functions: bool = False
-    layer_norm: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -169,9 +167,6 @@ class ActorCritic(nn.Module):
             activation = nn.relu
         else:
             activation = nn.tanh
-        if self.layer_norm:
-            x = nn.LayerNorm()(x)
-            x = nn.tanh(x)
         actor_mean = nn.Dense(
             self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
@@ -239,15 +234,12 @@ class TeacherGoalPolicy(nn.Module):
     hidden_dim: int = 256
     use_actor_probing_states: bool = False
     use_critic_probing_states: bool = True
-    layer_norm: bool = False
 
     @nn.compact
     def __call__(self, x, student_apply, student_params):
         # jax.debug.print("teacher input shape: {x}", x=x)
         activation = nn.relu if self.activation == "relu" else nn.tanh
-        if self.layer_norm:
-            x = nn.LayerNorm()(x)
-            x = nn.tanh(x)
+
         # Learnable probing states ~ U(-1, 1), sized to the student's observation
         # so they can be fed through the student policy.
         probing_states = self.param(
@@ -277,9 +269,6 @@ class TeacherGoalPolicy(nn.Module):
             critic_in = jnp.concatenate([x, probe_b], axis=-1)
         else:
             critic_in = jnp.concatenate([x, jax.lax.stop_gradient(probe_b)], axis=-1)
-        if (not self.use_actor_probing_states) and (not self.use_critic_probing_states):
-            actor_in = x
-            critic_in = x
 
         actor_h = nn.Dense(
             self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
@@ -677,11 +666,10 @@ def make_train(config):
 
     hidden_dim = config.get("HIDDEN_DIM", 256)
     teacher_hidden_dim = config.get("TEACHER_HIDDEN_DIM", 256)
-    layer_norm = config.get("LAYER_NORM", False)
+
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], bound_variance=bound_student_variance, hidden_dim=hidden_dim,
-        separate_value_functions=use_separate_student_value_functions, 
-        layer_norm=layer_norm,
+        separate_value_functions=use_separate_student_value_functions,
     )
 
     # Trainable teacher policy: maps a reference observation to a categorical
@@ -697,7 +685,6 @@ def make_train(config):
         hidden_dim=teacher_hidden_dim,
         use_actor_probing_states=use_actor_probing_states,
         use_critic_probing_states=use_critic_probing_states,
-        layer_norm=layer_norm,
     )
     teacher_rng, student_dummy_rng = jax.random.split(
         jax.random.PRNGKey(config.get("SEED", 0))
@@ -822,11 +809,11 @@ def make_train(config):
             obs_var = jnp.ones(_render_obs_dim)
         return obs_mean, obs_var
 
-    def _eval_render_action(params, obs, obs_mean, obs_var, goal, action_rng):
+    def _eval_render_action(params, obs, obs_mean, obs_var, goal):
         norm_obs = _normalize_eval_obs(obs, obs_mean, obs_var)
         policy_obs = _concat_goal(norm_obs, goal)
         pi, _ = network.apply(params, policy_obs)
-        return jnp.clip(pi.sample(seed=action_rng), action_low, action_high)
+        return jnp.clip(pi.mean(), action_low, action_high)
 
     # Batched eval used by the "competence_lp" teacher reward: roll out the
     # (deterministic) student conditioned on each proposed goal and measure the
@@ -849,27 +836,26 @@ def make_train(config):
         goals_b = jnp.broadcast_to(
             goals[:, None, :], (n_goals, reps, goals.shape[-1])
         ).reshape(batch, goals.shape[-1])
-        rng, action_rng, reset_rng = jax.random.split(rng, 3)
+        rng, reset_rng = jax.random.split(rng)
         reset_rngs = jax.random.split(reset_rng, batch)
         state = _eval_env_reset(reset_rngs)
 
         def step_fn(carry, _):
-            state, reached, action_rng = carry
+            state, reached = carry
             action = _eval_render_action(
-                student_params, state.obs, obs_mean, obs_var, goals_b, action_rng
+                student_params, state.obs, obs_mean, obs_var, goals_b
             )
-            action_rng, _ = jax.random.split(action_rng)
             state = _eval_env_step(state, action)
             norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
             goal_dist = jnp.sqrt(
                 jnp.sum(jnp.square(_goal_xy_delta(norm_obs, goals_b)), axis=-1)
             )
             reached = jnp.logical_or(reached, goal_dist <= goal_reached_threshold)
-            return (state, reached, action_rng), None
+            return (state, reached), None
 
-        (_, reached, _), _ = jax.lax.scan(
+        (_, reached), _ = jax.lax.scan(
             step_fn,
-            (state, jnp.zeros((batch,), dtype=bool), action_rng),
+            (state, jnp.zeros((batch,), dtype=bool)),
             None,
             length=teacher_eval_horizon,
         )
@@ -877,15 +863,14 @@ def make_train(config):
         return jnp.mean(success, axis=-1)
 
     def _render_rollout_impl(params, teacher_params, rng, obs_mean, obs_var):
-        rng, action_rng, reset_rng = jax.random.split(rng, 3)
+        rng, reset_rng = jax.random.split(rng)
         state = base_env.reset(reset_rng)
         norm_obs0 = _normalize_eval_obs(state.obs, obs_mean, obs_var)
         eval_goal = _teacher_goal_det(teacher_params, norm_obs0, 0.0, params)
 
         def step_fn(carry, _):
-            state, goal, action_rng = carry
-            action = _eval_render_action(params, state.obs, obs_mean, obs_var, goal, action_rng)
-            action_rng, _ = jax.random.split(action_rng)
+            state, goal = carry
+            action = _eval_render_action(params, state.obs, obs_mean, obs_var, goal)
 
             def repeat_step(s, __):
                 return base_env.step(s, action), None
@@ -904,10 +889,10 @@ def make_train(config):
                 _teacher_goal_det(teacher_params, norm_obs, 0.0, params),
                 goal,
             )
-            return (state, goal, action_rng), state.pipeline_state
+            return (state, goal), state.pipeline_state
 
-        _, pipeline_states, _ = jax.lax.scan(
-            step_fn, (state, eval_goal, action_rng), None, length=render_sim_steps
+        _, pipeline_states = jax.lax.scan(
+            step_fn, (state, eval_goal), None, length=render_sim_steps
         )
         return pipeline_states
 

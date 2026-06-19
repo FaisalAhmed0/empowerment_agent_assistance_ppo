@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="discrete_actions_teacher_single_3_student_more_seeds"
+WANDB_PROJECT_NAME="discrete_actions_teacher_single_student_layer_norm"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
 
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(500000000)
-LRS=(0.001 0.0003)
+LRS=(0.001)
 SEEDS=(1)
 NUM_EPOCHS_=(8)
-CLIP_EPS_=(0.2 0.3)
+CLIP_EPS_=(0.2)
 
 BOUND_STUDENT_VARIANCE="--BOUND_STUDENT_VARIANCE"
 BOUND_TEACHER_VARIANCE="--no-BOUND_TEACHER_VARIANCE"
@@ -18,11 +18,11 @@ BOUND_TEACHER_VARIANCE="--no-BOUND_TEACHER_VARIANCE"
 TEACHER_PROBE_AGG=(concat)
 TEACHER_REWARD_TYPE=(competence_lp)
 STUDENT_GOAL_REWARD_TYPE=(sparse)
-NUM_ENVSS=(64 512 1024)
+NUM_ENVSS=(1024)
 TEACHER_LR=(0.001)
 HIDDEN_DIM=(256)
 TEACHER_HIDDEN_DIM=(256)
-TEACHER_EPISODE_LENGTH=(2 4)
+TEACHER_EPISODE_LENGTH=(4)
 TEACHER_SAMPLE_EVERY_N_EPISODES=(1)
 TEACHER_NUM_MINIBATCHES_=(2)
 TEACHER_UPDATE_EPOCHS_=(1)
@@ -30,9 +30,10 @@ NUM_STEPS_=(10)
 TEACHER_ENTROPY_COFFS=(0 0.05)
 STUDENT_ENTROPY_COFFS=(0)
 GOAL_REWARD_WEIGHTS=(1)
-USE_SEPARATE_VALUE_FUNCTIONS=("--no-USE_SEPARATE_STUDENT_VALUE_FUNCTIONS" "--USE_SEPARATE_STUDENT_VALUE_FUNCTIONS")
-USE_ACTOR_PROBING_STATES=("--no-USE_ACTOR_PROBING_STATES" "--USE_ACTOR_PROBING_STATES")
-USE_CRITIC_PROBING_STATES=("--no-USE_CRITIC_PROBING_STATES" "--USE_CRITIC_PROBING_STATES")
+USE_SEPARATE_VALUE_FUNCTIONS=("--USE_SEPARATE_STUDENT_VALUE_FUNCTIONS")
+USE_ACTOR_PROBING_STATES=("--USE_ACTOR_PROBING_STATES")
+USE_CRITIC_PROBING_STATES=("--USE_CRITIC_PROBING_STATES")
+LAYER_NORM=("--LAYER_NORM" "--no-LAYER_NORM")
 
 
 run_count=0
@@ -61,6 +62,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for use_separate_value_functions in "${USE_SEPARATE_VALUE_FUNCTIONS[@]}"; do
                         for use_actor_probing_states in "${USE_ACTOR_PROBING_STATES[@]}"; do
                         for use_critic_probing_states in "${USE_CRITIC_PROBING_STATES[@]}"; do
+                        for layer_norm in "${LAYER_NORM[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_teacherlr${teacher_lr}_probeagg${teacher_probe_agg}_treward${teacher_reward_type}_sgoal${student_goal_reward_type}_teplen${teacher_episode_length}_sampleevery${teacher_sample_every_n_episodes}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_discrete.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -75,6 +77,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${use_critic_probing_states} \
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
+                        ${layer_norm} \
                         --NUM_STEPS=${num_steps} \
                         --CLIP_EPS=${clip_eps} \
                         --TEACHER_CLIP_EPS=${clip_eps} \
@@ -96,6 +99,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                       run_count=$((run_count + 1))
                     done
                   done
+                done
                 done
               done
             done
