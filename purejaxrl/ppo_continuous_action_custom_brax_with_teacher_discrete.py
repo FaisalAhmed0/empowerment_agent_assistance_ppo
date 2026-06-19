@@ -132,7 +132,7 @@ class TrainConfig:
     NORMALIZE_TEACHER_ADVANTAGE: bool = True
     USE_ACTOR_PROBING_STATES: bool = False
     USE_CRITIC_PROBING_STATES: bool = True
-    layer_norm: bool = False
+    LAYER_NORM: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         config = asdict(self)
@@ -2128,6 +2128,8 @@ def main():
         config=config,
         mode=config["WANDB_MODE"],
     )
+
+    print(config)
 
     rng = jax.random.PRNGKey(config["SEED"])
     (
