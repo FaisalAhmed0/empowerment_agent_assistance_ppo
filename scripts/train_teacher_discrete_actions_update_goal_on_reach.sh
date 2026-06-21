@@ -3,6 +3,7 @@
 # Define common parameters (fixed values)
 WANDB_PROJECT_NAME="discrete_actions_teacher_single_student_layer_norm"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
+UPDATE_GOAL_ON_REACH="--UPDATE_GOAL_ON_REACH"
 TEACHER_LP_ABSOLUTE="--TEACHER_LP_ABSOLUTE"
 
 ENV_NAMES=("ant_u_maze_single_goal")
@@ -76,12 +77,13 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${use_separate_value_functions} \
                         ${use_actor_probing_states} \
                         ${use_critic_probing_states} \
-                        ${TEACHER_LP_ABSOLUTE} \
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
                         ${layer_norm} \
                         --NUM_STEPS=${num_steps} \
                         --CLIP_EPS=${clip_eps} \
+                        ${TEACHER_LP_ABSOLUTE} \
+                        ${UPDATE_GOAL_ON_REACH} \
                         --TEACHER_CLIP_EPS=${clip_eps} \
                         --GOAL_REWARD_WEIGHT=${goal_reward_weight} \
                         --NUM_ENVS=${num_envs} \

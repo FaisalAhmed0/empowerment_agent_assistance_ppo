@@ -133,6 +133,7 @@ class TrainConfig:
     USE_ACTOR_PROBING_STATES: bool = False
     USE_CRITIC_PROBING_STATES: bool = True
     LAYER_NORM: bool = False
+    UPDATE_GOAL_ON_REACH: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         config = asdict(self)
@@ -668,6 +669,7 @@ def make_train(config):
     teacher_update_epochs = int(config.get("TEACHER_UPDATE_EPOCHS", config["UPDATE_EPOCHS"]))
     teacher_num_minibatches = int(config.get("TEACHER_NUM_MINIBATCHES", 1))
     teacher_batch_size = teacher_episode_length * config["NUM_ENVS"]
+    update_goal_on_reach = config.get("update_goal_on_reach", False)
     if teacher_batch_size % teacher_num_minibatches != 0:
         raise ValueError(
             "TEACHER_EPISODE_LENGTH * NUM_ENVS must be divisible by "
@@ -1272,9 +1274,7 @@ def make_train(config):
                     reached_any_in_episode = jnp.logical_or(reached_any_in_episode, reached)
                     done_mask = done.astype(bool)
                     completed_episode_counts = episode_counts + done_mask.astype(jnp.int32)
-                    sample_on_done = done_mask & (
-                        (completed_episode_counts % teacher_sample_every_n_episodes) == 0
-                    )
+                    sample_on_done = done_mask & ((completed_episode_counts % teacher_sample_every_n_episodes) == 0)
                     episode_success = reached_any_in_episode.astype(reward.dtype)
                     updated_avg_success_rate = avg_success_rate + success_rate_alpha * (
                         episode_success - avg_success_rate
@@ -1282,7 +1282,11 @@ def make_train(config):
                     avg_success_rate = jnp.where(
                         done_mask, updated_avg_success_rate, avg_success_rate
                     )
-                    refresh = sample_on_done
+                    
+                    if update_goal_on_reach:
+                        sample_on_done = jnp.logical_or(sample_on_done, reached)
+                    else:
+                        refresh = sample_on_done
                     teacher_rng, sample_rng = jax.random.split(teacher_rng)
                     (
                         new_goals,
@@ -1453,7 +1457,7 @@ def make_train(config):
                 # Raw (unnormalized) penalty and base env reward, kept so the
                 # batch_minmax mode can rebuild the shaped reward post-rollout.
                 info["goal_penalty_raw"] = raw_goal_penalty
-                info["base_reward"] = task_reward_term
+                info["base_reward"] = student_reward
                 info["returned_goal_reward_episode_returns"] = returned_goal_ep_returns
                 info["returned_goal_reward_episode"] = done_mask
                 info["teacher_reward"] = teacher_reward
@@ -1593,7 +1597,7 @@ def make_train(config):
                     traj_batch.done,
                     last_val[..., 1],
                 )
-                advantages = adv_task + current_goal_reward_weight * adv_goal
+                advantages = (task_reward_weight * adv_task) + (current_goal_reward_weight * adv_goal)
                 targets = jnp.stack([target_task, target_goal], axis=-1)
             else:
                 advantages, targets = _calculate_gae(traj_batch, last_val)
