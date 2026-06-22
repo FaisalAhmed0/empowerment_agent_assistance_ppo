@@ -157,7 +157,7 @@ class BraxGymnaxWrapper:
 
 class NavixGymnaxWrapper:
     def __init__(self, env_name):
-        self._env = nx.make(env_name)
+        self._env = nx.make(env_name, observation_fn=nx.observations.symbolic)
 
     def reset(self, key, params=None):
         timestep = self._env.reset(key)

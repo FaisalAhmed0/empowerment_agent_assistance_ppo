@@ -1,3 +1,4 @@
+import os
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -8,6 +9,7 @@ from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
 import gymnax
+import navix as nx
 from wrappers import LogWrapper, FlattenObservationWrapper, NavixGymnaxWrapper
 
 
@@ -67,8 +69,101 @@ def make_train(config):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     env, env_params = NavixGymnaxWrapper(config["ENV_NAME"]), None
+    obsv, env_state = env.reset(jax.random.PRNGKey(0), env_params)
+    print("shape of observation before flattening")
+    jax.debug.print("obsv.shape: {obsv}", obsv=obsv.shape)
     env = FlattenObservationWrapper(env)
     env = LogWrapper(env)
+
+    def render_eval_episode(
+        params, rng, out_path=None, num_steps=None, fps=None, deterministic=None
+    ):
+        """Roll out the trained policy and save a video of the agent.
+
+        The policy consumes the same flattened symbolic observations it was
+        trained on, while frames are produced from the underlying Navix state via
+        ``nx.observations.rgb`` so the saved video shows the full grid.
+
+        Actions are sampled stochastically from the policy distribution by
+        default. Set ``deterministic=True`` (or ``config["RENDER_DETERMINISTIC"]``)
+        to instead take the distribution mode (argmax) at every step.
+        """
+        num_steps = (
+            int(config.get("RENDER_NUM_STEPS", 200)) if num_steps is None else int(num_steps)
+        )
+        fps = int(config.get("RENDER_FPS", 10)) if fps is None else int(fps)
+        if out_path is None:
+            out_path = config.get("RENDER_OUT_PATH", "artifacts/minigrid_eval.mp4")
+        if deterministic is None:
+            deterministic = bool(config.get("RENDER_DETERMINISTIC", False))
+
+        network = ActorCritic(
+            env.action_space(env_params).n, activation=config["ACTIVATION"]
+        )
+
+        def _rollout(params, rng):
+            rng, reset_rng = jax.random.split(rng)
+            obs, state = env.reset(reset_rng, env_params)
+
+            def _step(carry, _):
+                obs, state, rng = carry
+                pi, _ = network.apply(params, obs)
+                rng, sample_rng, step_rng = jax.random.split(rng, 3)
+                if deterministic:
+                    action = pi.mode()
+                else:
+                    action = pi.sample(seed=sample_rng)
+                obs, state, reward, done, info = env.step(
+                    step_rng, state, action, env_params
+                )
+                return (obs, state, rng), state
+
+            _, states = jax.lax.scan(_step, (obs, state, rng), None, length=num_steps)
+            # `states` is the LogEnvState stacked over time; the wrapped Navix
+            # timestep (and its renderable state) lives in `env_state`.
+            frames = jax.vmap(nx.observations.rgb)(states.env_state.state)
+            return frames
+
+        frames = jax.jit(_rollout)(params, rng)
+        frames = np.asarray(jax.device_get(frames)).astype(np.uint8)
+
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            import imageio.v2 as imageio
+
+            if out_path.endswith(".gif"):
+                imageio.mimsave(out_path, list(frames), duration=1.0 / max(fps, 1))
+            else:
+                imageio.mimsave(out_path, list(frames), fps=fps, macro_block_size=1)
+        except Exception as err:  # pragma: no cover - fallback path
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.animation as animation
+
+            gif_path = os.path.splitext(out_path)[0] + ".gif"
+            fig = plt.figure()
+            plt.axis("off")
+            im = plt.imshow(frames[0])
+
+            def _update(i):
+                im.set_array(frames[i])
+                return (im,)
+
+            anim = animation.FuncAnimation(
+                fig, _update, frames=len(frames), interval=1000 / max(fps, 1), blit=True
+            )
+            anim.save(gif_path, writer=animation.PillowWriter(fps=fps))
+            plt.close(fig)
+            out_path = gif_path
+            print(f"[render_eval_episode] imageio failed ({err}); used matplotlib fallback")
+
+        print(
+            f"[render_eval_episode] saved agent video to {out_path} ({len(frames)} frames)"
+        )
+        return out_path
 
     def linear_schedule(count):
         frac = (
@@ -85,7 +180,6 @@ def make_train(config):
         )
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
-        import pdb; pdb.set_trace()
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
             tx = optax.chain(
@@ -126,6 +220,7 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
+                # jax.debug.print("obsv.shape: {obsv}", obsv=obsv.shape)
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
                 )
@@ -271,7 +366,7 @@ def make_train(config):
         )
         return {"runner_state": runner_state, "metrics": metric}
 
-    return train
+    return train, render_eval_episode
 
 
 if __name__ == "__main__":
@@ -292,7 +387,17 @@ if __name__ == "__main__":
         "ENV_NAME": "Navix-DoorKey-5x5-v0",
         "ANNEAL_LR": True,
         "DEBUG": True,
+        "RENDER_ENABLED": True,
+        "RENDER_NUM_STEPS": 500,
+        "RENDER_FPS": 10,
+        "RENDER_OUT_PATH": "artifacts/minigrid_eval.mp4",
+        "RENDER_DETERMINISTIC": False,
     }
     rng = jax.random.PRNGKey(30)
-    train_jit = jax.jit(make_train(config))
+    train_fn, render_eval_episode = make_train(config)
+    train_jit = jax.jit(train_fn)
     out = train_jit(rng)
+
+    if config.get("RENDER_ENABLED", True):
+        final_params = out["runner_state"][0].params
+        render_eval_episode(final_params, jax.random.PRNGKey(0))

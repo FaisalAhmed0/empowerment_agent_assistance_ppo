@@ -758,13 +758,34 @@ def make_train(config):
         """Per-env running standard deviation (variance floored by eps)."""
         return jnp.sqrt(norm_state.var + goal_penalty_norm_eps)
 
-    def linear_schedule(count):
-        frac = (
-            1.0
-            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
-            / config["NUM_UPDATES"]
-        )
-        return config["LR"] * frac
+    def _make_linear_lr_schedule(base_lr, steps_per_update, num_updates):
+        """Build a linear LR decay schedule shared by the student and teacher.
+
+        ``frac`` goes from 1.0 -> 0.0 across the agent's full set of PPO updates,
+        so both agents anneal at the same rate relative to training progress.
+        ``steps_per_update`` is the number of gradient steps per update
+        (minibatches * update epochs) used to convert the optax step count into
+        an update index.
+        """
+        steps_per_update = max(int(steps_per_update), 1)
+        num_updates = max(int(num_updates), 1)
+
+        def schedule(count):
+            frac = 1.0 - (count // steps_per_update) / num_updates
+            return base_lr * frac
+
+        return schedule
+
+    linear_schedule = _make_linear_lr_schedule(
+        config["LR"],
+        config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"],
+        config["NUM_UPDATES"],
+    )
+    teacher_linear_schedule = _make_linear_lr_schedule(
+        teacher_lr,
+        teacher_num_minibatches * teacher_update_epochs,
+        config["TEACHER_NUM_UPDATES"],
+    )
 
     def goal_reward_weight_schedule(update_idx):
         if config["NUM_UPDATES"] <= 1:
@@ -1075,10 +1096,16 @@ def make_train(config):
         )
 
         # INIT TEACHER (PPO agent operating on the student-episode timeline)
-        teacher_tx = optax.chain(
-            optax.clip_by_global_norm(teacher_max_grad_norm),
-            optax.adam(teacher_lr, eps=1e-5),
-        )
+        if config["ANNEAL_LR"]:
+            teacher_tx = optax.chain(
+                optax.clip_by_global_norm(teacher_max_grad_norm),
+                optax.adam(learning_rate=teacher_linear_schedule, eps=1e-5),
+            )
+        else:
+            teacher_tx = optax.chain(
+                optax.clip_by_global_norm(teacher_max_grad_norm),
+                optax.adam(teacher_lr, eps=1e-5),
+            )
         teacher_train_state = TrainState.create(
             apply_fn=teacher_network.apply,
             params=teacher_params,
@@ -1866,6 +1893,14 @@ def make_train(config):
                 teacher_did_update,
             ) = teacher_metrics
 
+            # Effective teacher LR (mirrors student annealing). ``train_state.step``
+            # is the optax gradient-step count, i.e. the schedule's ``count`` arg.
+            teacher_current_lr = (
+                teacher_linear_schedule(teacher_train_state.step)
+                if config["ANNEAL_LR"]
+                else teacher_lr
+            )
+
             if config.get("DEBUG"):
 
                 def debug_callback(info):
@@ -1893,6 +1928,7 @@ def make_train(config):
                         actor_loss,
                         entropy,
                         current_lr,
+                        teacher_current_lr,
                         current_goal_reward_weight,
                         teacher_total_loss,
                         teacher_value_loss,
@@ -1926,6 +1962,7 @@ def make_train(config):
                         "actor_loss": float(actor_loss),
                         "entropy": float(entropy),
                         "learning_rate": float(current_lr),
+                        "teacher/learning_rate": float(teacher_current_lr),
                         "task_reward_weight": float(task_reward_weight),
                         "goal_reward_weight": float(current_goal_reward_weight),
                         "task_reward_term_mean": float(info["task_reward_term"].mean()),
@@ -1983,6 +2020,7 @@ def make_train(config):
                         actor_loss,
                         entropy,
                         current_lr,
+                        teacher_current_lr,
                         current_goal_reward_weight,
                         teacher_total_loss,
                         teacher_value_loss,

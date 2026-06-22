@@ -3,11 +3,12 @@
 # Define common parameters (fixed values)
 WANDB_PROJECT_NAME="discrete_actions_teacher_single_student_reward_weightings"
 ANNEAL_GOAL_REWARD_WEIGHT="--no-ANNEAL_GOAL_REWARD_WEIGHT"
+ANNEAL_LR="--ANNEAL_LR"
 TEACHER_LP_ABSOLUTES=("--TEACHER_LP_ABSOLUTE" "--no-TEACHER_LP_ABSOLUTE")
 
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(500000000)
-LRS=(0.001)
+LRS=(0.0001)
 SEEDS=(1)
 NUM_EPOCHS_=(8)
 CLIP_EPS_=(0.2)
@@ -20,7 +21,7 @@ TEACHER_PROBE_AGG=(concat)
 TEACHER_REWARD_TYPE=(competence_lp)
 STUDENT_GOAL_REWARD_TYPE=(sparse)
 NUM_ENVSS=(1024)
-TEACHER_LR=(0.001)
+TEACHER_LR=(0.0001)
 HIDDEN_DIM=(256)
 TEACHER_HIDDEN_DIM=(256)
 TEACHER_EPISODE_LENGTH=(2)
@@ -28,15 +29,15 @@ TEACHER_SAMPLE_EVERY_N_EPISODES=(1)
 TEACHER_NUM_MINIBATCHES_=(2)
 TEACHER_UPDATE_EPOCHS_=(1)
 NUM_STEPS_=(10)
-TEACHER_ENTROPY_COFFS=(0 0.05 0.005)
-STUDENT_ENTROPY_COFFS=(0)
+TEACHER_ENTROPY_COFFS=(0.05 0.005)
+STUDENT_ENTROPY_COFFS=(0.05 0.005)
 GOAL_REWARD_WEIGHTS=(1)
 USE_SEPARATE_VALUE_FUNCTIONS=("--USE_SEPARATE_STUDENT_VALUE_FUNCTIONS")
 USE_ACTOR_PROBING_STATES=("--USE_ACTOR_PROBING_STATES")
 USE_CRITIC_PROBING_STATES=("--USE_CRITIC_PROBING_STATES")
 LAYER_NORM=("--LAYER_NORM" "--no-LAYER_NORM")
-TASK_REWARD_WEIGHTS=(10 1 0.1 0.01)
-GOAL_REWARD_WEIGHTS=(10 1 0.1 0.01)
+TASK_REWARD_WEIGHTS=(1 0.1 0.01)
+GOAL_REWARD_WEIGHTS=(1 0.1 0.01)
 
 
 run_count=0
@@ -80,6 +81,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${use_separate_value_functions} \
                         ${use_actor_probing_states} \
                         ${use_critic_probing_states} \
+                        ${ANNEAL_LR} \
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
                         ${layer_norm} \
