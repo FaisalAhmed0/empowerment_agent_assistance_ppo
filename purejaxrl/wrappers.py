@@ -156,8 +156,16 @@ class BraxGymnaxWrapper:
         )
 
 class NavixGymnaxWrapper:
-    def __init__(self, env_name):
-        self._env = nx.make(env_name, observation_fn=nx.observations.symbolic)
+    def __init__(self, env_name, max_steps=None, disable_termination=False):
+        kwargs = {"observation_fn": nx.observations.symbolic}
+        if max_steps is not None:
+            kwargs["max_steps"] = max_steps
+        if disable_termination:
+            # Replace the success-termination function with a no-op so the
+            # episode ends only by truncation at max_steps, giving a fixed
+            # synchronized horizon across all envs.
+            kwargs["termination_fn"] = lambda prev_state, action, state: jnp.asarray(False)
+        self._env = nx.make(env_name, **kwargs)
 
     def reset(self, key, params=None):
         timestep = self._env.reset(key)
@@ -171,7 +179,7 @@ class NavixGymnaxWrapper:
         return spaces.Box(
             low=self._env.observation_space.minimum,
             high=self._env.observation_space.maximum,
-            shape=(np.prod(self._env.observation_space.shape),),
+            shape=self._env.observation_space.shape,
             dtype=self._env.observation_space.dtype,
         )
 
