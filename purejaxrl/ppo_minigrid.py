@@ -1,9 +1,11 @@
 import os
+from dataclasses import asdict, dataclass
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 import optax
+import tyro
 import wandb
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
@@ -12,6 +14,59 @@ import distrax
 import gymnax
 import navix as nx
 from wrappers import LogWrapper, NavixGymnaxWrapper
+
+
+@dataclass
+class TrainConfig:
+    LR: float = 2.5e-4
+    NUM_ENVS: int = 128
+    NUM_STEPS: int = 128
+    TOTAL_TIMESTEPS: int = 25_000_000
+    UPDATE_EPOCHS: int = 1
+    NUM_MINIBATCHES: int = 8
+    GAMMA: float = 0.99
+    GAE_LAMBDA: float = 0.95
+    CLIP_EPS: float = 0.3
+    ENT_COEF: float = 0.001
+    VF_COEF: float = 0.5
+    MAX_GRAD_NORM: float = 0.5
+    ACTIVATION: str = "relu"
+    ENV_NAME: str = "Navix-DoorKey-16x16-v0"
+    OBS_EMBED_DIM: int = 16
+    OBS_TAG_VOCAB_SIZE: int = 11
+    OBS_COLOR_VOCAB_SIZE: int = 6
+    OBS_STATE_VOCAB_SIZE: int = 4
+    ANNEAL_LR: bool = True
+    DEBUG: bool = True
+    SEED: int = 30
+    RESET_SEED: int = 0
+    EVAL_RESET_SEED: int = 0
+    WANDB_MODE: str = "online"
+    ENTITY: str = ""
+    PROJECT: str = "purejaxrl"
+    RENDER_ENABLED: bool = True
+    RENDER_NUM_STEPS: int = 500
+    RENDER_FPS: int = 10
+    RENDER_OUT_PATH: str = "artifacts/minigrid_eval.mp4"
+    RENDER_DETERMINISTIC: bool = False
+    RENDER_NUM_VIDEOS_DURING_TRAINING: int = 0
+    TEACHER_HEATMAP_OUT_PATH: str = "artifacts/teacher_softmax.png"
+    TEACHER_HEATMAP_EVERY_N_UPDATES: int = 50
+    TEACHER_REWARD_TYPE: str = "competence_lp"
+    TEACHER_LP_ABSOLUTE: bool = False
+    TEACHER_SUCCESS_BONUS: float = 1.0
+    TEACHER_EVAL_EPISODES: int = 1
+    TEACHER_EVAL_NUM_ENVS: int = 10
+    TEACHER_EPISODE_LENGTH: int = 5
+    TEACHER_LR: float = 2.5e-4
+    TEACHER_GAMMA: float = 1.0
+    TEACHER_GAE_LAMBDA: float = 0.999
+    TEACHER_CLIP_EPS: float = 0.3
+    TEACHER_ENT_COEF: float = 0.01
+    TEACHER_VF_COEF: float = 0.5
+    TEACHER_MAX_GRAD_NORM: float = 0.5
+    TEACHER_UPDATE_EPOCHS: int = 4
+    TEACHER_NUM_MINIBATCHES: int = 4
 
 
 class ActorCritic(nn.Module):
@@ -360,6 +415,138 @@ def plot_teacher_softmax(
     return fig, ax
 
 
+def save_teacher_softmax_snapshot(
+    probs,
+    grid_h,
+    grid_w,
+    out_path,
+    *,
+    title="Teacher goal-cell distribution",
+    wandb_step=None,
+    wandb_key="teacher/goal_softmax",
+):
+    """Save and optionally log a teacher goal-softmax heatmap snapshot."""
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(out_dir, exist_ok=True)
+    fig, _ = plot_teacher_softmax(
+        probs,
+        grid_h,
+        grid_w,
+        title=title,
+        save_path=out_path,
+    )
+    print(f"[teacher] saved softmax heatmap to {out_path}")
+    if wandb_step is not None:
+        wandb.log({wandb_key: wandb.Image(fig)}, step=int(wandb_step))
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
+    return out_path
+
+
+def overlay_goal_on_frames(frames, goal_indices, grid_h, grid_w):
+    """Highlight the teacher goal cell on each rendered RGB frame.
+
+    Draws a semi-transparent gold fill over the goal tile and a solid
+    orange-red border around it so the selected cell is immediately visible
+    in saved evaluation videos.
+
+    Parameters
+    ----------
+    frames : np.ndarray, shape (T, H_px, W_px, 3), dtype uint8
+        RGB frames produced by ``nx.observations.rgb``.
+    goal_indices : array-like, shape (T,)
+        Flat row-major grid-cell indices (the teacher's ``goal_idx`` at each
+        timestep).
+    grid_h, grid_w : int
+        Number of grid cells along height and width axes respectively.
+
+    Returns
+    -------
+    np.ndarray
+        A copy of ``frames`` with the goal cell highlighted on every frame.
+    """
+    import numpy as _np
+
+    goal_indices = _np.asarray(goal_indices)
+    frames = frames.copy()
+    T, H_px, W_px = frames.shape[:3]
+    # Use exact partition edges so overlay stays correct even if frame size is
+    # not perfectly divisible by grid resolution.
+    row_edges = _np.linspace(0, H_px, grid_h + 1, dtype=_np.int32)
+    col_edges = _np.linspace(0, W_px, grid_w + 1, dtype=_np.int32)
+    tile_h = max(1, int(_np.median(_np.diff(row_edges))))
+    tile_w = max(1, int(_np.median(_np.diff(col_edges))))
+
+    highlight_color = _np.array([255, 215, 0], dtype=_np.float32)  # gold
+    alpha = 0.4
+    border_color = _np.array([255, 69, 0], dtype=_np.uint8)  # orange-red
+    border_px = max(2, min(tile_h, tile_w) // 10)
+
+    for t in range(T):
+        row = int(goal_indices[t]) // grid_w
+        col = int(goal_indices[t]) % grid_w
+        r0, r1 = row_edges[row], row_edges[row + 1]
+        c0, c1 = col_edges[col], col_edges[col + 1]
+        # Alpha-blend a gold fill over the goal tile.
+        tile = frames[t, r0:r1, c0:c1].astype(_np.float32)
+        frames[t, r0:r1, c0:c1] = _np.clip(
+            tile * (1 - alpha) + highlight_color * alpha, 0, 255
+        ).astype(_np.uint8)
+        # Draw an orange-red border around the tile.
+        frames[t, r0 : r0 + border_px, c0:c1] = border_color
+        frames[t, r1 - border_px : r1, c0:c1] = border_color
+        frames[t, r0:r1, c0 : c0 + border_px] = border_color
+        frames[t, r0:r1, c1 - border_px : c1] = border_color
+
+    return frames
+
+
+def plot_render_episode_returns(
+    rewards, dones, *, title=None, save_path=None, linewidth=2.0, marker="o"
+):
+    """Plot per-episode returns for one rendered rollout.
+
+    Parameters
+    ----------
+    rewards : array-like, shape (T,)
+        Step rewards from the rendered rollout.
+    dones : array-like, shape (T,)
+        Episode-terminal flags aligned with ``rewards``.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
+    dones = np.asarray(dones).reshape(-1).astype(bool)
+    assert rewards.shape[0] == dones.shape[0], "rewards/dones length mismatch"
+
+    episode_returns = []
+    running_return = 0.0
+    for r, d in zip(rewards, dones):
+        running_return += float(r)
+        if d:
+            episode_returns.append(running_return)
+            running_return = 0.0
+    if not episode_returns:
+        episode_returns.append(float(rewards.sum()))
+
+    x = np.arange(1, len(episode_returns) + 1)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(x, episode_returns, linewidth=linewidth, marker=marker)
+    ax.set_xlabel("Episode index")
+    ax.set_ylabel("Episode return")
+    ax.set_xticks(x)
+    ax.grid(True, alpha=0.3)
+    if title is not None:
+        ax.set_title(title)
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig, ax, episode_returns
+
+
 def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -367,12 +554,14 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    print(f"Number of updates: {config['NUM_UPDATES']}")
     # Teacher PPO + competence learning-progress (LP) reward settings. The
     # teacher proposes a goal cell; its reward is the change in the student's
     # success rate on that SAME goal measured at the synchronized episode
     # boundary (before vs. after the student's experience for that episode).
     config.setdefault("TEACHER_REWARD_TYPE", "competence_lp")
     config.setdefault("TEACHER_LP_ABSOLUTE", False)
+    config.setdefault("TEACHER_SUCCESS_BONUS", 1.0)
     config.setdefault("TEACHER_EVAL_EPISODES", 1)
     config.setdefault("TEACHER_EVAL_NUM_ENVS", 4)
     config.setdefault("TEACHER_EPISODE_LENGTH", 4)
@@ -506,18 +695,41 @@ def make_train(config):
                 goal_idx = jnp.where(resample, new_idx, goal_idx)
                 new_ref = gather_goal_cell(obs, goal_idx, grid_h, grid_w)
                 goal_ref = jnp.where(resample, new_ref, goal_ref)
-                return (obs, state, goal_idx, goal_ref, rng), state
+                return (obs, state, goal_idx, goal_ref, rng), (
+                    state,
+                    goal_idx,
+                    reward,
+                    done,
+                )
 
-            _, states = jax.lax.scan(
+            _, (states, goal_indices, rewards, dones) = jax.lax.scan(
                 _step, (obs, state, goal_idx, goal_ref, rng), None, length=num_steps
             )
             # `states` is the LogEnvState stacked over time; the wrapped Navix
             # timestep (and its renderable state) lives in `env_state`.
+            # `goal_indices` is the flat goal cell index at each timestep.
             frames = jax.vmap(nx.observations.rgb)(states.env_state.state)
-            return frames
+            return frames, goal_indices, rewards, dones
 
-        frames = jax.jit(_rollout)(params, rng)
+        frames, goal_indices, rewards, dones = jax.jit(_rollout)(params, rng)
         frames = np.asarray(jax.device_get(frames)).astype(np.uint8)
+        goal_indices = np.asarray(jax.device_get(goal_indices))
+        rewards = np.asarray(jax.device_get(rewards))
+        dones = np.asarray(jax.device_get(dones))
+        frames = overlay_goal_on_frames(frames, goal_indices, grid_h, grid_w)
+        unique_goals = np.unique(goal_indices).size
+        goal_rows = (goal_indices // grid_w).astype(np.int32)
+        goal_cols = (goal_indices % grid_w).astype(np.int32)
+        print(
+            "[render_eval_episode] goal trace: "
+            f"{unique_goals} unique cells over {len(goal_indices)} steps; "
+            f"first 10 (row,col)={list(zip(goal_rows[:10], goal_cols[:10]))}"
+        )
+        if unique_goals <= 1:
+            print(
+                "[render_eval_episode] warning: sampled goal stayed in one cell. "
+                "If unexpected, inspect teacher softmax entropy and render seed."
+            )
 
         out_dir = os.path.dirname(os.path.abspath(out_path))
         os.makedirs(out_dir, exist_ok=True)
@@ -552,17 +764,34 @@ def make_train(config):
             out_path = gif_path
             print(f"[render_eval_episode] imageio failed ({err}); used matplotlib fallback")
 
+        returns_plot_path = os.path.splitext(out_path)[0] + "_episode_returns.png"
+        ret_fig, _, episode_returns = plot_render_episode_returns(
+            rewards,
+            dones,
+            title="Rendered rollout episode returns",
+            save_path=returns_plot_path,
+        )
+        import matplotlib.pyplot as plt
+
+        plt.close(ret_fig)
         print(
             f"[render_eval_episode] saved agent video to {out_path} ({len(frames)} frames)"
+        )
+        print(
+            "[render_eval_episode] saved episode-return plot to "
+            f"{returns_plot_path} (episodes={len(episode_returns)})"
         )
         return out_path
 
     def linear_schedule(count):
-        frac = (
-            1.0
-            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
-            / config["NUM_UPDATES"]
-        )
+        update_idx = count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+        # Make the student LR linear from LR at update 0 to exactly 0 at the
+        # last training update (index NUM_UPDATES - 1).
+        if config["NUM_UPDATES"] <= 1:
+            frac = 0.0
+        else:
+            frac = 1.0 - (update_idx / (config["NUM_UPDATES"] - 1))
+            frac = jnp.maximum(frac, 0.0)
         return config["LR"] * frac
 
     def teacher_linear_schedule(count):
@@ -571,17 +800,17 @@ def make_train(config):
         n = max(
             int(config["NUM_UPDATES"]) // config["TEACHER_EPISODE_LENGTH"], 1
         )
-        frac = (
-            1.0
-            - (
-                count
-                // (
-                    config["TEACHER_NUM_MINIBATCHES"]
-                    * config["TEACHER_UPDATE_EPOCHS"]
-                )
-            )
-            / n
+        teacher_steps_per_update = (
+            config["TEACHER_NUM_MINIBATCHES"] * config["TEACHER_UPDATE_EPOCHS"]
         )
+        total_teacher_opt_steps = max(n * teacher_steps_per_update, 1)
+        # Make the teacher LR linear from TEACHER_LR at optimizer step 0 to
+        # exactly 0 at the final planned teacher optimizer step.
+        if total_teacher_opt_steps <= 1:
+            frac = 0.0
+        else:
+            frac = 1.0 - (count / (total_teacher_opt_steps - 1))
+            frac = jnp.clip(frac, 0.0, 1.0)
         return config["TEACHER_LR"] * frac
 
     def train(rng):
@@ -639,6 +868,7 @@ def make_train(config):
         teacher_eval_episodes = config["TEACHER_EVAL_EPISODES"]
         teacher_eval_num_envs = config["TEACHER_EVAL_NUM_ENVS"]
         teacher_lp_absolute = config["TEACHER_LP_ABSOLUTE"]
+        teacher_success_bonus = config["TEACHER_SUCCESS_BONUS"]
         teacher_network = TeacherSpatialPolicy(
             activation=config["ACTIVATION"],
             obs_embed_dim=config["OBS_EMBED_DIM"],
@@ -816,6 +1046,7 @@ def make_train(config):
                 last_obs,
                 pending,
                 goal_ref,
+                success_since_boundary,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -834,6 +1065,7 @@ def make_train(config):
                     goal_idx,
                     goal_ref,
                     pending,
+                    success_since_boundary,
                     teacher_buffer,
                     teacher_buffer_count,
                     rng,
@@ -852,9 +1084,13 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
+                obsv, env_state, env_reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
+                student_task_success_step = jnp.equal(env_reward, 1)
+                success_since_boundary = jnp.logical_or(
+                    success_since_boundary, student_task_success_step
+                )
                 # Store the goal-conditioned observation so the PPO update reruns
                 # the network on exactly the same inputs used to act.
                 # transition = Transition(
@@ -888,7 +1124,7 @@ def make_train(config):
                     jnp.not_equal(current_cell, goal_ref), axis=-1
                 )
                 # Add the goal reached signal to the reward.
-                reward = reward + goal_reached 
+                reward = env_reward + goal_reached
                 transition = Transition(
                     done, action, value, reward, log_prob, cond_obs, info
                 )
@@ -945,7 +1181,18 @@ def make_train(config):
                 lp = comp_after - comp_before_old
                 if teacher_lp_absolute:
                     lp = jnp.abs(lp)
-                teacher_reward = jnp.where(done_mask, lp, jnp.zeros_like(lp))
+                success_bonus = (
+                    teacher_success_bonus
+                    * success_since_boundary.astype(lp.dtype)
+                )
+                teacher_reward = jnp.where(
+                    done_mask, lp + success_bonus, jnp.zeros_like(lp)
+                )
+                success_since_boundary = jnp.where(
+                    done_mask,
+                    jnp.zeros_like(success_since_boundary),
+                    success_since_boundary,
+                )
 
                 # BUFFER WRITE: one row per synchronized episode, writing all
                 # NUM_ENVS envs at once. safe_write_row clamps to the padding row
@@ -1000,6 +1247,7 @@ def make_train(config):
                     goal_idx,
                     goal_ref,
                     pending,
+                    success_since_boundary,
                     teacher_buffer,
                     teacher_buffer_count,
                     rng,
@@ -1019,6 +1267,7 @@ def make_train(config):
                 pending.goal,
                 goal_ref,
                 pending,
+                success_since_boundary,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -1043,6 +1292,7 @@ def make_train(config):
                 goal_idx,
                 goal_ref,
                 pending,
+                success_since_boundary,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -1322,6 +1572,9 @@ def make_train(config):
                 teacher_entropy,
                 teacher_did_update,
             ) = teacher_metrics
+            student_current_lr = (
+                linear_schedule(train_state.step) if config["ANNEAL_LR"] else config["LR"]
+            )
             teacher_current_lr = (
                 teacher_linear_schedule(teacher_train_state.step)
                 if config["ANNEAL_LR"]
@@ -1351,6 +1604,7 @@ def make_train(config):
                         teacher_actor_loss,
                         teacher_entropy,
                         teacher_did_update,
+                        student_current_lr,
                         teacher_current_lr,
                         teacher_reward_traj,
                         comp_after_traj,
@@ -1362,6 +1616,7 @@ def make_train(config):
                         "actor_loss": float(actor_loss),
                         "entropy": float(entropy),
                         "goal_success_rate": float(goal_success_rate),
+                        "student/learning_rate": float(student_current_lr),
                         "teacher/learning_rate": float(teacher_current_lr),
                         "teacher/did_update": float(teacher_did_update),
                     }
@@ -1416,11 +1671,97 @@ def make_train(config):
                         teacher_actor_loss,
                         teacher_entropy,
                         teacher_did_update,
+                        student_current_lr,
                         teacher_current_lr,
                         teacher_reward_traj,
                         comp_after_traj,
                         comp_before_traj,
                     ),
+                )
+
+            # Mid-training video renders: fires render_eval_episode at
+            # RENDER_NUM_VIDEOS_DURING_TRAINING evenly-spaced update checkpoints.
+            # Uses jax.debug.callback so it works inside the compiled scan loop
+            # without breaking JIT — the Python-level interval check filters
+            # which steps actually trigger a render.
+            if config.get("RENDER_ENABLED", True) and config.get("RENDER_NUM_VIDEOS_DURING_TRAINING", 0) > 0:
+                _num_renders = int(config["RENDER_NUM_VIDEOS_DURING_TRAINING"])
+                _render_every_n = max(1, config["NUM_UPDATES"] // _num_renders)
+                _updates_per_outer = config["UPDATE_EPOCHS"] * config["NUM_MINIBATCHES"]
+
+                def _render_training_cb(optax_step, student_params, teacher_params):
+                    # Optax step counts gradient updates; divide to get the outer
+                    # (env-collection + PPO) update number.
+                    outer_update = int(optax_step) // _updates_per_outer
+                    if outer_update > 0 and (outer_update % _render_every_n) == 0:
+                        global_step = (
+                            outer_update * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        )
+                        base = config.get(
+                            "RENDER_OUT_PATH", "artifacts/minigrid_eval.mp4"
+                        )
+                        stem, ext = os.path.splitext(base)
+                        out = f"{stem}_step{global_step:010d}{ext}"
+                        vid = render_eval_episode(
+                            student_params,
+                            jax.random.PRNGKey(outer_update),
+                            teacher_params,
+                            out_path=out,
+                        )
+                        if config.get("WANDB_MODE", "disabled") != "disabled":
+                            fmt = "gif" if vid.endswith(".gif") else "mp4"
+                            wandb.log(
+                                {"eval/video": wandb.Video(vid, format=fmt)},
+                                step=global_step,
+                            )
+
+                jax.debug.callback(
+                    _render_training_cb,
+                    train_state.step,
+                    train_state.params,
+                    teacher_train_state.params,
+                )
+
+            # Mid-training teacher softmax snapshots at a fixed outer-update
+            # frequency. This uses the fixed reset observation so snapshots are
+            # comparable over time.
+            if config.get("TEACHER_HEATMAP_EVERY_N_UPDATES", 0) > 0:
+                _heatmap_every_n = int(config["TEACHER_HEATMAP_EVERY_N_UPDATES"])
+                _updates_per_outer = config["UPDATE_EPOCHS"] * config["NUM_MINIBATCHES"]
+                _heatmap_base = config.get(
+                    "TEACHER_HEATMAP_OUT_PATH", "artifacts/teacher_softmax.png"
+                )
+
+                def _teacher_heatmap_training_cb(optax_step, teacher_params):
+                    outer_update = int(optax_step) // _updates_per_outer
+                    if outer_update > 0 and (outer_update % _heatmap_every_n) == 0:
+                        global_step = (
+                            outer_update * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        )
+                        _, pi, _ = teacher_network.apply(teacher_params, obsv)
+                        probs = np.asarray(jax.device_get(pi.probs[0]))
+                        stem, ext = os.path.splitext(_heatmap_base)
+                        if not ext:
+                            ext = ".png"
+                        out = f"{stem}_step{global_step:010d}{ext}"
+                        save_teacher_softmax_snapshot(
+                            probs,
+                            config["TEACHER_GRID_H"],
+                            config["TEACHER_GRID_W"],
+                            out,
+                            title=f"Teacher goal-cell distribution @ step {global_step}",
+                            wandb_step=(
+                                global_step
+                                if config.get("WANDB_MODE", "disabled") != "disabled"
+                                else None
+                            ),
+                            wandb_key="teacher/goal_softmax_during_training",
+                        )
+
+                jax.debug.callback(
+                    _teacher_heatmap_training_cb,
+                    train_state.step,
+                    teacher_train_state.params,
                 )
 
             runner_state = (
@@ -1430,6 +1771,7 @@ def make_train(config):
                 last_obs,
                 pending,
                 goal_ref,
+                success_since_boundary,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -1456,6 +1798,7 @@ def make_train(config):
             obsv,
             pending,
             goal_ref,
+            jnp.zeros((config["NUM_ENVS"],), dtype=bool),
             teacher_buffer,
             teacher_buffer_count,
             _rng,
@@ -1484,61 +1827,9 @@ def make_train(config):
 
 
 if __name__ == "__main__":
-    config = {
-        "LR": 2.5e-4,
-        "NUM_ENVS": 128,
-        "NUM_STEPS": 128,
-        "TOTAL_TIMESTEPS": 10e6,
-        "UPDATE_EPOCHS": 1,
-        "NUM_MINIBATCHES": 8,
-        "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.2,
-        "ENT_COEF": 0.01,
-        "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
-        "ACTIVATION": "relu",
-        "ENV_NAME": "Navix-DoorKey-16x16-v0",
-        # Channel-wise embedding of the symbolic Minigrid observation. Each
-        # integer channel (object/tag, color, state) is embedded independently
-        # with a shared embedding size, then concatenated before the CNN.
-        "OBS_EMBED_DIM": 16,
-        "OBS_TAG_VOCAB_SIZE": 11,
-        "OBS_COLOR_VOCAB_SIZE": 6,
-        "OBS_STATE_VOCAB_SIZE": 4,
-        "ANNEAL_LR": True,
-        "DEBUG": True,
-        "SEED": 30,
-        # Fixed reset seeds so every episode starts from the exact same state.
-        "RESET_SEED": 0,
-        "EVAL_RESET_SEED": 0,
-        "WANDB_MODE": "online",  # set to "online" to activate wandb
-        "ENTITY": "",
-        "PROJECT": "purejaxrl",
-        "RENDER_ENABLED": True,
-        "RENDER_NUM_STEPS": 500,
-        "RENDER_FPS": 10,
-        "RENDER_OUT_PATH": "artifacts/minigrid_eval.mp4",
-        "RENDER_DETERMINISTIC": False,
-        # Teacher PPO + competence learning-progress (LP) reward.
-        # FIXED_EPISODE_LENGTH and TEACHER_EVAL_HORIZON are derived from grid
-        # dims inside make_train (H = 4 * grid_h * grid_w). Set them here only
-        # to override the computed defaults.
-        "TEACHER_REWARD_TYPE": "competence_lp",
-        "TEACHER_LP_ABSOLUTE": False,
-        "TEACHER_EVAL_EPISODES": 1,
-        "TEACHER_EVAL_NUM_ENVS": 10,
-        "TEACHER_EPISODE_LENGTH": 10,
-        "TEACHER_LR": 2.5e-4,
-        "TEACHER_GAMMA": 1,
-        "TEACHER_GAE_LAMBDA":0.999,
-        "TEACHER_CLIP_EPS": 0.2,
-        "TEACHER_ENT_COEF": 0.01,
-        "TEACHER_VF_COEF": 0.5,
-        "TEACHER_MAX_GRAD_NORM": 0.5,
-        "TEACHER_UPDATE_EPOCHS": 4,
-        "TEACHER_NUM_MINIBATCHES": 4,
-    }
+    # Parse CLI arguments with typed defaults, then keep the existing dict-based
+    # training pipeline unchanged.
+    config = asdict(tyro.cli(TrainConfig))
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -1568,20 +1859,13 @@ if __name__ == "__main__":
 
     # Teacher categorical heatmap over the (H, W) goal grid.
     teacher_probs = np.asarray(jax.device_get(out["teacher_probs"]))
-    heatmap_path = config.get(
-        "TEACHER_HEATMAP_OUT_PATH", "artifacts/teacher_softmax.png"
-    )
-    os.makedirs(os.path.dirname(os.path.abspath(heatmap_path)), exist_ok=True)
-    fig, _ = plot_teacher_softmax(
+    heatmap_path = config.get("TEACHER_HEATMAP_OUT_PATH", "artifacts/teacher_softmax.png")
+    save_teacher_softmax_snapshot(
         teacher_probs,
         config["TEACHER_GRID_H"],
         config["TEACHER_GRID_W"],
+        heatmap_path,
         title="Teacher goal-cell distribution",
-        save_path=heatmap_path,
+        wandb_step=(final_step if config.get("WANDB_MODE", "disabled") != "disabled" else None),
+        wandb_key="teacher/goal_softmax",
     )
-    print(f"[teacher] saved softmax heatmap to {heatmap_path}")
-    if config.get("WANDB_MODE", "disabled") != "disabled":
-        wandb.log({"teacher/goal_softmax": wandb.Image(fig)}, step=final_step)
-    import matplotlib.pyplot as plt
-
-    plt.close(fig)
