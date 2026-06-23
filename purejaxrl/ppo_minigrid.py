@@ -51,7 +51,7 @@ class TrainConfig:
     RENDER_DETERMINISTIC: bool = False
     RENDER_NUM_VIDEOS_DURING_TRAINING: int = 0
     TEACHER_HEATMAP_OUT_PATH: str = "artifacts/teacher_softmax.png"
-    TEACHER_HEATMAP_EVERY_N_UPDATES: int = 50
+    TEACHER_HEATMAP_EVERY_N_UPDATES: int = 100
     TEACHER_REWARD_TYPE: str = "competence_lp"
     TEACHER_LP_ABSOLUTE: bool = False
     TEACHER_SUCCESS_BONUS: float = 1.0
@@ -1732,14 +1732,13 @@ def make_train(config):
                     "TEACHER_HEATMAP_OUT_PATH", "artifacts/teacher_softmax.png"
                 )
 
-                def _teacher_heatmap_training_cb(optax_step, teacher_params):
+                def _teacher_heatmap_training_cb(optax_step, probs_snapshot):
                     outer_update = int(optax_step) // _updates_per_outer
                     if outer_update > 0 and (outer_update % _heatmap_every_n) == 0:
                         global_step = (
                             outer_update * config["NUM_STEPS"] * config["NUM_ENVS"]
                         )
-                        _, pi, _ = teacher_network.apply(teacher_params, obsv)
-                        probs = np.asarray(jax.device_get(pi.probs[0]))
+                        probs = np.asarray(probs_snapshot)
                         stem, ext = os.path.splitext(_heatmap_base)
                         if not ext:
                             ext = ".png"
@@ -1758,10 +1757,16 @@ def make_train(config):
                             wandb_key="teacher/goal_softmax_during_training",
                         )
 
+                # Compute teacher probs on-device before crossing into the host
+                # callback. Avoids nested JAX dispatch inside callback, which can
+                # stall when plotting runs during a compiled scan.
+                _, teacher_pi_snapshot, _ = teacher_apply(
+                    teacher_train_state.params, last_obs
+                )
                 jax.debug.callback(
                     _teacher_heatmap_training_cb,
                     train_state.step,
-                    teacher_train_state.params,
+                    teacher_pi_snapshot.probs[0],
                 )
 
             runner_state = (

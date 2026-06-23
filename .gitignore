@@ -3,6 +3,7 @@ __pycache__/
 ./*/*/__pycache__/
 ./*/*/*/__pycache__/
 job
+artifacts
 submit_job
 wandb
 ./*/wandb

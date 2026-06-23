@@ -5,12 +5,16 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
+from dataclasses import asdict, dataclass
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
 import gymnax
 import navix as nx
+import tyro
 from wrappers import LogWrapper, FlattenObservationWrapper, NavixGymnaxWrapper
+
+WANDB_RUN = None
 
 
 class ActorCritic(nn.Module):
@@ -59,6 +63,42 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
+
+
+@dataclass
+class Config:
+    lr: float = 2.5e-4
+    num_envs: int = 128
+    num_steps: int = 128
+    total_timesteps: int = int(50e6)
+    update_epochs: int = 1
+    num_minibatches: int = 8
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_eps: float = 0.2
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    activation: str = "relu"
+    env_name: str = "Navix-DoorKey-16x16-v0"
+    anneal_lr: bool = True
+    debug: bool = True
+    render_enabled: bool = True
+    render_num_steps: int = 500
+    render_fps: int = 10
+    render_out_path: str = "artifacts/minigrid_eval.mp4"
+    render_deterministic: bool = False
+    wandb_enabled: bool = True
+    wandb_project: str = "minigrid_no_teacher"
+    wandb_entity: str | None = None
+    wandb_name: str | None = None
+    wandb_mode: str = "online"
+    seed: int = 30
+
+
+def _config_to_legacy_dict(args: Config) -> dict[str, Any]:
+    config = asdict(args)
+    return {k.upper(): v for k, v in config.items()}
 
 
 def make_train(config):
@@ -355,13 +395,25 @@ def make_train(config):
             metric = traj_batch.info
             rng = update_state[-1]
             
-            # Debugging mode
-            if config.get("DEBUG"):
+            # Debug and host-side logging (stdout / wandb).
+            if config.get("DEBUG") or config.get("WANDB_ENABLED"):
                 def callback(info):
+                    global WANDB_RUN
                     return_values = info["returned_episode_returns"][info["returned_episode"]]
                     timesteps = info["timestep"][info["returned_episode"]] * config["NUM_ENVS"]
                     for t in range(len(timesteps)):
-                        print(f"global step={timesteps[t]}, episodic return={return_values[t]}")
+                        step = int(timesteps[t])
+                        episodic_return = float(return_values[t])
+                        if config.get("DEBUG"):
+                            print(
+                                f"global step={step}, episodic return={episodic_return}"
+                            )
+                        if config.get("WANDB_ENABLED") and WANDB_RUN is not None:
+                            WANDB_RUN.log(
+                                {"episodic_return": episodic_return, "global_step": step},
+                                step=step,
+                            )
+
                 jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, rng)
@@ -378,30 +430,25 @@ def make_train(config):
 
 
 if __name__ == "__main__":
-    config = {
-        "LR": 2.5e-4,
-        "NUM_ENVS": 128,
-        "NUM_STEPS": 128,
-        "TOTAL_TIMESTEPS": 10e6,
-        "UPDATE_EPOCHS": 1,
-        "NUM_MINIBATCHES": 8,
-        "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.2,
-        "ENT_COEF": 0.01,
-        "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
-        "ACTIVATION": "tanh",
-        "ENV_NAME": "Navix-DoorKey-16x16-v0",
-        "ANNEAL_LR": True,
-        "DEBUG": True,
-        "RENDER_ENABLED": True,
-        "RENDER_NUM_STEPS": 500,
-        "RENDER_FPS": 10,
-        "RENDER_OUT_PATH": "artifacts/minigrid_eval.mp4",
-        "RENDER_DETERMINISTIC": False,
-    }
-    rng = jax.random.PRNGKey(30)
+    args = tyro.cli(Config)
+    config = _config_to_legacy_dict(args)
+    if config["WANDB_ENABLED"]:
+        try:
+            import wandb
+        except ImportError as err:
+            raise ImportError(
+                "wandb is not installed. Install with `pip install wandb` "
+                "or run with `--wandb-enabled False`."
+            ) from err
+        WANDB_RUN = wandb.init(
+            project=config["WANDB_PROJECT"],
+            entity=config["WANDB_ENTITY"],
+            name=config["WANDB_NAME"],
+            mode=config["WANDB_MODE"],
+            config=config,
+        )
+
+    rng = jax.random.PRNGKey(config["SEED"])
     train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     out = train_jit(rng)
@@ -409,3 +456,6 @@ if __name__ == "__main__":
     if config.get("RENDER_ENABLED", True):
         final_params = out["runner_state"][0].params
         render_eval_episode(final_params, jax.random.PRNGKey(0))
+
+    if config.get("WANDB_ENABLED") and WANDB_RUN is not None:
+        WANDB_RUN.finish()
