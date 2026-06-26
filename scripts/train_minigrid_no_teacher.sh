@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="minigrid_with_teacher"
+WANDB_PROJECT_NAME="minigrid_no_teacher"
 
 ENV_NAMES=("Navix-DoorKey-16x16-v0")
 TOTAL_TIMESTEPS_=(50000000)
@@ -26,14 +26,14 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for num_envs in "${NUM_ENVSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_teacherlr${teacher_lr}_probeagg${teacher_probe_agg}_treward${teacher_reward_type}_sgoal${student_goal_reward_type}_teplen${teacher_episode_length}_sampleevery${teacher_sample_every_n_episodes}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_minigrid_no_teacher.py \
-                        --ENV_NAME=${ENV_NAME} \
-                        --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
-                        --LR=${LR} \
-                        --SEED=${SEED} \
-                        --NUM_STEPS=${num_steps} \
-                        --NUM_ENVS=${num_envs} \
-                        --PROJECT=\"${WANDB_PROJECT_NAME}\" \
-                        --ENT_COEF=${student_entropy_coef}" 
+                        --env_name=${ENV_NAME} \
+                        --total_timesteps=${TOTAL_TIMESTEPS} \
+                        --lr=${LR} \
+                        --seed=${SEED} \
+                        --num_steps=${num_steps} \
+                        --num_envs=${num_envs} \
+                        --wandb_project=\"${WANDB_PROJECT_NAME}\" \
+                        --ent_coef=${student_entropy_coef}" 
                       eval ${CMD}
                       run_count=$((run_count + 1))
                     done

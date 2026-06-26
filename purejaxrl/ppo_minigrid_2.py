@@ -27,7 +27,7 @@ class TrainConfig:
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.95
     CLIP_EPS: float = 0.3
-    ENT_COEF: float = 0.001
+    ENT_COEF: float = 0.01
     VF_COEF: float = 0.5
     MAX_GRAD_NORM: float = 0.5
     ACTIVATION: str = "relu"
@@ -59,6 +59,7 @@ class TrainConfig:
     TEACHER_EVAL_EPISODES: int = 1
     TEACHER_EVAL_NUM_ENVS: int = 10
     TEACHER_EPISODE_LENGTH: int = 5
+    TEACHER_BATCH_SIZE: int = 512
     TEACHER_LR: float = 2.5e-4
     TEACHER_GAMMA: float = 1.0
     TEACHER_GAE_LAMBDA: float = 0.999
@@ -258,7 +259,7 @@ class Transition(NamedTuple):
 
 
 class TeacherTransition(NamedTuple):
-    """One teacher transition = one student update step on a proposed goal."""
+    """One teacher transition captured at a proposal-ending env event."""
 
     done: jnp.ndarray
     action: jnp.ndarray  # flat goal-cell index proposed by the teacher
@@ -559,14 +560,13 @@ def make_train(config):
     print(f"Number of updates: {config['NUM_UPDATES']}")
     # Teacher PPO + competence learning-progress (LP) reward settings. The
     # teacher proposes a goal cell; its reward is the change in the student's
-    # success rate on that SAME goal measured at the synchronized episode
-    # boundary (before vs. after the student's experience for that episode).
+    # success rate on that SAME goal measured when a proposal ends
+    # (episode boundary OR goal reached event).
     config.setdefault("TEACHER_REWARD_TYPE", "competence_lp")
     config.setdefault("TEACHER_LP_ABSOLUTE", False)
     config.setdefault("TEACHER_SUCCESS_BONUS", 1.0)
     config.setdefault("TEACHER_EVAL_EPISODES", 1)
     config.setdefault("TEACHER_EVAL_NUM_ENVS", 4)
-    config.setdefault("TEACHER_EPISODE_LENGTH", 4)
     config.setdefault("TEACHER_LR", 2.5e-4)
     config.setdefault("TEACHER_GAMMA", 0.99)
     config.setdefault("TEACHER_GAE_LAMBDA", 0.95)
@@ -592,9 +592,7 @@ def make_train(config):
     config["FIXED_EPISODE_LENGTH"] = 4 * teacher_grid_h * teacher_grid_w
     # Default eval horizon to one full fixed episode; can be overridden in config.
     config.setdefault("TEACHER_EVAL_HORIZON", config["FIXED_EPISODE_LENGTH"])
-    config["TEACHER_BATCH_SIZE"] = (
-        config["TEACHER_EPISODE_LENGTH"] * config["NUM_ENVS"]
-    )
+    assert config["TEACHER_BATCH_SIZE"] > 0, "TEACHER_BATCH_SIZE must be > 0"
     assert (
         config["TEACHER_BATCH_SIZE"] % config["TEACHER_NUM_MINIBATCHES"] == 0
     ), "teacher batch size must be divisible by TEACHER_NUM_MINIBATCHES"
@@ -808,11 +806,15 @@ def make_train(config):
         return config["LR"] * frac
 
     def teacher_linear_schedule(count):
-        # The teacher updates once every ``TEACHER_EPISODE_LENGTH`` student
-        # updates, so anneal over the number of teacher (not student) updates.
-        n = max(
-            int(config["NUM_UPDATES"]) // config["TEACHER_EPISODE_LENGTH"], 1
+        # The teacher updates after accumulating TEACHER_BATCH_SIZE event
+        # transitions (done OR goal_reached). Use an upper-bound estimate from
+        # total student env-steps for LR annealing.
+        total_student_env_steps = (
+            int(config["NUM_UPDATES"])
+            * int(config["NUM_STEPS"])
+            * int(config["NUM_ENVS"])
         )
+        n = max(total_student_env_steps // int(config["TEACHER_BATCH_SIZE"]), 1)
         teacher_steps_per_update = (
             config["TEACHER_NUM_MINIBATCHES"] * config["TEACHER_UPDATE_EPOCHS"]
         )
@@ -872,7 +874,6 @@ def make_train(config):
         teacher_clip_eps = config["TEACHER_CLIP_EPS"]
         teacher_vf_coef = config["TEACHER_VF_COEF"]
         teacher_ent_coef = config["TEACHER_ENT_COEF"]
-        teacher_episode_length = config["TEACHER_EPISODE_LENGTH"]
         teacher_num_minibatches = config["TEACHER_NUM_MINIBATCHES"]
         teacher_update_epochs = config["TEACHER_UPDATE_EPOCHS"]
         teacher_batch_size = config["TEACHER_BATCH_SIZE"]
@@ -1041,8 +1042,8 @@ def make_train(config):
         # Sample one goal cell per env from the teacher on the fixed reset obs,
         # snapshot the goal cell content (for reach detection), and measure the
         # student's "before" competence on each proposed goal. One teacher
-        # transition is collected per student update step; ``TEACHER_EPISODE_LENGTH``
-        # of them form one teacher PPO episode.
+        # transition is recorded for each env event (done OR goal_reached);
+        # teacher PPO runs once ``TEACHER_BATCH_SIZE`` transitions accumulate.
         rng, _goal_rng = jax.random.split(rng)
         init_goal_idx, _, init_log_prob, init_value = teacher_sample(
             teacher_train_state.params, obsv, rng=_goal_rng
@@ -1061,18 +1062,15 @@ def make_train(config):
             goal=init_goal_idx,
         )
         teacher_obs_shape = env.observation_space(env_params).shape
-        # Allocate teacher_episode_length + 1 rows so the padding-row pattern
-        # can safely absorb out-of-range writes when the buffer is full.
-        _tbuf_rows = teacher_episode_length + 1
+        # Flat event buffer with one padding slot for safe out-of-range writes.
+        _tbuf_rows = teacher_batch_size + 1
         teacher_buffer = TeacherTransition(
-            done=jnp.zeros((_tbuf_rows, config["NUM_ENVS"])),
-            action=jnp.zeros(
-                (_tbuf_rows, config["NUM_ENVS"]), dtype=jnp.int32
-            ),
-            value=jnp.zeros((_tbuf_rows, config["NUM_ENVS"])),
-            reward=jnp.zeros((_tbuf_rows, config["NUM_ENVS"])),
-            log_prob=jnp.zeros((_tbuf_rows, config["NUM_ENVS"])),
-            obs=jnp.zeros((_tbuf_rows, config["NUM_ENVS"]) + teacher_obs_shape),
+            done=jnp.zeros((_tbuf_rows,), dtype=jnp.float32),
+            action=jnp.zeros((_tbuf_rows,), dtype=jnp.int32),
+            value=jnp.zeros((_tbuf_rows,), dtype=jnp.float32),
+            reward=jnp.zeros((_tbuf_rows,), dtype=jnp.float32),
+            log_prob=jnp.zeros((_tbuf_rows,), dtype=jnp.float32),
+            obs=jnp.zeros((_tbuf_rows,) + teacher_obs_shape),
         )
         teacher_buffer_count = jnp.array(0, dtype=jnp.int32)
 
@@ -1085,7 +1083,7 @@ def make_train(config):
                 last_obs,
                 pending,
                 goal_ref,
-                success_since_boundary,
+                success_since_proposal_start,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -1093,9 +1091,8 @@ def make_train(config):
 
             # COLLECT TRAJECTORIES
             # goal_idx resamples on episode-done OR teacher-goal-reached so the
-            # student always has an active goal to chase. pending.goal is the
-            # teacher's macro-goal for LP tracking; it only updates at the
-            # synchronized episode boundary (done is all-True once per H steps).
+            # student always has an active goal to chase. pending stores the
+            # currently active teacher proposal per env and rolls on each event.
             def _env_step(inner_state, unused):
                 (
                     train_state,
@@ -1104,7 +1101,7 @@ def make_train(config):
                     goal_idx,
                     goal_ref,
                     pending,
-                    success_since_boundary,
+                    success_since_proposal_start,
                     teacher_buffer,
                     teacher_buffer_count,
                     rng,
@@ -1127,8 +1124,8 @@ def make_train(config):
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
                 student_task_success_step = jnp.equal(env_reward, 1)
-                success_since_boundary = jnp.logical_or(
-                    success_since_boundary, student_task_success_step
+                success_since_proposal_start = jnp.logical_or(
+                    success_since_proposal_start, student_task_success_step
                 )
                 # Store the goal-conditioned observation so the PPO update reruns
                 # the network on exactly the same inputs used to act.
@@ -1159,8 +1156,11 @@ def make_train(config):
                 # The goal is "reached" when the symbolic content at the goal cell
                 # differs from the snapshot taken when the goal was issued.
                 current_cell = gather_goal_cell(obsv, goal_idx, grid_h, grid_w)
-                goal_reached = goal_reward_weight *  jnp.any(
+                goal_reached_mask = jnp.any(
                     jnp.not_equal(current_cell, goal_ref), axis=-1
+                )
+                goal_reached = goal_reward_weight * goal_reached_mask.astype(
+                    env_reward.dtype
                 )
                 # Add the goal reached signal to the reward.
                 reward = env_reward + goal_reached
@@ -1169,24 +1169,23 @@ def make_train(config):
                 )
 
                 # SAMPLE NEXT TEACHER PROPOSAL from the current (frozen) teacher.
-                # Used for student resample on done|reach and for updating the
-                # pending macro-goal at the episode boundary.
+                # Used for student resample on done|reach and for rolling the
+                # pending teacher proposal for ended events.
                 rng, _t_sample_rng = jax.random.split(rng)
                 new_t_goal_idx, _, new_t_log_prob, new_t_value = teacher_sample(
                     teacher_train_state.params, obsv, rng=_t_sample_rng
                 )
 
                 # RESAMPLE STUDENT GOAL on episode end or teacher-goal reached.
-                resample_mask = jnp.logical_or(done, goal_reached)
+                resample_mask = jnp.logical_or(done, goal_reached_mask)
                 goal_idx = jnp.where(resample_mask, new_t_goal_idx, goal_idx)
                 new_ref = gather_goal_cell(obsv, goal_idx, grid_h, grid_w)
                 goal_ref = jnp.where(resample_mask[:, None], new_ref, goal_ref)
 
-                # COMPETENCE-LP AT SYNCHRONIZED EPISODE BOUNDARY
-                # Episodes end only by truncation (fixed horizon), so done is
-                # all-True or all-False for all envs simultaneously.
+                # COMPETENCE-LP AT PROPOSAL END EVENTS (done OR goal reached).
                 done_mask = done.astype(bool)
-                any_done = jnp.any(done_mask)
+                event_mask = jnp.logical_or(done_mask, goal_reached_mask)
+                any_event = jnp.any(event_mask)
 
                 def _do_eval(operands):
                     old_goals, new_goals, sp, e_rng = operands
@@ -1203,7 +1202,7 @@ def make_train(config):
 
                 rng, _eval_rng = jax.random.split(rng)
                 comp_after, comp_before_new = jax.lax.cond(
-                    any_done,
+                    any_event,
                     _do_eval,
                     _skip_eval,
                     (
@@ -1215,68 +1214,92 @@ def make_train(config):
                 )
 
                 # TEACHER REWARD: LP = success_after - success_before_proposal.
-                # Non-zero only at the episode boundary (done steps).
+                # Emitted whenever a proposal ends (done OR goal reached).
                 comp_before_old = pending.competence_before
                 lp = comp_after - comp_before_old
                 if teacher_lp_absolute:
                     lp = jnp.abs(lp)
                 success_bonus = (
                     teacher_success_bonus
-                    * success_since_boundary.astype(lp.dtype)
+                    * success_since_proposal_start.astype(lp.dtype)
                 )
                 teacher_reward = jnp.where(
-                    done_mask, lp + success_bonus, jnp.zeros_like(lp)
+                    event_mask, lp + success_bonus, jnp.zeros_like(lp)
                 )
-                success_since_boundary = jnp.where(
-                    done_mask,
-                    jnp.zeros_like(success_since_boundary),
-                    success_since_boundary,
+                success_since_proposal_start = jnp.where(
+                    event_mask,
+                    jnp.zeros_like(success_since_proposal_start),
+                    success_since_proposal_start,
                 )
 
-                # BUFFER WRITE: one row per synchronized episode, writing all
-                # NUM_ENVS envs at once. safe_write_row clamps to the padding row
-                # (teacher_episode_length) when the buffer is already full.
-                can_record = any_done & (
-                    teacher_buffer_count < teacher_episode_length
-                )
-                safe_write_row = jnp.where(
-                    can_record, teacher_buffer_count, teacher_episode_length
+                # BUFFER WRITE: append one transition per env event (done OR
+                # goal_reached), up to TEACHER_BATCH_SIZE capacity.
+                event_int = event_mask.astype(jnp.int32)
+                event_rank = jnp.cumsum(event_int) - 1
+                raw_write_idx = teacher_buffer_count + event_rank
+                valid_event = event_mask & (raw_write_idx < teacher_batch_size)
+                safe_write_idx = jnp.where(valid_event, raw_write_idx, teacher_batch_size)
+                event_obs = jnp.where(
+                    event_mask[:, None, None, None],
+                    pending.obs,
+                    teacher_buffer.obs[teacher_batch_size],
                 )
                 teacher_buffer = TeacherTransition(
-                    done=teacher_buffer.done.at[safe_write_row].set(
-                        jnp.zeros_like(teacher_reward)
+                    done=teacher_buffer.done.at[safe_write_idx].set(
+                        jnp.where(
+                            event_mask,
+                            jnp.ones_like(teacher_reward),
+                            teacher_buffer.done[teacher_batch_size],
+                        )
                     ),
-                    action=teacher_buffer.action.at[safe_write_row].set(
-                        pending.action
+                    action=teacher_buffer.action.at[safe_write_idx].set(
+                        jnp.where(
+                            event_mask,
+                            pending.action,
+                            teacher_buffer.action[teacher_batch_size],
+                        )
                     ),
-                    value=teacher_buffer.value.at[safe_write_row].set(
-                        pending.value
+                    value=teacher_buffer.value.at[safe_write_idx].set(
+                        jnp.where(
+                            event_mask,
+                            pending.value,
+                            teacher_buffer.value[teacher_batch_size],
+                        )
                     ),
-                    reward=teacher_buffer.reward.at[safe_write_row].set(
-                        teacher_reward
+                    reward=teacher_buffer.reward.at[safe_write_idx].set(
+                        jnp.where(
+                            event_mask,
+                            teacher_reward,
+                            teacher_buffer.reward[teacher_batch_size],
+                        )
                     ),
-                    log_prob=teacher_buffer.log_prob.at[safe_write_row].set(
-                        pending.log_prob
+                    log_prob=teacher_buffer.log_prob.at[safe_write_idx].set(
+                        jnp.where(
+                            event_mask,
+                            pending.log_prob,
+                            teacher_buffer.log_prob[teacher_batch_size],
+                        )
                     ),
-                    obs=teacher_buffer.obs.at[safe_write_row].set(pending.obs),
+                    obs=teacher_buffer.obs.at[safe_write_idx].set(event_obs),
                 )
-                teacher_buffer_count = teacher_buffer_count + any_done.astype(
-                    jnp.int32
+                teacher_buffer_count = jnp.minimum(
+                    teacher_buffer_count + valid_event.astype(jnp.int32).sum(),
+                    jnp.asarray(teacher_batch_size, dtype=jnp.int32),
                 )
 
-                # UPDATE PENDING on done only; pending.goal is the macro-goal for
-                # LP; the rest are the teacher PPO transition fields.
+                # UPDATE PENDING on event: when a goal proposal terminates (done
+                # or reach), roll to the newly sampled teacher proposal.
                 pending = PendingTeacher(
-                    obs=jnp.where(any_done, obsv, pending.obs),
-                    action=jnp.where(done_mask, new_t_goal_idx, pending.action),
-                    value=jnp.where(done_mask, new_t_value, pending.value),
+                    obs=jnp.where(event_mask[:, None, None, None], obsv, pending.obs),
+                    action=jnp.where(event_mask, new_t_goal_idx, pending.action),
+                    value=jnp.where(event_mask, new_t_value, pending.value),
                     log_prob=jnp.where(
-                        done_mask, new_t_log_prob, pending.log_prob
+                        event_mask, new_t_log_prob, pending.log_prob
                     ),
                     competence_before=jnp.where(
-                        done_mask, comp_before_new, pending.competence_before
+                        event_mask, comp_before_new, pending.competence_before
                     ),
-                    goal=jnp.where(done_mask, new_t_goal_idx, pending.goal),
+                    goal=jnp.where(event_mask, new_t_goal_idx, pending.goal),
                 )
 
                 inner_state = (
@@ -1286,7 +1309,7 @@ def make_train(config):
                     goal_idx,
                     goal_ref,
                     pending,
-                    success_since_boundary,
+                    success_since_proposal_start,
                     teacher_buffer,
                     teacher_buffer_count,
                     rng,
@@ -1297,6 +1320,7 @@ def make_train(config):
                     teacher_reward,
                     comp_after,
                     comp_before_old,
+                    event_mask,
                 )
 
             inner_state = (
@@ -1306,7 +1330,7 @@ def make_train(config):
                 pending.goal,
                 goal_ref,
                 pending,
-                success_since_boundary,
+                success_since_proposal_start,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -1317,6 +1341,7 @@ def make_train(config):
                 teacher_reward_traj,
                 comp_after_traj,
                 comp_before_traj,
+                event_mask_traj,
             ) = jax.lax.scan(
                 _env_step, inner_state, None, config["NUM_STEPS"]
             )
@@ -1331,7 +1356,7 @@ def make_train(config):
                 goal_idx,
                 goal_ref,
                 pending,
-                success_since_boundary,
+                success_since_proposal_start,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,
@@ -1459,9 +1484,9 @@ def make_train(config):
             entropy = jnp.mean(loss_info[1][2])
 
             # ----- TEACHER PPO UPDATE -----
-            # The teacher buffer was filled inside the rollout scan (at each
-            # synchronized episode boundary). Fires once TEACHER_EPISODE_LENGTH
-            # completed episodes have been collected; buffer/count reset after.
+            # The teacher buffer is filled inside the rollout scan (per env
+            # event: done OR goal_reached). Fires once TEACHER_BATCH_SIZE
+            # transitions are collected; buffer/count reset after.
             def _teacher_calculate_gae(traj, last_val):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
@@ -1488,9 +1513,9 @@ def make_train(config):
 
             def _run_teacher_update(operands):
                 t_state, t_buffer, t_count, t_rng, last_val = operands
-                # Slice valid rows only (drop the padding row at index teacher_episode_length).
+                # Slice valid transitions only (drop the padding slot).
                 traj = jax.tree_util.tree_map(
-                    lambda x: x[:teacher_episode_length], t_buffer
+                    lambda x: x[:teacher_batch_size], t_buffer
                 )
                 advantages, targets = _teacher_calculate_gae(traj, last_val)
 
@@ -1545,7 +1570,7 @@ def make_train(config):
                     permutation = jax.random.permutation(_rng, teacher_batch_size)
                     batch = (traj, advantages, targets)
                     batch = jax.tree_util.tree_map(
-                        lambda x: x.reshape((teacher_batch_size,) + x.shape[2:]),
+                        lambda x: x.reshape((teacher_batch_size,) + x.shape[1:]),
                         batch,
                     )
                     shuffled_batch = jax.tree_util.tree_map(
@@ -1586,7 +1611,7 @@ def make_train(config):
                 return t_state, t_buffer, t_count, t_rng, (z, z, z, z, z)
 
             teacher_should_update = (
-                (teacher_buffer_count >= teacher_episode_length)
+                (teacher_buffer_count >= teacher_batch_size)
                 & jnp.logical_not(jnp.asarray(teacher_uniform_random))
             )
             (
@@ -1604,7 +1629,7 @@ def make_train(config):
                     teacher_buffer,
                     teacher_buffer_count,
                     rng,
-                    pending.value,
+                    jnp.array(0.0, dtype=jnp.float32),
                 ),
             )
             (
@@ -1654,6 +1679,7 @@ def make_train(config):
                         teacher_reward_traj,
                         comp_after_traj,
                         comp_before_traj,
+                        event_mask_traj,
                     ) = args
                     payload = {
                         "total_loss": float(total_loss),
@@ -1686,12 +1712,10 @@ def make_train(config):
                                 "episodic_length": float(episode_lengths.mean()),
                             }
                         )
-                    # Log LP and competence only at episode boundaries (done steps).
-                    # teacher_reward_traj is zero at non-done steps.
-                    boundary_mask = returned_episode  # (NUM_STEPS, NUM_ENVS) bool
-                    lp_vals = teacher_reward_traj[boundary_mask]
-                    ca_vals = comp_after_traj[boundary_mask]
-                    cb_vals = comp_before_traj[boundary_mask]
+                    # Log LP and competence at proposal-ending events.
+                    lp_vals = teacher_reward_traj[event_mask_traj]
+                    ca_vals = comp_after_traj[event_mask_traj]
+                    cb_vals = comp_before_traj[event_mask_traj]
                     if len(lp_vals) > 0:
                         payload.update(
                             {
@@ -1721,6 +1745,7 @@ def make_train(config):
                         teacher_reward_traj,
                         comp_after_traj,
                         comp_before_traj,
+                        event_mask_traj,
                     ),
                 )
 
@@ -1829,7 +1854,7 @@ def make_train(config):
                 last_obs,
                 pending,
                 goal_ref,
-                success_since_boundary,
+                success_since_proposal_start,
                 teacher_buffer,
                 teacher_buffer_count,
                 rng,

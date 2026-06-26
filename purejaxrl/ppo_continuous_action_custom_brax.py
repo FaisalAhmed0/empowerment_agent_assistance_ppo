@@ -11,8 +11,10 @@ from brax import envs as brax_envs
 from brax.io import html
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
+from dataclasses import dataclass, asdict, field
 from flax.training.train_state import TrainState
 import distrax
+import tyro
 from wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
@@ -25,6 +27,44 @@ try:
     from purejaxrl.envs.factory import make_custom_env
 except ImportError:
     from envs.factory import make_custom_env
+
+
+@dataclass
+class TrainConfig:
+    LR: float = 3e-4
+    NUM_ENVS: int = 245
+    NUM_STEPS: int = 64
+    TOTAL_TIMESTEPS: int = int(5e7)
+    UPDATE_EPOCHS: int = 4
+    NUM_MINIBATCHES: int = 32
+    GAMMA: float = 0.99
+    GAE_LAMBDA: float = 0.95
+    CLIP_EPS: float = 0.3
+    ENT_COEF: float = 0.0
+    VF_COEF: float = 0.5
+    MAX_GRAD_NORM: float = 0.5
+    ACTIVATION: str = "tanh"
+    ENV_NAME: str = "ant_u_maze"
+    ENV_BACKEND: str | None = None
+    EPISODE_LENGTH: int = 1000
+    ACTION_REPEAT: int = 1
+    ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
+    ANNEAL_LR: bool = True
+    NORMALIZE_ENV: bool = True
+    DEBUG: bool = True
+    SEED: int = 30
+    WANDB_MODE: str = "online"
+    ENTITY: str = ""
+    PROJECT: str = "purejaxrl"
+    EVAL_RENDER_STEPS: int = 300
+    EVAL_RENDER_MAX_FRAMES: int = 100
+    EVAL_RENDER_HEIGHT: int = 360
+    EVAL_RENDER_LOG_WANDB_HTML: bool = True
+    COMMENT: str = ""
+
+
+def parse_config_from_cli() -> TrainConfig:
+    return tyro.cli(TrainConfig)
 
 
 class ActorCritic(nn.Module):
@@ -280,6 +320,7 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+                # NOTE: this where i will add a goal-reaching reward
                 obsv, env_state, reward, done, info = env.step(
                     rng_step, env_state, action, env_params
                 )
@@ -485,38 +526,8 @@ def make_train(config):
 
 
 def main():
-    config = {
-        "LR": 3e-4,
-        "NUM_ENVS": 1024,
-        "NUM_STEPS": 64,
-        "TOTAL_TIMESTEPS": 5e8,
-        "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 32,
-        "GAMMA": 0.99,
-        "GAE_LAMBDA": 0.95,
-        "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.3,
-        "ENT_COEF": 0.0,
-        "VF_COEF": 0.5,
-        "MAX_GRAD_NORM": 0.5,
-        "ACTIVATION": "tanh",
-        "ENV_NAME": "ant_u_maze_single_goal",
-        "ENV_BACKEND": None,
-        "EPISODE_LENGTH": 500,
-        "ACTION_REPEAT": 1,
-        "ENV_KWARGS": {},
-        "ANNEAL_LR": True,
-        "NORMALIZE_ENV": True,
-        "DEBUG": True,
-        "SEED": 30,
-        "WANDB_MODE": "online",  # set to "online" to activate wandb
-        "ENTITY": "",
-        "PROJECT": "purejaxrl",
-        "EVAL_RENDER_STEPS": 300,
-        "EVAL_RENDER_MAX_FRAMES": 100,
-        "EVAL_RENDER_HEIGHT": 360,
-        "EVAL_RENDER_LOG_WANDB_HTML": True,
-    }
+    config_obj = parse_config_from_cli()
+    config = asdict(config_obj)
 
     wandb.init(
         entity=config["ENTITY"],

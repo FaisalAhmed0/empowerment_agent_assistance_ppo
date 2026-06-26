@@ -12,7 +12,7 @@ import distrax
 import gymnax
 import navix as nx
 import tyro
-from wrappers import LogWrapper, FlattenObservationWrapper, NavixGymnaxWrapper
+from wrappers import LogWrapper, NavixGymnaxWrapper
 
 WANDB_RUN = None
 
@@ -20,6 +20,8 @@ WANDB_RUN = None
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
+    obs_embed_dim: int = 16
+    obs_vocab_sizes: Sequence[int] = (11, 6, 4)
 
     @nn.compact
     def __call__(self, x):
@@ -27,29 +29,54 @@ class ActorCritic(nn.Module):
             activation = nn.relu
         else:
             activation = nn.tanh
-        actor_mean = nn.Dense(
+
+        symbolic = x.astype(jnp.int32)
+        tag_embed = nn.Embed(
+            num_embeddings=self.obs_vocab_sizes[0],
+            features=self.obs_embed_dim,
+            name="tag_embed",
+        )(symbolic[..., 0])
+        color_embed = nn.Embed(
+            num_embeddings=self.obs_vocab_sizes[1],
+            features=self.obs_embed_dim,
+            name="color_embed",
+        )(symbolic[..., 1])
+        state_embed = nn.Embed(
+            num_embeddings=self.obs_vocab_sizes[2],
+            features=self.obs_embed_dim,
+            name="state_embed",
+        )(symbolic[..., 2])
+        embedding = jnp.concatenate((tag_embed, color_embed, state_embed), axis=-1)
+
+        embedding = nn.Conv(
+            32,
+            kernel_size=(2, 2),
+            padding="SAME",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(embedding)
+        embedding = activation(embedding)
+        embedding = nn.Conv(
+            64,
+            kernel_size=(2, 2),
+            padding="SAME",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(embedding)
+        embedding = activation(embedding)
+        embedding = embedding.reshape((*embedding.shape[:-3], -1))
+        embedding = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_mean = activation(actor_mean)
+        )(embedding)
+        embedding = activation(embedding)
+
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
+        )(embedding)
         pi = distrax.Categorical(logits=actor_mean)
 
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
+            embedding
         )
 
         return pi, jnp.squeeze(critic, axis=-1)
@@ -81,6 +108,10 @@ class Config:
     max_grad_norm: float = 0.5
     activation: str = "relu"
     env_name: str = "Navix-DoorKey-16x16-v0"
+    obs_embed_dim: int = 16
+    obs_tag_vocab_size: int = 11
+    obs_color_vocab_size: int = 6
+    obs_state_vocab_size: int = 4
     anneal_lr: bool = True
     debug: bool = True
     render_enabled: bool = True
@@ -120,7 +151,6 @@ def make_train(config):
     obsv, env_state = env.reset(jax.random.PRNGKey(0), env_params)
     print("shape of observation before flattening")
     jax.debug.print("obsv.shape: {obsv}", obsv=obsv.shape)
-    env = FlattenObservationWrapper(env)
     env = LogWrapper(env)
 
     def render_eval_episode(
@@ -146,7 +176,14 @@ def make_train(config):
             deterministic = bool(config.get("RENDER_DETERMINISTIC", False))
 
         network = ActorCritic(
-            env.action_space(env_params).n, activation=config["ACTIVATION"]
+            env.action_space(env_params).n,
+            activation=config["ACTIVATION"],
+            obs_embed_dim=config["OBS_EMBED_DIM"],
+            obs_vocab_sizes=(
+                config["OBS_TAG_VOCAB_SIZE"],
+                config["OBS_COLOR_VOCAB_SIZE"],
+                config["OBS_STATE_VOCAB_SIZE"],
+            ),
         )
 
         def _rollout(params, rng):
@@ -224,7 +261,14 @@ def make_train(config):
     def train(rng):
         # INIT NETWORK
         network = ActorCritic(
-            env.action_space(env_params).n, activation=config["ACTIVATION"]
+            env.action_space(env_params).n,
+            activation=config["ACTIVATION"],
+            obs_embed_dim=config["OBS_EMBED_DIM"],
+            obs_vocab_sizes=(
+                config["OBS_TAG_VOCAB_SIZE"],
+                config["OBS_COLOR_VOCAB_SIZE"],
+                config["OBS_STATE_VOCAB_SIZE"],
+            ),
         )
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
