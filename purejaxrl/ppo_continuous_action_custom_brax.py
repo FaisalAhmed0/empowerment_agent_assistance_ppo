@@ -13,6 +13,7 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from dataclasses import dataclass, asdict, field
 from flax.training.train_state import TrainState
+from envs.ant_maze import sample_random_goal
 import distrax
 import tyro
 from wrappers import (
@@ -39,10 +40,10 @@ class TrainConfig:
     NUM_MINIBATCHES: int = 32
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.95
-    CLIP_EPS: float = 0.3
+    CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
     VF_COEF: float = 0.5
-    MAX_GRAD_NORM: float = 0.5
+    MAX_GRAD_NORM: float = 1.0
     ACTIVATION: str = "tanh"
     ENV_NAME: str = "ant_u_maze"
     ENV_BACKEND: str | None = None
@@ -61,6 +62,7 @@ class TrainConfig:
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     COMMENT: str = ""
+    ADD_GOAL_REWARD: bool = False
 
 
 def parse_config_from_cli() -> TrainConfig:
@@ -111,6 +113,8 @@ class Transition(NamedTuple):
     action: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
+    task_reward: jnp.ndarray
+    goal_reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
@@ -129,6 +133,7 @@ def make_train(config):
         backend=config.get("ENV_BACKEND"),
         env_kwargs=env_kwargs,
     )
+    add_goal_reward = config.get("ADD_GOAL_REWARD", False)
     if custom_env is not None:
         base_env = custom_env
     else:
@@ -301,18 +306,31 @@ def make_train(config):
         )
 
         # INIT ENV
-        rng, _rng = jax.random.split(rng)
+        rng, goal_rng,  _rng = jax.random.split(rng, 3)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
-
+        # if add_goal_reward:
+        goals = jax.vmap(sample_random_goal)(jax.random.split(goal_rng, config["NUM_ENVS"]))
+            
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, rng = runner_state
+                (
+                    train_state,
+                    env_state,
+                    last_obs,
+                    goals,
+                    task_reward_sum,
+                    task_reward_sq_sum,
+                    goal_reward_sum,
+                    goal_reward_sq_sum,
+                    reward_count,
+                    rng,
+                ) = runner_state
 
                 # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
+                rng, goal_rng,  _rng = jax.random.split(rng, 3)
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
@@ -324,10 +342,32 @@ def make_train(config):
                 obsv, env_state, reward, done, info = env.step(
                     rng_step, env_state, action, env_params
                 )
+                task_reward = reward
+                goal_reward = jnp.zeros_like(task_reward)
+                if add_goal_reward:
+                    goal_reward = (
+                        jnp.linalg.norm(obsv[..., :2] - goals, axis=-1) < 0.5
+                    ).astype(task_reward.dtype)
+                    reward = task_reward + goal_reward
+                    sampled_goals = jax.vmap(sample_random_goal)(
+                        jax.random.split(goal_rng, config["NUM_ENVS"])
+                    )
+                    goals = jnp.where(done[:, None], sampled_goals, goals)
                 transition = Transition(
-                    done, action, value, reward, log_prob, last_obs, info
+                    done, action, value, reward, task_reward, goal_reward, log_prob, last_obs, info
                 )
-                runner_state = (train_state, env_state, obsv, rng)
+                runner_state = (
+                    train_state,
+                    env_state,
+                    obsv,
+                    goals,
+                    task_reward_sum,
+                    task_reward_sq_sum,
+                    goal_reward_sum,
+                    goal_reward_sq_sum,
+                    reward_count,
+                    rng,
+                )
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
@@ -335,7 +375,18 @@ def make_train(config):
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, rng = runner_state
+            (
+                train_state,
+                env_state,
+                last_obs,
+                goals,
+                task_reward_sum,
+                task_reward_sq_sum,
+                goal_reward_sum,
+                goal_reward_sq_sum,
+                reward_count,
+                rng,
+            ) = runner_state
             _, last_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -452,6 +503,35 @@ def make_train(config):
             value_loss = loss_info[1][0].mean()
             actor_loss = loss_info[1][1].mean()
             entropy = loss_info[1][2].mean()
+            task_reward_mean = traj_batch.task_reward.mean()
+            task_reward_std = traj_batch.task_reward.std()
+            goal_reward_mean = traj_batch.goal_reward.mean()
+            goal_reward_std = traj_batch.goal_reward.std()
+            batch_count = jnp.asarray(
+                traj_batch.task_reward.size, dtype=traj_batch.task_reward.dtype
+            )
+            task_reward_sum = task_reward_sum + traj_batch.task_reward.sum()
+            task_reward_sq_sum = task_reward_sq_sum + jnp.square(
+                traj_batch.task_reward
+            ).sum()
+            goal_reward_sum = goal_reward_sum + traj_batch.goal_reward.sum()
+            goal_reward_sq_sum = goal_reward_sq_sum + jnp.square(
+                traj_batch.goal_reward
+            ).sum()
+            reward_count = reward_count + batch_count
+            safe_count = jnp.maximum(reward_count, 1.0)
+            task_reward_running_mean = task_reward_sum / safe_count
+            task_reward_running_var = jnp.maximum(
+                task_reward_sq_sum / safe_count - jnp.square(task_reward_running_mean),
+                0.0,
+            )
+            task_reward_running_std = jnp.sqrt(task_reward_running_var)
+            goal_reward_running_mean = goal_reward_sum / safe_count
+            goal_reward_running_var = jnp.maximum(
+                goal_reward_sq_sum / safe_count - jnp.square(goal_reward_running_mean),
+                0.0,
+            )
+            goal_reward_running_std = jnp.sqrt(goal_reward_running_var)
             current_lr = (
                 linear_schedule(
                     update_idx
@@ -482,7 +562,22 @@ def make_train(config):
             if config.get("WANDB_MODE", "disabled") == "online":
 
                 def wandb_callback(args):
-                    info, total_loss, value_loss, actor_loss, entropy, current_lr = args
+                    (
+                        info,
+                        total_loss,
+                        value_loss,
+                        actor_loss,
+                        entropy,
+                        task_reward_mean,
+                        task_reward_std,
+                        goal_reward_mean,
+                        goal_reward_std,
+                        task_reward_running_mean,
+                        task_reward_running_std,
+                        goal_reward_running_mean,
+                        goal_reward_running_std,
+                        current_lr,
+                    ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
                     return_values = info["returned_episode_returns"][
@@ -499,6 +594,14 @@ def make_train(config):
                             "value_loss": float(value_loss),
                             "actor_loss": float(actor_loss),
                             "entropy": float(entropy),
+                            "task_reward_mean": float(task_reward_mean),
+                            "task_reward_std": float(task_reward_std),
+                            "goal_reward_mean": float(goal_reward_mean),
+                            "goal_reward_std": float(goal_reward_std),
+                            "task_reward_running_mean": float(task_reward_running_mean),
+                            "task_reward_running_std": float(task_reward_running_std),
+                            "goal_reward_running_mean": float(goal_reward_running_mean),
+                            "goal_reward_running_std": float(goal_reward_running_std),
                             "learning_rate": float(current_lr),
                         },
                         step=step,
@@ -506,14 +609,52 @@ def make_train(config):
 
                 jax.debug.callback(
                     wandb_callback,
-                    (metric, total_loss, value_loss, actor_loss, entropy, current_lr),
+                    (
+                        metric,
+                        total_loss,
+                        value_loss,
+                        actor_loss,
+                        entropy,
+                        task_reward_mean,
+                        task_reward_std,
+                        goal_reward_mean,
+                        goal_reward_std,
+                        task_reward_running_mean,
+                        task_reward_running_std,
+                        goal_reward_running_mean,
+                        goal_reward_running_std,
+                        current_lr,
+                    ),
                 )
 
-            runner_state = (train_state, env_state, last_obs, rng)
+            runner_state = (
+                train_state,
+                env_state,
+                last_obs,
+                goals,
+                task_reward_sum,
+                task_reward_sq_sum,
+                goal_reward_sum,
+                goal_reward_sq_sum,
+                reward_count,
+                rng,
+            )
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
+        reward_dtype = obsv.dtype
+        runner_state = (
+            train_state,
+            env_state,
+            obsv,
+            goals,
+            jnp.array(0.0, dtype=reward_dtype),
+            jnp.array(0.0, dtype=reward_dtype),
+            jnp.array(0.0, dtype=reward_dtype),
+            jnp.array(0.0, dtype=reward_dtype),
+            jnp.array(0.0, dtype=reward_dtype),
+            _rng,
+        )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
@@ -542,8 +683,10 @@ def main():
     train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
-    jax.block_until_ready(train_output["runner_state"][3])
-    final_train_state, final_env_state, _, final_rng = train_output["runner_state"]
+    jax.block_until_ready(train_output["runner_state"][9])
+    final_train_state, final_env_state, _, _, _, _, _, _, _, final_rng = train_output[
+        "runner_state"
+    ]
     render_eval_episode(final_train_state.params, final_rng, final_env_state)
 
 

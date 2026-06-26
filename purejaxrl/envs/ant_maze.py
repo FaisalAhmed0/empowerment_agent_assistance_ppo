@@ -216,6 +216,15 @@ HARDEST_MAZE_HARD_GOALS = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 MAZE_HEIGHT = 0.5
 
 
+def all_possible_goals(structure=U_MAZE, size_scaling=4):
+    possible_goals = find_goals(structure, size_scaling)
+    return possible_goals
+
+def sample_random_goal(rng):
+    possible_goals = all_possible_goals()
+    idx = jax.random.randint(rng, (1,), 0, len(possible_goals))
+    return jnp.array(possible_goals[idx])[0]
+
 def sample_goals(structure, rng, size_scaling=4):
     '''Sample goals given a maze structure'''
     possible_goals = find_goals(structure, size_scaling)

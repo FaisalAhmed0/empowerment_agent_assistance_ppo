@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_sparse_reward_more_seeds"
-
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goal_reward"
+ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 ENV_NAMES=("ant_u_maze")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30 57937 843953)
-COMMENT="just_want_to_make_sure_that_this_codebase_works_okay_on_the_ant-u-maze_environment_as_it_will_be_my_starting_for_further_modification_for_my_teacher-student_framework_this_time_with_more_seeds"
+COMMENT="here_we_add_a_goal_reward_to_the_ant-u-maze_environment_to_see_if_this_will_affect_the_stability_of_the_training"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
@@ -39,6 +39,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \
                         --SEED=${SEED} \
+                        ${ADD_GOAL_REWARD} \
                         --NUM_STEPS=${num_steps} \
                         --GAE_LAMBDA=${gae_lambda} \
                         --MAX_GRAD_NORM=${max_grad_norm} \
