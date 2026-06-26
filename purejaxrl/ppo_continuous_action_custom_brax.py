@@ -51,7 +51,7 @@ class TrainConfig:
     ACTION_REPEAT: int = 1
     ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
     ANNEAL_LR: bool = True
-    NORMALIZE_ENV: bool = True
+    NORMALIZE_ENV: bool = False
     DEBUG: bool = True
     SEED: int = 30
     WANDB_MODE: str = "online"
@@ -63,6 +63,8 @@ class TrainConfig:
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = False
+    CONDITION_ON_GOAL: bool = False
+    GOAL_REACH_EPSILON: float = 0.5
 
 
 def parse_config_from_cli() -> TrainConfig:
@@ -134,6 +136,8 @@ def make_train(config):
         env_kwargs=env_kwargs,
     )
     add_goal_reward = config.get("ADD_GOAL_REWARD", False)
+    condition_on_goal = config.get("CONDITION_ON_GOAL", False)
+    goal_reach_epsilon = config.get("GOAL_REACH_EPSILON", 0.5)
     if custom_env is not None:
         base_env = custom_env
     else:
@@ -152,7 +156,7 @@ def make_train(config):
     env = VecEnv(env)
     if config["NORMALIZE_ENV"]:
         env = NormalizeVecObservation(env)
-        env = NormalizeVecReward(env, config["GAMMA"])
+        # env = NormalizeVecReward(env, config["GAMMA"])
 
     def linear_schedule(count):
         frac = (
@@ -288,6 +292,9 @@ def make_train(config):
         # INIT NETWORK
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
+        goal_dim = 2
+        if condition_on_goal:
+            init_x = jnp.concatenate([init_x, jnp.zeros((goal_dim, ))], axis=-1)
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
             tx = optax.chain(
@@ -310,7 +317,16 @@ def make_train(config):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
         # if add_goal_reward:
-        goals = jax.vmap(sample_random_goal)(jax.random.split(goal_rng, config["NUM_ENVS"]))
+        raw_goals = jax.vmap(sample_random_goal)(
+            jax.random.split(goal_rng, config["NUM_ENVS"])
+        ).astype(jnp.float32)
+        goals = raw_goals
+        if condition_on_goal:
+            if config["NORMALIZE_ENV"]:
+                mean_xy = env_state.mean[..., :2]
+                var_xy = env_state.var[..., :2]
+                goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+            obsv = jnp.concatenate([obsv, goals], axis=-1)
             
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
@@ -321,6 +337,7 @@ def make_train(config):
                     env_state,
                     last_obs,
                     goals,
+                    raw_goals,
                     task_reward_sum,
                     task_reward_sq_sum,
                     goal_reward_sum,
@@ -345,14 +362,32 @@ def make_train(config):
                 task_reward = reward
                 goal_reward = jnp.zeros_like(task_reward)
                 if add_goal_reward:
-                    goal_reward = (
-                        jnp.linalg.norm(obsv[..., :2] - goals, axis=-1) < 0.5
-                    ).astype(task_reward.dtype)
+                    if config["NORMALIZE_ENV"]:
+                        dist = jnp.linalg.norm(
+                            env_state.org_obs[..., :2] - raw_goals, axis=-1
+                        )
+                    else:
+                        dist = jnp.linalg.norm(obsv[..., :2] - raw_goals, axis=-1)
+                    # jax.debug.print("dist_mean: {dist}", dist=dist.mean())
+                    goal_reward = (dist <= goal_reach_epsilon).astype(task_reward.dtype)
+                    # jax.debug.print("dist: {dist}", dist=dist)
+                    # jax.debug.print("goals: {goals}", goals=goals)
+                    jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
                     reward = task_reward + goal_reward
-                    sampled_goals = jax.vmap(sample_random_goal)(
-                        jax.random.split(goal_rng, config["NUM_ENVS"])
-                    )
-                    goals = jnp.where(done[:, None], sampled_goals, goals)
+                sampled_raw_goals = jax.vmap(sample_random_goal)(
+                    jax.random.split(goal_rng, config["NUM_ENVS"])
+                )
+                raw_goals = jnp.where(done[:, None], sampled_raw_goals, raw_goals)
+                def normalize_goals(raw_goals, env_state):
+                    if config["NORMALIZE_ENV"]:
+                        mean_xy = env_state.mean[..., :2]
+                        var_xy = env_state.var[..., :2]
+                        return (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+                    else:
+                        return raw_goals
+                goals = normalize_goals(raw_goals, env_state)
+                if condition_on_goal:
+                    obsv = jnp.concatenate([obsv, goals], axis=-1)
                 transition = Transition(
                     done, action, value, reward, task_reward, goal_reward, log_prob, last_obs, info
                 )
@@ -361,6 +396,7 @@ def make_train(config):
                     env_state,
                     obsv,
                     goals,
+                    raw_goals,
                     task_reward_sum,
                     task_reward_sq_sum,
                     goal_reward_sum,
@@ -380,6 +416,7 @@ def make_train(config):
                 env_state,
                 last_obs,
                 goals,
+                raw_goals,
                 task_reward_sum,
                 task_reward_sq_sum,
                 goal_reward_sum,
@@ -632,6 +669,7 @@ def make_train(config):
                 env_state,
                 last_obs,
                 goals,
+                raw_goals,
                 task_reward_sum,
                 task_reward_sq_sum,
                 goal_reward_sum,
@@ -648,6 +686,7 @@ def make_train(config):
             env_state,
             obsv,
             goals,
+            raw_goals,
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
@@ -683,8 +722,8 @@ def main():
     train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
-    jax.block_until_ready(train_output["runner_state"][9])
-    final_train_state, final_env_state, _, _, _, _, _, _, _, final_rng = train_output[
+    jax.block_until_ready(train_output["runner_state"][10])
+    final_train_state, final_env_state, _, _, _, _, _, _, _, _, final_rng = train_output[
         "runner_state"
     ]
     render_eval_episode(final_train_state.params, final_rng, final_env_state)

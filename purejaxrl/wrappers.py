@@ -239,6 +239,7 @@ class NormalizeVecObsEnvState:
     var: jnp.ndarray
     count: float
     env_state: environment.EnvState
+    org_obs: jnp.ndarray
 
 
 class NormalizeVecObservation(GymnaxWrapper):
@@ -252,6 +253,7 @@ class NormalizeVecObservation(GymnaxWrapper):
             var=jnp.ones_like(obs),
             count=1e-4,
             env_state=state,
+            org_obs=obs,
         )
         batch_mean = jnp.mean(obs, axis=0)
         batch_var = jnp.var(obs, axis=0)
@@ -272,6 +274,7 @@ class NormalizeVecObservation(GymnaxWrapper):
             var=new_var,
             count=new_count,
             env_state=state.env_state,
+            org_obs=obs,
         )
 
         return (obs - state.mean) / jnp.sqrt(state.var + 1e-8), state
@@ -300,6 +303,7 @@ class NormalizeVecObservation(GymnaxWrapper):
             var=new_var,
             count=new_count,
             env_state=env_state,
+            org_obs=obs,
         )
         return (
             (obs - state.mean) / jnp.sqrt(state.var + 1e-8),

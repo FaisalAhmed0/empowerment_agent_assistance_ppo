@@ -6,18 +6,19 @@ ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 ENV_NAMES=("ant_u_maze")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
-SEEDS=(30 57937 843953)
+SEEDS=(30)
 COMMENT="here_we_add_a_goal_reward_to_the_ant-u-maze_environment_to_see_if_this_will_affect_the_stability_of_the_training"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(2048)
 NUM_STEPS_=(10)
-STUDENT_ENTROPY_COFFS=(0)
-GAE_LAMBDA=(0.9 0.95)
-CLIP_EPS=(0.2)
-MAX_GRAD_NORM=(1.0)
-UPDATE_EPOCHSS=(4)
+STUDENT_ENTROPY_COFFS=(0 0.1 0.01 0.001)
+GAE_LAMBDA=(0.8 0.9 0.95)
+CLIP_EPS=(0.2 0.3)
+MAX_GRAD_NORM=(0.5 1.0)
+UPDATE_EPOCHSS=(4 10)
+NORMALIZE_ENVS=(--no-NORMALIZE_ENV --NORMALIZE_ENV)
 
 
 run_count=0
@@ -33,6 +34,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for clip_eps in "${CLIP_EPS[@]}"; do
                         for max_grad_norm in "${MAX_GRAD_NORM[@]}"; do
                         for update_epochs in "${UPDATE_EPOCHSS[@]}"; do
+                        for normalize_env in "${NORMALIZE_ENVS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -46,6 +48,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --UPDATE_EPOCHS=${update_epochs} \
                         --COMMENT=${COMMENT} \
                         --NUM_ENVS=${num_envs} \
+                        ${normalize_env} \
                         --CLIP_EPS=${clip_eps} \
                         --PROJECT=\"${WANDB_PROJECT_NAME}\" \
                         --ENT_COEF=${student_entropy_coef}"
@@ -57,6 +60,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
           done
+        done
         done
         done
         done
