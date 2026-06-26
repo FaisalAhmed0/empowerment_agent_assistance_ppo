@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_sparse_reward_more_seeds_2"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_gpu_comparison"
 
 ENV_NAMES=("ant_u_maze")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30)
-COMMENT="just_want_to_make_sure_that_this_codebase_works_okay_on_the_ant-u-maze_environment_as_it_will_be_my_starting_for_further_modification_for_my_teacher-student_framework_this_time_with_more_seeds"
+COMMENT="I_want_to_compare_the_resutls_from_different_gpus_under_the_same_seed_and_hyperparameters"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
@@ -15,8 +15,8 @@ NUM_ENVSS=(2048)
 NUM_STEPS_=(10)
 STUDENT_ENTROPY_COFFS=(0 0.1 0.01 0.001)
 GAE_LAMBDA=(0.8 0.9 0.95)
-CLIP_EPS=(0.2 0.3)
-MAX_GRAD_NORM=(0.5 1.0)
+CLIP_EPS=(0.2)
+MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4 10)
 HIDDEN_DIMS=(64 128)
 NORMALIZE_ENVS=(--no-NORMALIZE_ENV --NORMALIZE_ENV)

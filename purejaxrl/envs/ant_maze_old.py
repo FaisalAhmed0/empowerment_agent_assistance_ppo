@@ -212,6 +212,7 @@ HARDEST_MAZE_HARD_GOALS = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                 [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]
 
 
+
 MAZE_HEIGHT = 0.5
 
 
@@ -223,6 +224,15 @@ def sample_random_goal(rng):
     possible_goals = all_possible_goals()
     idx = jax.random.randint(rng, (1,), 0, len(possible_goals))
     return jnp.array(possible_goals[idx])[0]
+
+def sample_goals(structure, rng, size_scaling=4):
+    '''Sample goals given a maze structure'''
+    possible_goals = find_goals(structure, size_scaling)
+    idx = jax.random.randint(rng, (1,), 0, len(possible_goals))
+    print(possible_goals[idx])
+    jax.debug.print("possible_goals: {possible_goals}", possible_goals=possible_goals)
+    return jnp.array(possible_goals[idx])[0]
+    
 
 
 def find_starts(structure, size_scaling):
@@ -241,22 +251,57 @@ def find_goals(structure, size_scaling):
         for j in range(len(structure[0])):
             if structure[i][j] == GOAL:
                 goals.append([i * size_scaling, j * size_scaling])
-
     return jnp.array(goals)
+
+def find_walls(structure, size_scaling):
+    walls = []
+    for i in range(len(structure)):
+        for j in range(len(structure[0])):
+            if structure[i][j] == 1:
+                walls.append([i * size_scaling, j * size_scaling])
+    return jnp.array(walls)
+
+def find_floor(structure, size_scaling):
+    floor = []
+    for i in range(len(structure)):
+        for j in range(len(structure[0])):
+            if structure[i][j] == 0:
+                floor.append([i * size_scaling, j * size_scaling])
+    return jnp.array(floor)
 
 
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling):
     if maze_layout_name == "u_maze":
         maze_layout = U_MAZE
+    elif maze_layout_name == "u_maze_1":
+        maze_layout = U_MAZE_1
+    elif maze_layout_name == "u_maze_2":
+        maze_layout = U_MAZE_2
+    elif maze_layout_name == "u_maze_3":
+        maze_layout = U_MAZE_3
+    elif maze_layout_name == "u_maze_4":
+        maze_layout = U_MAZE_4
+    elif maze_layout_name == "u_maze_skill_eval":
+        maze_layout = U_MAZE_SKILL_EVAL
+    elif maze_layout_name == "u_maze_single_goal":
+        maze_layout = U_MAZE_SINGLE_GOAL
     elif maze_layout_name == "u_maze_eval":
         maze_layout = U_MAZE_EVAL
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
+    elif maze_layout_name == "big_maze_single_goal":
+        maze_layout = BIG_MAZE_SINGLE_GOAL
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
         maze_layout = HARDEST_MAZE
+    elif maze_layout_name == "hardest_maze_50_percent":
+        maze_layout = HARDEST_MAZE_50_PERCENT
+    elif maze_layout_name == "hardest_maze_single_goal":
+        maze_layout = HARDEST_MAZE_SINGLE_GOAL
+    elif maze_layout_name == "hardest_maze_hard_goals":
+        maze_layout = HARDEST_MAZE_HARD_GOALS
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
@@ -264,6 +309,34 @@ def make_maze(maze_layout_name, maze_size_scaling):
 
     possible_starts = find_starts(maze_layout, maze_size_scaling)
     possible_goals = find_goals(maze_layout, maze_size_scaling)
+    walls = find_walls(maze_layout, maze_size_scaling)
+    floor = find_floor(maze_layout, maze_size_scaling)
+
+    # #TODO: reward to preven the assistant from generating goals inside the walls, this might help with groudning, test this reward function in a simple maze
+    # def is_non_wall_location(goal, walls, tol=1e-6):
+    #     """
+    #     Checks if a goal (x, y) is not inside any wall (returns True if not a wall).
+    #     Args:
+    #         goal: jnp.ndarray with shape (2,) or list/tuple (x, y)
+    #         walls: jnp.ndarray of shape (num_walls, 2)
+    #         tol: float, tolerance for numerical precision
+
+    #     Returns:
+    #         bool: True if not inside a wall, False otherwise
+    #     """
+    #     # For each wall, check if goal matches within tolerance any wall position
+    #     # `walls` may be empty
+    #     if walls.shape[0] == 0:
+    #         return True
+    #     # Compute pairwise distance to all walls, return True if all dists > tol
+    #     dists = jnp.linalg.norm(walls - jnp.asarray(goal), axis=1)
+    #     import pdb;pdb.set_trace()
+    #     return jnp.all(dists < tol)
+    
+    # import pdb;pdb.set_trace()
+    # all_valid_location = jnp.concatenate([possible_starts, possible_goals, floor], axis=0)
+
+
 
     tree = ET.parse(xml_path)
     worldbody = tree.find(".//worldbody")
@@ -317,13 +390,47 @@ class AntMaze(PipelineEnv):
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
         dense_reward: bool = False,
+        skill_mazes: bool = False,
+        skill_mazes_eval: bool = True,
         **kwargs,
     ):
-        xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
-
+        self.skill_mazes = skill_mazes
+        self.skill_mazes_eval = skill_mazes_eval
+        if self.skill_mazes:
+            xml_string, possible_starts, _ = make_maze(maze_layout_name, maze_size_scaling)
+            _, _, self.possible_goals_1 = make_maze("u_maze_1", maze_size_scaling)
+            _, _, self.possible_goals_2 = make_maze("u_maze_2", maze_size_scaling)
+            _, _, self.possible_goals_3 = make_maze("u_maze_3", maze_size_scaling)
+            _, _, self.possible_goals_4 = make_maze("u_maze_4", maze_size_scaling)
+            self.goals_skills = [self.possible_goals_1, self.possible_goals_2, self.possible_goals_3, self.possible_goals_4]
+        elif self.skill_mazes_eval:
+            xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
+            self.goals_skills = [possible_goals]
+        else:
+            xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
+            self.goals_skills = [possible_goals]
+        # import pdb;pdb.set_trace()
+        # print(possible_goals)
+        self.maze_layout_name = maze_layout_name
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
-        self.possible_goals = possible_goals
+        self.possible_goals = self.possible_goals_1 if self.skill_mazes else possible_goals
+        if self.skill_mazes:
+            pass
+        else:
+            self.maze_layout_name = maze_layout_name
+            if "single_goal" in self.maze_layout_name:
+                self.hard_goal = jnp.array([12, 4])
+            if "u_maze" in self.maze_layout_name:
+                self.max_x = 15
+                self.min_x = 2.5
+            if "big_maze" in self.maze_layout_name:
+                self.max_x = 24
+                self.min_x = 2.5
+            if "hardest_maze" in self.maze_layout_name:
+                self.max_x = 45
+                self.min_x = 2.5
+
 
         n_frames = 5
 
@@ -359,7 +466,7 @@ class AntMaze(PipelineEnv):
         self._reset_noise_scale = reset_noise_scale
         self._exclude_current_positions_from_observation = exclude_current_positions_from_observation
         self.dense_reward = dense_reward
-        self.state_dim = 29
+        self.state_dim = 29 + 4 if (self.skill_mazes or self.skill_mazes_eval) else 29
         self.goal_indices = jnp.array([0, 1])
         self.goal_reach_thresh = 0.5
 
@@ -367,25 +474,51 @@ class AntMaze(PipelineEnv):
             raise NotImplementedError("use_contact_forces not implemented.")
 
     def reset(self, rng: jax.Array) -> State:
-        """Resets the environment to an initial state."""
+        """Resets the environment to an initial state with a randomly sampled skill."""
+        skill_idx = jnp.int32(0)
+        if self.skill_mazes:
+            rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+            skill_idx = jax.random.randint(rng4, (1,), 0, 4)[0]
+        else:
+            rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
+        return self._reset_impl(rng, rng1, rng2, rng3, skill_idx)
 
-        rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
+    def reset_with_skill(self, rng: jax.Array, skill_idx: jax.Array) -> State:
+        """Reset with a specific skill index (JIT-compatible).
 
+        Unlike ``reset``, the skill is not sampled randomly but taken from
+        ``skill_idx`` which can be a traced JAX value.  The RNG split pattern
+        is kept identical to ``reset`` so downstream randomness is unchanged.
+        """
+        skill_idx = jnp.int32(skill_idx)
+        if self.skill_mazes or self.skill_mazes_eval:
+            rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+        else:
+            rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
+        return self._reset_impl(rng, rng1, rng2, rng3, skill_idx)
+
+    def _reset_impl(self, rng, rng1, rng2, rng3, skill_idx) -> State:
+        """Shared reset body used by both ``reset`` and ``reset_with_skill``."""
         low, hi = -self._reset_noise_scale, self._reset_noise_scale
         q = self.sys.init_q + jax.random.uniform(rng, (self.sys.q_size(),), minval=low, maxval=hi)
         qd = hi * jax.random.normal(rng1, (self.sys.qd_size(),))
 
-        # set the start and target q, qd
         start = self._random_start(rng2)
         q = q.at[:2].set(start)
 
-        target = self._random_target(rng3)
+        if self.skill_mazes or self.skill_mazes_eval:
+            target = self._random_target_for_skill(rng3, skill_idx)
+        else:
+            target = self._random_target(rng3, skill_idx)
         q = q.at[-2:].set(target)
 
         qd = qd.at[-2:].set(0)
 
         pipeline_state = self.pipeline_init(q, qd)
-        obs = self._get_obs(pipeline_state)
+        obs = self._get_obs(pipeline_state, skill_idx)
+
+        if "single_goal" in self.maze_layout_name:
+            self.hard_goal = jnp.array([12, 4])
 
         reward, done, zero = jnp.zeros(3)
         metrics = {
@@ -402,6 +535,8 @@ class AntMaze(PipelineEnv):
             "dist": zero,
             "success": zero,
             "success_easy": zero,
+            "current_step": zero,
+            "skill_idx": jnp.float32(skill_idx),
         }
         state = State(pipeline_state, obs, reward, done, metrics)
         return state
@@ -424,9 +559,10 @@ class AntMaze(PipelineEnv):
         ctrl_cost = self._ctrl_cost_weight * jnp.sum(jnp.square(action))
         contact_cost = 0.0
 
-        old_obs = self._get_obs(pipeline_state0)
+        skill_idx = state.metrics["skill_idx"].astype(jnp.int32)
+        old_obs = self._get_obs(pipeline_state0, skill_idx)
         old_dist = jnp.linalg.norm(old_obs[:2] - old_obs[-2:])
-        obs = self._get_obs(pipeline_state)
+        obs = self._get_obs(pipeline_state, skill_idx)
         dist = jnp.linalg.norm(obs[:2] - obs[-2:])
         vel_to_target = (old_dist - dist) / self.dt
         success = jnp.array(dist < self.goal_reach_thresh, dtype=float)
@@ -453,10 +589,11 @@ class AntMaze(PipelineEnv):
             dist=dist,
             success=success,
             success_easy=success_easy,
+            current_step=state.metrics["current_step"]+1,
         )
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done)
 
-    def _get_obs(self, pipeline_state: base.State) -> jax.Array:
+    def _get_obs(self, pipeline_state: base.State, skill_index) -> jax.Array:
         """Observe ant body position and velocities."""
         qpos = pipeline_state.q[:-2]
         qvel = pipeline_state.qd[:-2]
@@ -466,12 +603,32 @@ class AntMaze(PipelineEnv):
         if self._exclude_current_positions_from_observation:
             qpos = qpos[2:]
 
-        return jnp.concatenate([qpos] + [qvel] + [target_pos])
+        if self.skill_mazes or self.skill_mazes_eval:
+            skill_index_onehot = jax.nn.one_hot(jnp.int32(skill_index), 4)
+            return jnp.concatenate([qpos] + [qvel] + [skill_index_onehot] + [target_pos] )
+        else:
+            return jnp.concatenate([qpos] + [qvel] + [target_pos])
+        # return jnp.concatenate([qpos] + [qvel] + [target_pos])
 
-    def _random_target(self, rng: jax.Array) -> jax.Array:
+    def _random_target(self, rng: jax.Array, skill_idx) -> jax.Array:
         """Returns a random target location chosen from possibilities specified in the maze layout."""
         idx = jax.random.randint(rng, (1,), 0, len(self.possible_goals))
         return jnp.array(self.possible_goals[idx])[0]
+
+    def _random_target_for_skill(self, rng: jax.Array, skill_idx) -> jax.Array:
+        """Returns a random target from the goal set corresponding to skill_idx (JIT-safe)."""
+        branches = []
+        for goals in self.goals_skills:
+            goals_array = jnp.array(goals)
+            def branch_fn(rng, g=goals_array):
+                idx = jax.random.randint(rng, (1,), 0, g.shape[0])
+                return g[idx[0]]
+            branches.append(branch_fn)
+        skills_target = jax.lax.switch(jnp.int32(skill_idx), branches, rng)
+        # jax.debug.print("skill_idx: {x}", x=skill_idx)
+        # jax.debug.print("skills_target: {x}", x=skills_target)
+        return skills_target
+        
 
     def _random_start(self, rng: jax.Array) -> jax.Array:
         """Returns a random start location chosen from possibilities specified in the maze layout."""

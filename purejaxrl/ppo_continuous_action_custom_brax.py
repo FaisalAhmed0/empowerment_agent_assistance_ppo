@@ -43,6 +43,7 @@ class TrainConfig:
     CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
     VF_COEF: float = 0.5
+    HIDDEN_DIM: int = 64
     MAX_GRAD_NORM: float = 1.0
     ACTIVATION: str = "tanh"
     ENV_NAME: str = "ant_u_maze"
@@ -65,6 +66,7 @@ class TrainConfig:
     ADD_GOAL_REWARD: bool = False
     CONDITION_ON_GOAL: bool = False
     GOAL_REACH_EPSILON: float = 0.5
+    HIDDEN_DIM: int = 64
 
 
 def parse_config_from_cli() -> TrainConfig:
@@ -74,6 +76,7 @@ def parse_config_from_cli() -> TrainConfig:
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
+    hidden_dim: int = 64
 
     @nn.compact
     def __call__(self, x):
@@ -82,11 +85,11 @@ class ActorCritic(nn.Module):
         else:
             activation = nn.tanh
         actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
@@ -96,11 +99,11 @@ class ActorCritic(nn.Module):
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
         critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
         critic = activation(critic)
         critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic)
         critic = activation(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
@@ -167,7 +170,7 @@ def make_train(config):
         return config["LR"] * frac
 
     network = ActorCritic(
-        env.action_space(env_params).shape[0], activation=config["ACTIVATION"]
+        env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
     )
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
@@ -708,6 +711,8 @@ def make_train(config):
 def main():
     config_obj = parse_config_from_cli()
     config = asdict(config_obj)
+    gpu_names = sorted({d.device_kind for d in jax.devices("gpu")})
+    config["GPU_NAME"] = gpu_names[0]
 
     wandb.init(
         entity=config["ENTITY"],

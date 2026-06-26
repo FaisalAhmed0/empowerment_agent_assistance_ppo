@@ -42,10 +42,10 @@ from envs.ant_maze import (
     U_MAZE_EVAL,
     U_MAZE_SINGLE_GOAL,
     U_MAZE_SKILL_EVAL,
-    find_floor,
+    # find_floor,
     find_goals,
     find_starts,
-    find_walls,
+    # find_walls,
 )
 from envs.multi_ant_mjcf import build_multi_ant_maze_root, world_agent_conaffinity_mask
 
@@ -90,8 +90,8 @@ def make_multi_ant_maze_xml(maze_layout_name: str, maze_size_scaling: float, n_a
 
     possible_starts = find_starts(maze_layout, maze_size_scaling)
     possible_goals = find_goals(maze_layout, maze_size_scaling)
-    _walls = find_walls(maze_layout, maze_size_scaling)
-    _floor = find_floor(maze_layout, maze_size_scaling)
+    # _walls = find_walls(maze_layout, maze_size_scaling)
+    # _floor = find_floor(maze_layout, maze_size_scaling)
 
     base_root = build_multi_ant_maze_root(n_agents)
     wall_agent_conaff = world_agent_conaffinity_mask(n_agents)

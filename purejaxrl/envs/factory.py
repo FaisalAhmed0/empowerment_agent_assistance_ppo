@@ -107,7 +107,6 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
                 env = AntMaze(
                     backend=backend or "spring",
                     maze_layout_name=env_name[4:],
-                    skill_mazes=kwargs.get("skill_mazes", False),
                 )
         elif "humanoid" in env_name:
             # Possible env_name = {'humanoid_u_maze', 'humanoid_big_maze', 'humanoid_hardest_maze'}
