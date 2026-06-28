@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 import optax
+import wandb
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
@@ -279,6 +280,22 @@ def make_train(config):
 
                 jax.debug.callback(callback, metric)
 
+            if config.get("WANDB_MODE", "disabled") != "disabled":
+
+                def wandb_callback(args):
+                    info = args
+                    step = int(info["timestep"].max() * config["NUM_ENVS"])
+                    return_values = info["returned_episode_returns"][
+                        info["returned_episode"]
+                    ]
+                    if len(return_values) > 0:
+                        wandb.log(
+                            {"episodic_return": float(return_values.mean())},
+                            step=step,
+                        )
+
+                jax.debug.callback(wandb_callback, metric)
+
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
 
@@ -312,7 +329,21 @@ if __name__ == "__main__":
         "NORMALIZE_ENV": True,
         "DEBUG": True,
         "HIDDEN_DIM": 64,
+        "WANDB_MODE": "online",
+        "ENTITY": "",
+        "PROJECT": "purejaxrl",
     }
+    gpu_names = sorted({d.device_kind for d in jax.devices("gpu")})
+    config["GPU_NAME"] = gpu_names[0]
+    wandb.init(
+        entity=config["ENTITY"],
+        project=config["PROJECT"],
+        tags=["PPO", "BRAX", config["ENV_NAME"], f"jax_{jax.__version__}"],
+        name=f'purejaxrl_ppo_brax_{config["ENV_NAME"]}',
+        config=config,
+        mode=config["WANDB_MODE"],
+    )
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
+    wandb.finish()

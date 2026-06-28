@@ -13,6 +13,7 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from dataclasses import dataclass, asdict, field
 from flax.training.train_state import TrainState
+from copy import deepcopy
 from envs.ant_maze import sample_random_goal
 import distrax
 import tyro
@@ -71,6 +72,9 @@ class TrainConfig:
 
 def parse_config_from_cli() -> TrainConfig:
     return tyro.cli(TrainConfig)
+
+
+
 
 
 class ActorCritic(nn.Module):
@@ -138,13 +142,23 @@ def make_train(config):
         backend=config.get("ENV_BACKEND"),
         env_kwargs=env_kwargs,
     )
+    custom_env_2 = make_custom_env(
+        env_name=config["ENV_NAME"],
+        backend=config.get("ENV_BACKEND"),
+        env_kwargs=env_kwargs,
+    )
     add_goal_reward = config.get("ADD_GOAL_REWARD", False)
     condition_on_goal = config.get("CONDITION_ON_GOAL", False)
     goal_reach_epsilon = config.get("GOAL_REACH_EPSILON", 0.5)
     if custom_env is not None:
         base_env = custom_env
+        base_env_2 = custom_env_2
     else:
         base_env = brax_envs.get_environment(
+            env_name=config["ENV_NAME"],
+            backend=config.get("ENV_BACKEND", "positional"),
+        )
+        base_env_2 = brax_envs.get_environment(
             env_name=config["ENV_NAME"],
             backend=config.get("ENV_BACKEND", "positional"),
         )
@@ -153,13 +167,21 @@ def make_train(config):
         episode_length=config.get("EPISODE_LENGTH", 1000),
         action_repeat=config.get("ACTION_REPEAT", 1),
     )
+    env_2 = BraxGymnaxWrapper(
+        env=base_env_2,
+        episode_length=config.get("EPISODE_LENGTH", 1000),
+        action_repeat=config.get("ACTION_REPEAT", 1),
+    )
     env_params = None
     env = LogWrapper(env)
     env = ClipAction(env)
     env = VecEnv(env)
+    env_2 = LogWrapper(env_2)
+    env_2 = ClipAction(env_2)
+    env_2 = VecEnv(env_2)
     if config["NORMALIZE_ENV"]:
         env = NormalizeVecObservation(env)
-        # env = NormalizeVecReward(env, config["GAMMA"])
+        env_2 = NormalizeVecObservation(env_2)
 
     def linear_schedule(count):
         frac = (
@@ -314,11 +336,49 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
+        rng, goal_rng,  _rng = jax.random.split(rng, 3)
+
+        if config["NORMALIZE_ENV"]:
+            # import pdb; pdb.set_trace()
+            # env = NormalizeVecReward(env, config["GAMMA"])
+            ### run random actions to have a starting estimate of the observation normalization stats
+            def run_policy(network_params, rng):
+                rng, _rng = jax.random.split(rng)
+                reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+                obsv, env_state = env.reset(reset_rng, env_params)
+                def step_fn(carry, _):
+                    obsv, env_state, rng = carry
+                    rng, rng_sample, rng_step = jax.random.split(rng, 3)
+                    pi, _ = network.apply(network_params, obsv)
+                    action = pi.sample(seed=rng_sample)
+                    rng_step = jax.random.split(rng_step, config["NUM_ENVS"])
+                    obsv, env_state, reward, done, info  = env.step(rng_step, env_state, action, env_params)
+                    return (obsv, env_state, rng), None
+                _, pipeline_states = jax.lax.scan(
+                    step_fn, (obsv, env_state, rng), None, length=1000
+                )
+                return env_state
+            warmup_env_state = run_policy(network_params, rng)
+            obs_mean = warmup_env_state.mean
+            obs_var = warmup_env_state.var
+            jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
+            jax.debug.print("obs_var: {obs_var}", obs_var=obs_var[0])
 
         # INIT ENV
-        rng, goal_rng,  _rng = jax.random.split(rng, 3)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = env.reset(reset_rng, env_params)
+        if config["NORMALIZE_ENV"]:
+            obsv, env_state = env.reset_with_stats(
+                reset_rng, warmup_env_state, env_params
+            )
+            jax.debug.print(
+                "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
+            )
+            jax.debug.print(
+                "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
+            )
+        else:
+            obsv, env_state = env.reset(reset_rng, env_params)
+        
         # if add_goal_reward:
         raw_goals = jax.vmap(sample_random_goal)(
             jax.random.split(goal_rng, config["NUM_ENVS"])
@@ -581,6 +641,12 @@ def make_train(config):
                 if config["ANNEAL_LR"]
                 else config["LR"]
             )
+            if config["NORMALIZE_ENV"]:
+                obs_norm_mean = env_state.mean.mean()
+                obs_norm_var = env_state.var.mean()
+            else:
+                obs_norm_mean = jnp.array(0.0, dtype=task_reward_mean.dtype)
+                obs_norm_var = jnp.array(0.0, dtype=task_reward_mean.dtype)
 
 
             if config.get("DEBUG"):
@@ -617,6 +683,8 @@ def make_train(config):
                         goal_reward_running_mean,
                         goal_reward_running_std,
                         current_lr,
+                        obs_norm_mean,
+                        obs_norm_var,
                     ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
@@ -643,6 +711,8 @@ def make_train(config):
                             "goal_reward_running_mean": float(goal_reward_running_mean),
                             "goal_reward_running_std": float(goal_reward_running_std),
                             "learning_rate": float(current_lr),
+                            "obs_norm_mean": float(obs_norm_mean),
+                            "obs_norm_var": float(obs_norm_var),
                         },
                         step=step,
                     )
@@ -664,6 +734,8 @@ def make_train(config):
                         goal_reward_running_mean,
                         goal_reward_running_std,
                         current_lr,
+                        obs_norm_mean,
+                        obs_norm_var,
                     ),
                 )
 

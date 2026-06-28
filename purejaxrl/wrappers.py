@@ -246,57 +246,67 @@ class NormalizeVecObservation(GymnaxWrapper):
     def __init__(self, env):
         super().__init__(env)
 
-    def reset(self, key, params=None):
-        obs, state = self._env.reset(key, params)
-        state = NormalizeVecObsEnvState(
-            mean=jnp.zeros_like(obs),
-            var=jnp.ones_like(obs),
-            count=1e-4,
-            env_state=state,
-            org_obs=obs,
-        )
+    def _update_obs_stats(self, mean, var, count, obs):
         batch_mean = jnp.mean(obs, axis=0)
         batch_var = jnp.var(obs, axis=0)
         batch_count = obs.shape[0]
 
-        delta = batch_mean - state.mean
-        tot_count = state.count + batch_count
+        delta = batch_mean - mean
+        tot_count = count + batch_count
 
-        new_mean = state.mean + delta * batch_count / tot_count
-        m_a = state.var * state.count
+        new_mean = mean + delta * batch_count / tot_count
+        m_a = var * count
         m_b = batch_var * batch_count
-        M2 = m_a + m_b + jnp.square(delta) * state.count * batch_count / tot_count
+        M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
         new_var = M2 / tot_count
-        new_count = tot_count
+        return new_mean, new_var, tot_count
 
+    def reset(self, key, params=None):
+        obs, state = self._env.reset(key, params)
+        init_mean = jnp.zeros_like(obs)
+        init_var = jnp.ones_like(obs)
+        init_count = 1e-4
+        new_mean, new_var, new_count = self._update_obs_stats(
+            init_mean, init_var, init_count, obs
+        )
         state = NormalizeVecObsEnvState(
             mean=new_mean,
             var=new_var,
             count=new_count,
-            env_state=state.env_state,
+            env_state=state,
             org_obs=obs,
         )
+        return (obs - state.mean) / jnp.sqrt(state.var + 1e-8), state
 
+    def reset_with_stats(self, key, stats_state, params=None):
+        obs, env_state = self._env.reset(key, params)
+        if stats_state is None:
+            base_mean = jnp.zeros_like(obs)
+            base_var = jnp.ones_like(obs)
+            base_count = 1e-4
+        else:
+            base_mean = stats_state.mean
+            base_var = stats_state.var
+            base_count = stats_state.count
+        new_mean, new_var, new_count = self._update_obs_stats(
+            base_mean, base_var, base_count, obs
+        )
+        state = NormalizeVecObsEnvState(
+            mean=new_mean,
+            var=new_var,
+            count=new_count,
+            env_state=env_state,
+            org_obs=obs,
+        )
         return (obs - state.mean) / jnp.sqrt(state.var + 1e-8), state
 
     def step(self, key, state, action, params=None):
         obs, env_state, reward, done, info = self._env.step(
             key, state.env_state, action, params
         )
-
-        batch_mean = jnp.mean(obs, axis=0)
-        batch_var = jnp.var(obs, axis=0)
-        batch_count = obs.shape[0]
-
-        delta = batch_mean - state.mean
-        tot_count = state.count + batch_count
-
-        new_mean = state.mean + delta * batch_count / tot_count
-        m_a = state.var * state.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + jnp.square(delta) * state.count * batch_count / tot_count
-        new_var = M2 / tot_count
-        new_count = tot_count
+        new_mean, new_var, new_count = self._update_obs_stats(
+            state.mean, state.var, state.count, obs
+        )
 
         state = NormalizeVecObsEnvState(
             mean=new_mean,
