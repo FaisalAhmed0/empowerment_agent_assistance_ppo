@@ -40,7 +40,7 @@ class TrainConfig:
     UPDATE_EPOCHS: int = 4
     NUM_MINIBATCHES: int = 32
     GAMMA: float = 0.99
-    GAE_LAMBDA: float = 0.95
+    GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
     VF_COEF: float = 0.5
@@ -67,7 +67,7 @@ class TrainConfig:
     ADD_GOAL_REWARD: bool = False
     CONDITION_ON_GOAL: bool = False
     GOAL_REACH_EPSILON: float = 0.5
-    HIDDEN_DIM: int = 64
+    HIDDEN_DIM: int = 128
 
 
 def parse_config_from_cli() -> TrainConfig:

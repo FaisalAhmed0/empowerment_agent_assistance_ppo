@@ -3,7 +3,7 @@
 # Define common parameters (fixed values)
 WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goal_reward"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
-ENV_NAMES=("ant_u_maze")
+ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30)

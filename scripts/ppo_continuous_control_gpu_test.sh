@@ -1,23 +1,24 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_gpu_comparison_more_seeds"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_gpu_comparison_more_seeds_num_of_minibatches"
 
 ENV_NAMES=("ant_u_maze")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30 75937 123)
-COMMENT="I_want_to_compare_the_resutls_from_different_gpus_under_the_same_seed_and_hyperparameters"
+COMMENT="I_want_to_compare_the_resutls_from_different_gpus_under_the_same_seed_and_hyperparameters_this_time_I_am_foucsing_on_num_of_minibatches"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(2048)
 NUM_STEPS_=(10)
-STUDENT_ENTROPY_COFFS=(0 0.001 0.0001)
-GAE_LAMBDA=(0.8 0.9)
+STUDENT_ENTROPY_COFFS=(0)
+GAE_LAMBDA=(0.8)
+NUM_MINIBATCHES=(4 8 16)
 CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)
-UPDATE_EPOCHSS=(4 10)
+UPDATE_EPOCHSS=(4)
 HIDDEN_DIMS=(64 128 256)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 
@@ -37,6 +38,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for update_epochs in "${UPDATE_EPOCHSS[@]}"; do
                         for normalize_env in "${NORMALIZE_ENVS[@]}"; do
                         for hidden_dim in "${HIDDEN_DIMS[@]}"; do
+                        for num_minibatches in "${NUM_MINIBATCHES[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}_hidden_dim${hidden_dim}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -45,6 +47,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --SEED=${SEED} \
                         --NUM_STEPS=${num_steps} \
                         --HIDDEN_DIM=${hidden_dim} \
+                        --NUM_MINIBATCHES=${num_minibatches} \
                         --GAE_LAMBDA=${gae_lambda} \
                         --MAX_GRAD_NORM=${max_grad_norm} \
                         --UPDATE_EPOCHS=${update_epochs} \
@@ -62,6 +65,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
           done
+        done
         done
         done
         done
