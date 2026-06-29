@@ -346,6 +346,8 @@ def make_train(config):
                 rng, _rng = jax.random.split(rng)
                 reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
                 obsv, env_state = env.reset(reset_rng, env_params)
+                if condition_on_goal:
+                    obsv = jnp.concatenate([obsv, jnp.zeros((config["NUM_ENVS"], goal_dim))], axis=-1)
                 def step_fn(carry, _):
                     obsv, env_state, rng = carry
                     rng, rng_sample, rng_step = jax.random.split(rng, 3)
@@ -353,6 +355,8 @@ def make_train(config):
                     action = pi.sample(seed=rng_sample)
                     rng_step = jax.random.split(rng_step, config["NUM_ENVS"])
                     obsv, env_state, reward, done, info  = env.step(rng_step, env_state, action, env_params)
+                    if condition_on_goal:
+                        obsv = jnp.concatenate([obsv, jnp.zeros((config["NUM_ENVS"], goal_dim))], axis=-1)
                     return (obsv, env_state, rng), None
                 _, pipeline_states = jax.lax.scan(
                     step_fn, (obsv, env_state, rng), None, length=1000
