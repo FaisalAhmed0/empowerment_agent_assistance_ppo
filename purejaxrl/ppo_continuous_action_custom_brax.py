@@ -435,7 +435,7 @@ def make_train(config):
                     goal_reward = (dist <= goal_reach_epsilon).astype(task_reward.dtype)
                     # jax.debug.print("dist: {dist}", dist=dist)
                     # jax.debug.print("goals: {goals}", goals=goals)
-                    jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
+                    # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
                     reward = task_reward + goal_reward
                 sampled_raw_goals = jax.vmap(sample_random_goal)(
                     jax.random.split(goal_rng, config["NUM_ENVS"])
