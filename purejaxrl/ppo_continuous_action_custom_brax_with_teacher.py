@@ -1,5 +1,6 @@
 import os
 import traceback
+import time
 os.environ["MUJOCO_GL"] = "osmesa"
 import jax
 import jax.numpy as jnp
@@ -15,6 +16,7 @@ from dataclasses import dataclass, asdict, field
 from flax.training.train_state import TrainState
 from copy import deepcopy
 import distrax
+from envs.ant_maze import all_possible_goals
 import tyro
 from wrappers import (
     LogWrapper,
@@ -79,6 +81,146 @@ class TrainConfig:
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
+    GOAL_REWARD_COEF: float = 1.0
+    NUM_EVAL_ENVS: int = 32
+    CONDITION_TEACHER_ON_COMPETENCE: bool = True
+
+
+def _inner_brax_state(state):
+    """Walk nested wrappers until the inner Brax ``State`` is reached."""
+    current = state
+    while hasattr(current, "env_state") and not hasattr(current, "pipeline_state"):
+        current = current.env_state
+    return current
+
+
+def _replace_inner_brax_state(wrapped_state, brax_state):
+    """Replace the inner Brax state, updating ``org_obs`` when present."""
+    if hasattr(wrapped_state, "pipeline_state"):
+        return brax_state
+    new_inner = _replace_inner_brax_state(wrapped_state.env_state, brax_state)
+    updates = {"env_state": new_inner}
+    if hasattr(wrapped_state, "org_obs"):
+        updates["org_obs"] = brax_state.obs
+    return wrapped_state.replace(**updates)
+
+
+def _success_metric(wrapped_state):
+    return _inner_brax_state(wrapped_state).metrics["success"]
+
+
+def _normalize_xy(goal, mean, var):
+    mean_xy = mean[..., :2]
+    var_xy = var[..., :2]
+    return (goal - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+
+
+def _collapse_obs_norm_stats(stats_state, obs_dim):
+    """Reduce batched ``(NUM_ENVS, obs_dim)`` stats to global 1D for eval."""
+    if stats_state is None:
+        return None
+    mean = stats_state.mean
+    var = stats_state.var
+    if mean.ndim > 1 and mean.shape[-1] == obs_dim:
+        # mean = jnp.mean(mean, axis=0)
+        # var = jnp.mean(var, axis=0)
+        mean = mean[0]
+        var = var[0]
+    return stats_state.replace(mean=mean, var=var)
+
+
+def evaluate_multiple_goals(
+    env,
+    brax_env,
+    network,
+    params,
+    goals,
+    num_envs_per_goal,
+    max_steps=1000,
+    warmup_env_state=None,
+    normalize_obs=False,
+    condition_on_goal=True,
+):
+    """Evaluate success rate for each goal over multiple random starts.
+
+    Uses the full wrapped env stack (VecEnv + LogWrapper + ...). VecEnv.reset
+    already vmaps over envs, so each goal is evaluated with a batched reset of
+    ``num_envs_per_goal`` keys rather than vmapping over scalar keys.
+
+    ``goals`` must be raw world coordinates. When ``normalize_obs`` is True,
+    observations and conditioned goals are normalized using collapsed warmup
+    stats so eval can use a different batch size than training.
+    """
+    env_params = None
+    obs_dim = brax_env.observation_size
+    eval_stats = (
+        _collapse_obs_norm_stats(warmup_env_state, obs_dim)
+        if normalize_obs and warmup_env_state is not None
+        else warmup_env_state
+    )
+    norm_mean = eval_stats.mean if eval_stats is not None else None
+    norm_var = eval_stats.var if eval_stats is not None else None
+
+    def _reinit_with_goal(brax_state, goal):
+        q = brax_state.pipeline_state.q.at[-2:].set(goal)
+        pipeline_state = brax_env.pipeline_init(q, brax_state.pipeline_state.qd)
+        obs = brax_env._get_obs(pipeline_state)
+        return brax_state.replace(pipeline_state=pipeline_state, obs=obs)
+
+    reinit_with_goal = jax.vmap(_reinit_with_goal, in_axes=(0, None))
+
+    def eval_one_goal(rng, specific_goal):
+        reset_rngs = jax.random.split(rng, num_envs_per_goal)
+        if eval_stats is not None:
+            obsv, env_state = env.reset_with_stats(
+                reset_rngs, eval_stats, env_params
+            )
+        else:
+            obsv, env_state = env.reset(reset_rngs, env_params)
+
+        brax_state = _inner_brax_state(env_state)
+        brax_state = reinit_with_goal(brax_state, specific_goal)
+        env_state = _replace_inner_brax_state(env_state, brax_state)
+
+        if normalize_obs:
+            obsv = (brax_state.obs - norm_mean) / jnp.sqrt(norm_var + 1e-8)
+        else:
+            obsv = brax_state.obs
+
+        if condition_on_goal:
+            if normalize_obs:
+                policy_goal = _normalize_xy(specific_goal, norm_mean, norm_var)
+            else:
+                policy_goal = specific_goal
+            goal_batch = jnp.broadcast_to(
+                policy_goal, (num_envs_per_goal, policy_goal.shape[-1])
+            )
+
+        def step_fn(carry, _):
+            obsv, env_state, rng = carry
+            rng, step_rng, action_rng = jax.random.split(rng, 3)
+            step_rngs = jax.random.split(step_rng, num_envs_per_goal)
+            if condition_on_goal:
+                policy_obs = jnp.concatenate([obsv, goal_batch], axis=-1)
+            else:
+                policy_obs = obsv
+            pi, _ = network.apply(params, policy_obs)
+            action = pi.sample(seed=action_rng)
+            obsv, env_state, reward, done, info = env.step(
+                step_rngs, env_state, action, env_params
+            )
+            success = _success_metric(env_state)
+            return (obsv, env_state, rng), success
+
+        _, successes = jax.lax.scan(
+            step_fn, (obsv, env_state, rng), None, length=max_steps
+        )
+
+        return successes.max(axis=0).mean()
+
+    vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
+    goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])
+    return vmap_goals(goal_rngs, goals)
 
 
 def parse_config_from_cli() -> TrainConfig:
@@ -290,6 +432,12 @@ def make_train(config):
     )
     gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
     goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
+    all_goals = all_possible_goals()
+    num_competence = int(all_goals.shape[0])
+    condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
+    teacher_obs_dim = (
+        base_obs_dim + num_competence if condition_teacher_on_competence else base_obs_dim
+    )
     teacher_network = TeacherActorCritic(
         num_actions=teacher_num_goal_points * teacher_num_goal_points,
         activation=config["ACTIVATION"],
@@ -415,6 +563,9 @@ def make_train(config):
             traceback.print_exc()
 
     def train(rng):
+        steps_per_update = config["NUM_ENVS"] * config["NUM_STEPS"]
+        _wandb_timer = {"last_time": None}
+
         # INIT NETWORK
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
@@ -439,13 +590,36 @@ def make_train(config):
         )
         rng, goal_rng, teacher_init_rng, _rng = jax.random.split(rng, 4)
         teacher_params = teacher_network.init(
-            teacher_init_rng, jnp.zeros((base_obs_dim,))
+            teacher_init_rng, jnp.zeros((teacher_obs_dim,))
         )
 
-        def sample_teacher_goals(obs, rng):
-            pi, _ = teacher_network.apply(teacher_params, obs)
+        def _build_teacher_input(obs, competence_vector):
+            if not condition_teacher_on_competence:
+                return obs
+            comp_batch = jnp.broadcast_to(
+                competence_vector, (obs.shape[0], competence_vector.shape[0])
+            )
+            return jnp.concatenate([obs, comp_batch], axis=-1)
+
+        def sample_teacher_goals(obs, competence_vector, rng):
+            teacher_obs = _build_teacher_input(obs, competence_vector)
+            pi, _ = teacher_network.apply(teacher_params, teacher_obs)
             idx = pi.sample(seed=rng)
             return goal_grid[idx].astype(jnp.float32)
+
+        def compute_competence_vector(student_params, stats_state):
+            return evaluate_multiple_goals(
+                env_2,
+                custom_env_2,
+                network,
+                student_params,
+                all_goals,
+                config["NUM_EVAL_ENVS"],
+                max_steps=config.get("EPISODE_LENGTH", 1000),
+                warmup_env_state=stats_state,
+                normalize_obs=config["NORMALIZE_ENV"],
+                condition_on_goal=condition_on_goal,
+            )
 
         if config["NORMALIZE_ENV"]:
             # import pdb; pdb.set_trace()
@@ -491,8 +665,11 @@ def make_train(config):
             )
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
-        
-        raw_goals = sample_teacher_goals(obsv, goal_rng)
+
+        competence_vector = jnp.zeros((num_competence,), dtype=obsv.dtype)
+        raw_goals = sample_teacher_goals(
+            obsv[..., :base_obs_dim], competence_vector, goal_rng
+        )
         goals = raw_goals
         if condition_on_goal:
             if config["NORMALIZE_ENV"]:
@@ -511,6 +688,7 @@ def make_train(config):
                     last_obs,
                     goals,
                     raw_goals,
+                    competence_vector,
                     task_reward_sum,
                     task_reward_sq_sum,
                     goal_reward_sum,
@@ -546,8 +724,20 @@ def make_train(config):
                     # jax.debug.print("dist: {dist}", dist=dist)
                     # jax.debug.print("goals: {goals}", goals=goals)
                     # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
-                    reward = task_reward + goal_reward
-                teacher_goals = sample_teacher_goals(obsv, goal_rng)
+                    reward = task_reward + config["GOAL_REWARD_COEF"] * goal_reward
+                if condition_teacher_on_competence:
+                    competence_vector = jax.lax.cond(
+                        jnp.any(done),
+                        lambda _: compute_competence_vector(
+                            train_state.params, env_state
+                        ),
+                        lambda _: competence_vector,
+                        operand=None,
+                    )
+                # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
+                teacher_goals = sample_teacher_goals(
+                    obsv[..., :base_obs_dim], competence_vector, goal_rng
+                )
                 raw_goals = jnp.where(done[:, None], teacher_goals, raw_goals)
                 # jax.debug.print("done: {done}", done=jnp.any(done))
                 # jax.lax.cond(
@@ -574,6 +764,7 @@ def make_train(config):
                     obsv,
                     goals,
                     raw_goals,
+                    competence_vector,
                     task_reward_sum,
                     task_reward_sq_sum,
                     goal_reward_sum,
@@ -594,6 +785,7 @@ def make_train(config):
                 last_obs,
                 goals,
                 raw_goals,
+                competence_vector,
                 task_reward_sum,
                 task_reward_sq_sum,
                 goal_reward_sum,
@@ -761,7 +953,7 @@ def make_train(config):
             else:
                 obs_norm_mean = jnp.array(0.0, dtype=task_reward_mean.dtype)
                 obs_norm_var = jnp.array(0.0, dtype=task_reward_mean.dtype)
-
+            competence_mean = competence_vector.mean()
 
             if config.get("DEBUG"):
 
@@ -799,18 +991,24 @@ def make_train(config):
                         current_lr,
                         obs_norm_mean,
                         obs_norm_var,
+                        competence_mean,
                     ) = args
+                    now = time.perf_counter()
+                    log_metrics = {}
+                    if _wandb_timer["last_time"] is not None:
+                        elapsed = now - _wandb_timer["last_time"]
+                        if elapsed > 0:
+                            log_metrics["sps"] = float(steps_per_update / elapsed)
+                    _wandb_timer["last_time"] = now
+
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
                     ]
                     if len(return_values) > 0:
-                        wandb.log(
-                            {"episodic_return": float(return_values.mean())},
-                            step=step,
-                        )
-                        wandb.log(
+                        log_metrics["episodic_return"] = float(return_values.mean())
+                    log_metrics.update(
                         {
                             "total_loss": float(total_loss),
                             "value_loss": float(value_loss),
@@ -827,9 +1025,10 @@ def make_train(config):
                             "learning_rate": float(current_lr),
                             "obs_norm_mean": float(obs_norm_mean),
                             "obs_norm_var": float(obs_norm_var),
-                        },
-                        step=step,
+                            "student_competence_mean": float(competence_mean),
+                        }
                     )
+                    wandb.log(log_metrics, step=step)
 
                 jax.debug.callback(
                     wandb_callback,
@@ -850,6 +1049,7 @@ def make_train(config):
                         current_lr,
                         obs_norm_mean,
                         obs_norm_var,
+                        competence_mean,
                     ),
                 )
 
@@ -859,6 +1059,7 @@ def make_train(config):
                 last_obs,
                 goals,
                 raw_goals,
+                competence_vector,
                 task_reward_sum,
                 task_reward_sq_sum,
                 goal_reward_sum,
@@ -876,6 +1077,7 @@ def make_train(config):
             obsv,
             goals,
             raw_goals,
+            competence_vector,
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
@@ -913,8 +1115,8 @@ def main():
     train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
-    jax.block_until_ready(train_output["runner_state"][10])
-    final_train_state, final_env_state, _, _, _, _, _, _, _, _, final_rng = train_output[
+    jax.block_until_ready(train_output["runner_state"][11])
+    final_train_state, final_env_state, _, _, _, _, _, _, _, _, _, final_rng = train_output[
         "runner_state"
     ]
     if config["SAVE_MODEL"]:
