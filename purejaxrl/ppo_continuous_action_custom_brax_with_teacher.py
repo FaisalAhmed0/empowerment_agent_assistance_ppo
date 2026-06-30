@@ -467,6 +467,27 @@ def make_train(config):
             obs = obs[0]
         return (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
 
+    def _build_teacher_input(obs, competence_vector):
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        if not condition_teacher_on_competence:
+            return obs
+        comp_batch = jnp.broadcast_to(
+            competence_vector, (obs.shape[0], competence_vector.shape[0])
+        )
+        return jnp.concatenate([obs, comp_batch], axis=-1)
+
+    def _sample_teacher_goals(teacher_params, obs, competence_vector, rng):
+        teacher_obs = _build_teacher_input(obs, competence_vector)
+        pi, _ = teacher_network.apply(teacher_params, teacher_obs)
+        idx = pi.sample(seed=rng)
+        return goal_grid[idx].astype(jnp.float32)
+
+    def _policy_goal_from_raw(raw_goal, obs_mean, obs_var):
+        if config["NORMALIZE_ENV"]:
+            return _normalize_xy(raw_goal, obs_mean, obs_var)
+        return raw_goal
+
     render_sim_steps = int(config.get("EVAL_RENDER_STEPS", 500))
     render_max_frames = int(config.get("EVAL_RENDER_MAX_FRAMES", 120))
     render_action_repeat = int(config.get("ACTION_REPEAT", 1))
@@ -481,17 +502,40 @@ def make_train(config):
             obs_var = jnp.ones(_render_obs_dim)
         return obs_mean, obs_var
 
-    def _eval_render_action(params, obs, obs_mean, obs_var):
+    def _eval_render_action(params, obs, obs_mean, obs_var, policy_goal=None):
         norm_obs = _normalize_eval_obs(obs, obs_mean, obs_var)
-        pi, _ = network.apply(params, norm_obs)
+        if condition_on_goal:
+            policy_obs = jnp.concatenate([norm_obs, policy_goal], axis=-1)
+        else:
+            policy_obs = norm_obs
+        pi, _ = network.apply(params, policy_obs)
         return jnp.clip(pi.mean(), action_low, action_high)
 
-    def _render_rollout_impl(params, rng, obs_mean, obs_var):
-        state = base_env.reset(rng)
+    def _render_rollout_impl(
+        params, teacher_params, competence_vector, rng, obs_mean, obs_var
+    ):
+        rng, reset_rng = jax.random.split(rng)
+        state = base_env.reset(reset_rng)
+        raw_goal = jnp.zeros((2,), dtype=jnp.float32)
+        policy_goal = jnp.zeros((2,), dtype=jnp.float32)
+        if condition_on_goal:
+            rng, goal_rng = jax.random.split(rng)
+            norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
+            raw_goal = _sample_teacher_goals(
+                teacher_params, norm_obs, competence_vector, goal_rng
+            )
+            if raw_goal.ndim > 1:
+                raw_goal = raw_goal[0]
+            policy_goal = _policy_goal_from_raw(raw_goal, obs_mean, obs_var)
 
         def step_fn(carry, _):
-            state, _ = carry
-            action = _eval_render_action(params, state.obs, obs_mean, obs_var)
+            state, raw_goal, policy_goal, rng = carry
+            if condition_on_goal:
+                action = _eval_render_action(
+                    params, state.obs, obs_mean, obs_var, policy_goal
+                )
+            else:
+                action = _eval_render_action(params, state.obs, obs_mean, obs_var)
 
             def repeat_step(s, __):
                 return base_env.step(s, action), None
@@ -499,10 +543,26 @@ def make_train(config):
             state, _ = jax.lax.scan(
                 repeat_step, state, None, length=render_action_repeat
             )
-            return (state, None), state.pipeline_state
+            if condition_on_goal:
+                rng, goal_rng = jax.random.split(rng)
+                norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
+                new_raw_goal = _sample_teacher_goals(
+                    teacher_params, norm_obs, competence_vector, goal_rng
+                )
+                if new_raw_goal.ndim > 1:
+                    new_raw_goal = new_raw_goal[0]
+                new_policy_goal = _policy_goal_from_raw(
+                    new_raw_goal, obs_mean, obs_var
+                )
+                raw_goal = jnp.where(state.done, new_raw_goal, raw_goal)
+                policy_goal = jnp.where(state.done, new_policy_goal, policy_goal)
+            return (state, raw_goal, policy_goal, rng), state.pipeline_state
 
         _, pipeline_states = jax.lax.scan(
-            step_fn, (state, None), None, length=render_sim_steps
+            step_fn,
+            (state, raw_goal, policy_goal, rng),
+            None,
+            length=render_sim_steps,
         )
         return pipeline_states
 
@@ -522,13 +582,17 @@ def make_train(config):
             for i in range(n)
         ]
 
-    def render_eval_episode(params, rng, final_env_state):
+    def render_eval_episode(
+        params, teacher_params, competence_vector, rng, final_env_state
+    ):
         """Runs one eval rollout and logs rendered HTML to wandb."""
         if config.get("WANDB_MODE", "disabled") != "online":
             return
         try:
             obs_mean, obs_var = _obs_norm_stats_for_render(final_env_state)
-            pipeline_states = _run_render_rollout(params, rng, obs_mean, obs_var)
+            pipeline_states = _run_render_rollout(
+                params, teacher_params, competence_vector, rng, obs_mean, obs_var
+            )
             pipeline_states = _subsample_pipeline_states(
                 pipeline_states, render_max_frames
             )
@@ -593,19 +657,10 @@ def make_train(config):
             teacher_init_rng, jnp.zeros((teacher_obs_dim,))
         )
 
-        def _build_teacher_input(obs, competence_vector):
-            if not condition_teacher_on_competence:
-                return obs
-            comp_batch = jnp.broadcast_to(
-                competence_vector, (obs.shape[0], competence_vector.shape[0])
-            )
-            return jnp.concatenate([obs, comp_batch], axis=-1)
-
         def sample_teacher_goals(obs, competence_vector, rng):
-            teacher_obs = _build_teacher_input(obs, competence_vector)
-            pi, _ = teacher_network.apply(teacher_params, teacher_obs)
-            idx = pi.sample(seed=rng)
-            return goal_grid[idx].astype(jnp.float32)
+            return _sample_teacher_goals(
+                teacher_params, obs, competence_vector, rng
+            )
 
         def compute_competence_vector(student_params, stats_state):
             return evaluate_multiple_goals(
@@ -1091,6 +1146,7 @@ def make_train(config):
         return {
             "runner_state": runner_state,
             "metrics": metric,
+            "teacher_params": teacher_params,
         }
 
     return train, render_eval_episode
@@ -1116,9 +1172,21 @@ def main():
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
     jax.block_until_ready(train_output["runner_state"][11])
-    final_train_state, final_env_state, _, _, _, _, _, _, _, _, _, final_rng = train_output[
-        "runner_state"
-    ]
+    (
+        final_train_state,
+        final_env_state,
+        _,
+        _,
+        _,
+        final_competence,
+        _,
+        _,
+        _,
+        _,
+        _,
+        final_rng,
+    ) = train_output["runner_state"]
+    teacher_params = train_output["teacher_params"]
     if config["SAVE_MODEL"]:
         scratch = os.environ.get("SCRATCH")   
         random_name = RandomWord().word()
@@ -1130,7 +1198,13 @@ def main():
         os.makedirs(model_save_path, exist_ok=False)
         save_checkpoint(final_train_state, model_save_path)
         load_checkpoint(final_train_state, model_save_path)
-    render_eval_episode(final_train_state.params, final_rng, final_env_state)
+    render_eval_episode(
+        final_train_state.params,
+        teacher_params,
+        final_competence,
+        final_rng,
+        final_env_state,
+    )
 
 
 if __name__ == "__main__":
