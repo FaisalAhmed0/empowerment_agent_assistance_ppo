@@ -14,7 +14,6 @@ from typing import Sequence, NamedTuple, Any
 from dataclasses import dataclass, asdict, field
 from flax.training.train_state import TrainState
 from copy import deepcopy
-from envs.ant_maze import sample_random_goal
 import distrax
 import tyro
 from wrappers import (
@@ -39,17 +38,17 @@ from wonderwords import RandomWord
 @dataclass
 class TrainConfig:
     LR: float = 3e-4
-    NUM_ENVS: int = 245
+    NUM_ENVS: int = 256
     NUM_STEPS: int = 64
     TOTAL_TIMESTEPS: int = int(5e7)
     UPDATE_EPOCHS: int = 4
-    NUM_MINIBATCHES: int = 32
+    NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
     VF_COEF: float = 0.5
-    HIDDEN_DIM: int = 64
+    HIDDEN_DIM: int = 256
     MAX_GRAD_NORM: float = 1.0
     ACTIVATION: str = "tanh"
     ENV_NAME: str = "ant_u_maze"
@@ -58,7 +57,7 @@ class TrainConfig:
     ACTION_REPEAT: int = 1
     ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
     ANNEAL_LR: bool = True
-    NORMALIZE_ENV: bool = False
+    NORMALIZE_ENV: bool = True
     DEBUG: bool = True
     SEED: int = 30
     WANDB_MODE: str = "online"
@@ -69,10 +68,15 @@ class TrainConfig:
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     COMMENT: str = ""
-    ADD_GOAL_REWARD: bool = False
-    CONDITION_ON_GOAL: bool = False
+    ADD_GOAL_REWARD: bool = True
+    CONDITION_ON_GOAL: bool = True
     GOAL_REACH_EPSILON: float = 0.5
-    HIDDEN_DIM: int = 128
+    TEACHER_GOAL_X_MIN: float = 0.0
+    TEACHER_GOAL_X_MAX: float = 12.0
+    TEACHER_GOAL_Y_MIN: float = 0.0
+    TEACHER_GOAL_Y_MAX: float = 4.0
+    TEACHER_NUM_GOAL_POINTS: int = 30
+    TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
 
@@ -122,6 +126,50 @@ class ActorCritic(nn.Module):
         )
 
         return pi, jnp.squeeze(critic, axis=-1)
+
+
+class TeacherActorCritic(nn.Module):
+    num_actions: int
+    activation: str = "tanh"
+    hidden_dim: int = 128
+
+    @nn.compact
+    def __call__(self, x):
+        act = nn.relu if self.activation == "relu" else nn.tanh
+        actor_mean = act(
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(x)
+        )
+        actor_mean = act(
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(actor_mean)
+        )
+        logits = nn.Dense(
+            self.num_actions, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        )(actor_mean)
+        pi = distrax.Categorical(logits=logits)
+        critic = act(
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(x)
+        )
+        critic = act(
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(critic)
+        )
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
+        return pi, jnp.squeeze(value, axis=-1)
 
 
 class Transition(NamedTuple):
@@ -227,6 +275,25 @@ def make_train(config):
 
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
+    )
+    base_obs_dim = int(env.observation_space(env_params).shape[0])
+    teacher_num_goal_points = int(config["TEACHER_NUM_GOAL_POINTS"])
+    xs = jnp.linspace(
+        config["TEACHER_GOAL_X_MIN"],
+        config["TEACHER_GOAL_X_MAX"],
+        teacher_num_goal_points,
+    )
+    ys = jnp.linspace(
+        config["TEACHER_GOAL_Y_MIN"],
+        config["TEACHER_GOAL_Y_MAX"],
+        teacher_num_goal_points,
+    )
+    gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
+    goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
+    teacher_network = TeacherActorCritic(
+        num_actions=teacher_num_goal_points * teacher_num_goal_points,
+        activation=config["ACTIVATION"],
+        hidden_dim=config["TEACHER_HIDDEN_DIM"],
     )
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
@@ -370,7 +437,15 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
-        rng, goal_rng,  _rng = jax.random.split(rng, 3)
+        rng, goal_rng, teacher_init_rng, _rng = jax.random.split(rng, 4)
+        teacher_params = teacher_network.init(
+            teacher_init_rng, jnp.zeros((base_obs_dim,))
+        )
+
+        def sample_teacher_goals(obs, rng):
+            pi, _ = teacher_network.apply(teacher_params, obs)
+            idx = pi.sample(seed=rng)
+            return goal_grid[idx].astype(jnp.float32)
 
         if config["NORMALIZE_ENV"]:
             # import pdb; pdb.set_trace()
@@ -417,10 +492,7 @@ def make_train(config):
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
         
-        # if add_goal_reward:
-        raw_goals = jax.vmap(sample_random_goal)(
-            jax.random.split(goal_rng, config["NUM_ENVS"])
-        ).astype(jnp.float32)
+        raw_goals = sample_teacher_goals(obsv, goal_rng)
         goals = raw_goals
         if condition_on_goal:
             if config["NORMALIZE_ENV"]:
@@ -475,10 +547,14 @@ def make_train(config):
                     # jax.debug.print("goals: {goals}", goals=goals)
                     # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
                     reward = task_reward + goal_reward
-                sampled_raw_goals = jax.vmap(sample_random_goal)(
-                    jax.random.split(goal_rng, config["NUM_ENVS"])
-                )
-                raw_goals = jnp.where(done[:, None], sampled_raw_goals, raw_goals)
+                teacher_goals = sample_teacher_goals(obsv, goal_rng)
+                raw_goals = jnp.where(done[:, None], teacher_goals, raw_goals)
+                # jax.debug.print("done: {done}", done=jnp.any(done))
+                # jax.lax.cond(
+                #     jnp.any(done),
+                #     lambda:jax.debug.print("obsv xy: {obsv}", obsv=obsv[..., :2]),
+                #     lambda: None,
+                # )
                 def normalize_goals(raw_goals, env_state):
                     if config["NORMALIZE_ENV"]:
                         mean_xy = env_state.mean[..., :2]
