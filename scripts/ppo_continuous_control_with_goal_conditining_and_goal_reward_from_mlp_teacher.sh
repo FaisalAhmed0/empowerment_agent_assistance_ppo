@@ -1,15 +1,14 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_2"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 ENV_NAMES=("ant_u_maze")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30 75937 9937)
-COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_randomly_initialized_and_not_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_we_want_to_give"
-
+COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_randomly_initialized_and_not_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_and_also_fixed_the_goal_space"
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(2048)
@@ -22,7 +21,7 @@ UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(4 16 8)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
-GOAL_REWARD_COEF=(0.5 0.05)
+GOAL_REWARD_COEF=(0.1 0.01 0.001)
 
 
 run_count=0
@@ -43,7 +42,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for num_minibatches in "${NUM_MINIBATCHES[@]}"; do
                         for goal_reward_coef in "${GOAL_REWARD_COEF[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
-                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py \
+                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_no_teacher_reward.py \
                         --ENV_NAME=${ENV_NAME} \
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \

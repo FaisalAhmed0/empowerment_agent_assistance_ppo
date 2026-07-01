@@ -85,6 +85,7 @@ class TrainConfig:
     INTERPOLATED_REWARD: bool = False
     NUM_EVAL_ENVS: int = 32
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
+    USE_AVERAGE_COMPETENCE_REWARD: bool = True
 
 
 def _inner_brax_state(state):
@@ -792,6 +793,12 @@ def make_train(config):
                         lambda _: competence_vector,
                         operand=None,
                     )
+                    if config["USE_AVERAGE_COMPETENCE_REWARD"]:
+                        import pdb; pdb.set_trace()
+                        avg_competence = competence_vector.mean()
+                        teacher_reward = jnp.where(done, avg_competence, 0.0)
+                    else:
+                        teacher_reward = jnp.zeros_like(task_reward)
                 # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
                 teacher_goals = sample_teacher_goals(
                     obsv[..., :base_obs_dim], competence_vector, goal_rng

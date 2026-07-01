@@ -457,7 +457,13 @@ def push_teacher_transition(buffer, transition):
     )
 
 
-def push_teacher_rollout_on_done(buffer, carry, teacher_reward, episode_done):
+def _where_done(done, fresh, old):
+    if old.ndim == 1:
+        return jnp.where(done, fresh, old)
+    return jnp.where(done[:, None], fresh, old)
+
+
+def push_teacher_rollout_on_done(buffer, carry, teacher_reward, done):
     transition = TeacherRolloutTransition(
         teacher_obs=carry.teacher_obs,
         goal_idx=carry.goal_idx,
@@ -467,7 +473,7 @@ def push_teacher_rollout_on_done(buffer, carry, teacher_reward, episode_done):
         reward=teacher_reward,
     )
     return jax.lax.cond(
-        episode_done,
+        jnp.any(done),
         lambda b: push_teacher_transition(b, transition),
         lambda b: b,
         buffer,
@@ -894,11 +900,11 @@ def make_train(config):
             )
 
         def teacher_act_and_carry(obs, competence_vector, rng):
-            raw_goal, goal_idx, log_prob, value, teacher_obs = _teacher_act(
-                teacher_params, obs, competence_vector, rng
+            raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs = (
+                _teacher_act(teacher_params, obs, competence_vector, rng)
             )
             carry = teacher_carry_from_act(
-                raw_goal, goal_idx, log_prob, value, teacher_obs
+                raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs
             )
             return raw_goal, carry
 
@@ -1047,28 +1053,36 @@ def make_train(config):
                     teacher_reward = jnp.where(done, avg_competence, 0.0)
                 else:
                     teacher_reward = jnp.zeros_like(task_reward)
-                episode_done = done[0]
                 teacher_rollout_buffer = push_teacher_rollout_on_done(
                     teacher_rollout_buffer,
                     teacher_episode_carry,
                     teacher_reward,
-                    episode_done,
+                    done,
                 )
                 # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
-                new_raw_goals, goal_idx, log_prob, value, teacher_obs = _teacher_act(
+                (
+                    new_raw_goals,
+                    goal_idx,
+                    teacher_log_prob,
+                    teacher_value,
+                    teacher_obs,
+                ) = _teacher_act(
                     teacher_params,
                     obsv[..., :base_obs_dim],
                     competence_vector,
                     goal_rng,
                 )
                 fresh_carry = teacher_carry_from_act(
-                    new_raw_goals, goal_idx, log_prob, value, teacher_obs
+                    new_raw_goals,
+                    goal_idx,
+                    teacher_log_prob,
+                    teacher_value,
+                    teacher_obs,
                 )
-                teacher_episode_carry = jax.lax.cond(
-                    episode_done,
-                    lambda _: fresh_carry,
-                    lambda _: teacher_episode_carry,
-                    operand=None,
+                teacher_episode_carry = jax.tree.map(
+                    lambda f, o: _where_done(done, f, o),
+                    fresh_carry,
+                    teacher_episode_carry,
                 )
                 raw_goals = jnp.where(done[:, None], new_raw_goals, raw_goals)
                 # jax.debug.print("done: {done}", done=jnp.any(done))
