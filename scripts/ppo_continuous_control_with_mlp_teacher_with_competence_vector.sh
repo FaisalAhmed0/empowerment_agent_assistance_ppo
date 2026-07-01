@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_with_competence_vector"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_with_competence_vector_interpolated_reward"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 CONDITION_TEACHER_ON_COMPETENCE="--CONDITION_TEACHER_ON_COMPETENCE"
+INTERPOLATED_REWARD="--INTERPOLATED_REWARD"
 ENV_NAMES=("ant_u_maze")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30 75937 9937)
-COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_randomly_initialized_and_not_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_we_want_to_give_and_we_are_conditioning_the_teacher_on_the_competence_vector"
+COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_randomly_initialized_and_not_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_we_want_to_give_and_we_are_conditioning_the_teacher_on_the_competence_vector_and_we_are_using_an_interpolated_reward"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
@@ -23,7 +24,7 @@ UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(4 16 8)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
-GOAL_REWARD_COEF=(0.1 0.3 0.5)
+GOAL_REWARD_COEF=(0.5 0.1 0.05 0.01)
 
 
 run_count=0

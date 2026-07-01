@@ -82,6 +82,7 @@ class TrainConfig:
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
     GOAL_REWARD_COEF: float = 1.0
+    INTERPOLATED_REWARD: bool = False
     NUM_EVAL_ENVS: int = 32
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
 
@@ -780,6 +781,8 @@ def make_train(config):
                     # jax.debug.print("goals: {goals}", goals=goals)
                     # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
                     reward = task_reward + config["GOAL_REWARD_COEF"] * goal_reward
+                    if config["INTERPOLATED_REWARD"]:
+                        reward = (1-config["GOAL_REWARD_COEF"]) * task_reward + config["GOAL_REWARD_COEF"] * goal_reward
                 if condition_teacher_on_competence:
                     competence_vector = jax.lax.cond(
                         jnp.any(done),
