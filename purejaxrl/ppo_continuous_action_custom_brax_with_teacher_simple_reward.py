@@ -86,7 +86,9 @@ class TrainConfig:
     INTERPOLATED_REWARD: bool = False
     NUM_EVAL_ENVS: int = 32
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
-    USE_AVERAGE_COMPETENCE_REWARD: bool = True
+    USE_AVERAGE_COMPETENCE_REWARD: bool = False
+    USE_LEARNING_PROGRESS_REWARD: bool = True
+    ABSOLUTE_LEARNING_PROGRESS: bool = False
     TEACHER_SOFTMAX_VIZ_LOG_EVERY_UPDATES: int = 0
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
     TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX: int = 0
@@ -386,6 +388,9 @@ class Transition(NamedTuple):
     task_reward: jnp.ndarray
     goal_reward: jnp.ndarray
     teacher_reward: jnp.ndarray
+    teacher_success_reward: jnp.ndarray
+    teacher_learning_progress_reward: jnp.ndarray
+    ppo_updates_per_episode: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
@@ -690,6 +695,7 @@ def make_train(config):
     num_competence = int(all_goals.shape[0])
     condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
+    use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     update_competence = (
         condition_teacher_on_competence or use_average_competence_reward
     )
@@ -1028,6 +1034,20 @@ def make_train(config):
                 condition_on_goal=condition_on_goal,
             )
 
+        def evaluate_teacher_goal_success_rates(student_params, stats_state, goals):
+            return evaluate_multiple_goals(
+                env_2,
+                custom_env_2,
+                network,
+                student_params,
+                goals,
+                config["NUM_EVAL_ENVS"],
+                max_steps=config.get("EPISODE_LENGTH", 1000),
+                warmup_env_state=stats_state,
+                normalize_obs=config["NORMALIZE_ENV"],
+                condition_on_goal=condition_on_goal,
+            )
+
         if config["NORMALIZE_ENV"]:
             # import pdb; pdb.set_trace()
             # env = NormalizeVecReward(env, config["GAMMA"])
@@ -1090,7 +1110,17 @@ def make_train(config):
                 var_xy = env_state.var[..., :2]
                 goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
             obsv = jnp.concatenate([obsv, goals], axis=-1)
-            
+
+        if use_learning_progress_reward:
+            episode_goal_success_start = evaluate_teacher_goal_success_rates(
+                train_state.params, env_state, raw_goals
+            )
+        else:
+            episode_goal_success_start = jnp.zeros(
+                (config["NUM_ENVS"],), dtype=obsv.dtype
+            )
+        episode_step_count = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
+
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
             # COLLECT TRAJECTORIES
@@ -1108,6 +1138,9 @@ def make_train(config):
                     goal_reward_sum,
                     goal_reward_sq_sum,
                     reward_count,
+                    episode_success,
+                    episode_goal_success_start,
+                    episode_step_count,
                     teacher_episode_carry,
                     teacher_rollout_buffer,
                     rng,
@@ -1126,6 +1159,8 @@ def make_train(config):
                 obsv, env_state, reward, done, info = env.step(
                     rng_step, env_state, action, env_params
                 )
+                step_success = _success_metric(env_state)
+                episode_success = jnp.maximum(episode_success, step_success)
                 # jax.debug.print("done: {done}", done=done)
                 task_reward = reward
                 goal_reward = jnp.zeros_like(task_reward)
@@ -1153,11 +1188,49 @@ def make_train(config):
                         lambda _: competence_vector,
                         operand=None,
                     )
+                    # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
                 if use_average_competence_reward:
                     avg_competence = competence_vector.mean()
-                    teacher_reward = jnp.where(done, avg_competence, 0.0)
+                    competence_part = jnp.where(done, avg_competence, 0.0)
                 else:
-                    teacher_reward = jnp.zeros_like(task_reward)
+                    competence_part = jnp.zeros_like(task_reward)
+                success_part = jnp.where(done, episode_success, 0.0)
+
+                episode_step_count = episode_step_count + 1.0
+                ppo_updates_per_episode = (
+                    episode_step_count + config["NUM_STEPS"] - 1
+                ) // config["NUM_STEPS"]
+                ppo_updates_at_done = jnp.where(done, ppo_updates_per_episode, 0.0)
+
+                learning_progress_part = jnp.zeros_like(task_reward)
+                if use_learning_progress_reward:
+
+                    def _compute_learning_progress(_):
+                        end_rates = evaluate_teacher_goal_success_rates(
+                            train_state.params,
+                            env_state,
+                            teacher_episode_carry.raw_goal,
+                        )
+                        learning_progress = (
+                            end_rates - episode_goal_success_start
+                        )
+                        if config["ABSOLUTE_LEARNING_PROGRESS"]:
+                            learning_progress = jnp.abs(learning_progress)
+                        jax.debug.print("learning_progress: {learning_progress}", learning_progress=learning_progress)
+                        jax.debug.print("raw_goals: {raw_goals}", raw_goals=teacher_episode_carry.raw_goal)
+                        return jnp.where(done, learning_progress, 0.0)
+
+                    learning_progress_part = jax.lax.cond(
+                        jnp.any(done),
+                        _compute_learning_progress,
+                        lambda _: learning_progress_part,
+                        operand=None,
+                    )
+
+                teacher_reward = (
+                    competence_part + success_part + learning_progress_part
+                )
+                episode_success = jnp.where(done, 0.0, episode_success)
                 teacher_rollout_buffer = push_teacher_rollout_on_done(
                     teacher_rollout_buffer,
                     teacher_episode_carry,
@@ -1190,6 +1263,23 @@ def make_train(config):
                     teacher_episode_carry,
                 )
                 raw_goals = jnp.where(done[:, None], new_raw_goals, raw_goals)
+                if use_learning_progress_reward:
+
+                    def _update_episode_start_rates(_):
+                        new_start_rates = evaluate_teacher_goal_success_rates(
+                            train_state.params, env_state, new_raw_goals
+                        )
+                        return jnp.where(
+                            done, new_start_rates, episode_goal_success_start
+                        )
+
+                    episode_goal_success_start = jax.lax.cond(
+                        jnp.any(done),
+                        _update_episode_start_rates,
+                        lambda _: episode_goal_success_start,
+                        operand=None,
+                    )
+                episode_step_count = jnp.where(done, 0.0, episode_step_count)
                 # jax.debug.print("done: {done}", done=jnp.any(done))
                 # jax.lax.cond(
                 #     jnp.any(done),
@@ -1214,6 +1304,9 @@ def make_train(config):
                     task_reward,
                     goal_reward,
                     teacher_reward,
+                    success_part,
+                    learning_progress_part,
+                    ppo_updates_at_done,
                     log_prob,
                     last_obs,
                     info,
@@ -1231,6 +1324,9 @@ def make_train(config):
                     goal_reward_sum,
                     goal_reward_sq_sum,
                     reward_count,
+                    episode_success,
+                    episode_goal_success_start,
+                    episode_step_count,
                     teacher_episode_carry,
                     teacher_rollout_buffer,
                     rng,
@@ -1255,6 +1351,9 @@ def make_train(config):
                 goal_reward_sum,
                 goal_reward_sq_sum,
                 reward_count,
+                episode_success,
+                episode_goal_success_start,
+                episode_step_count,
                 teacher_episode_carry,
                 teacher_rollout_buffer,
                 rng,
@@ -1374,7 +1473,7 @@ def make_train(config):
 
             teacher_should_update = (
                 teacher_rollout_buffer.count >= teacher_rollout_buffer_size
-            ) & use_average_competence_reward
+            ) & (use_average_competence_reward | use_learning_progress_reward)
 
             def _teacher_calculate_gae(traj, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -1589,9 +1688,33 @@ def make_train(config):
             teacher_average_competence_reward_all_steps = (
                 traj_batch.teacher_reward.mean()
             )
+            teacher_success_reward_at_done = jnp.where(
+                done_mask, traj_batch.teacher_success_reward, jnp.nan
+            )
+            teacher_average_success_reward = jnp.nanmean(teacher_success_reward_at_done)
+            teacher_learning_progress_at_done = jnp.where(
+                done_mask, traj_batch.teacher_learning_progress_reward, jnp.nan
+            )
+            teacher_average_learning_progress = jnp.nanmean(
+                teacher_learning_progress_at_done
+            )
+            ppo_updates_at_done = jnp.where(
+                done_mask, traj_batch.ppo_updates_per_episode, jnp.nan
+            )
+            average_ppo_updates_per_episode = jnp.nanmean(ppo_updates_at_done)
             teacher_buffer_count = teacher_rollout_buffer.count
             teacher_buffer_mean_reward_val = teacher_buffer_mean_reward(
                 teacher_rollout_buffer
+            )
+
+            jax.lax.cond(
+                jnp.any(done_mask),
+                lambda: jax.debug.print(
+                    "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
+                    lp=teacher_average_learning_progress,
+                    u=average_ppo_updates_per_episode,
+                ),
+                lambda: None,
             )
 
             if config.get("DEBUG"):
@@ -1633,6 +1756,9 @@ def make_train(config):
                         competence_mean,
                         teacher_average_competence_reward,
                         teacher_average_competence_reward_all_steps,
+                        teacher_average_success_reward,
+                        teacher_average_learning_progress,
+                        average_ppo_updates_per_episode,
                         teacher_buffer_count,
                         teacher_buffer_mean_reward_val,
                         teacher_total_loss,
@@ -1692,6 +1818,21 @@ def make_train(config):
                         log_metrics["teacher/average_competence_reward"] = (
                             avg_competence_at_done
                         )
+                    avg_success_at_done = float(teacher_average_success_reward)
+                    if math.isfinite(avg_success_at_done):
+                        log_metrics["teacher/average_success_reward"] = (
+                            avg_success_at_done
+                        )
+                    avg_learning_progress = float(teacher_average_learning_progress)
+                    if math.isfinite(avg_learning_progress):
+                        log_metrics["teacher/average_learning_progress_reward"] = (
+                            avg_learning_progress
+                        )
+                    avg_ppo_updates = float(average_ppo_updates_per_episode)
+                    if math.isfinite(avg_ppo_updates):
+                        log_metrics["teacher/average_ppo_updates_per_episode"] = (
+                            avg_ppo_updates
+                        )
                     if float(teacher_did_update) > 0:
                         log_metrics.update(
                             {
@@ -1729,6 +1870,9 @@ def make_train(config):
                         competence_mean,
                         teacher_average_competence_reward,
                         teacher_average_competence_reward_all_steps,
+                        teacher_average_success_reward,
+                        teacher_average_learning_progress,
+                        average_ppo_updates_per_episode,
                         teacher_buffer_count,
                         teacher_buffer_mean_reward_val,
                         teacher_total_loss,
@@ -1780,6 +1924,9 @@ def make_train(config):
                 goal_reward_sum,
                 goal_reward_sq_sum,
                 reward_count,
+                episode_success,
+                episode_goal_success_start,
+                episode_step_count,
                 teacher_episode_carry,
                 teacher_rollout_buffer,
                 rng,
@@ -1801,6 +1948,9 @@ def make_train(config):
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
+            jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
+            episode_goal_success_start,
+            episode_step_count,
             teacher_episode_carry,
             teacher_rollout_buffer,
             _rng,
@@ -1848,6 +1998,9 @@ def main():
         _,
         _,
         final_competence,
+        _,
+        _,
+        _,
         _,
         _,
         _,

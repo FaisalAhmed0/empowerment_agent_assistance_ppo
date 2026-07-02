@@ -4,15 +4,16 @@
 WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_simple_reward_2"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
-ENV_NAMES=("ant_u_maze")
+USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
+ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
-SEEDS=(30 75937 9937)
+SEEDS=(30)
 COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_we_want_to_give_and_we_are_using_a_simple_reward_2"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(2048)
+NUM_ENVSS=(256 1024 2048)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0)
 GAE_LAMBDA=(0.8)
@@ -22,9 +23,11 @@ UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(4 16 8)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
-GOAL_REWARD_COEF=(1 0.1 0.01 0.001)
+GOAL_REWARD_COEF=(1 0.1)
 ### Teacher hyperparameters
 TEACHER_ROLLOUT_BUFFER_SIZES=(1 2 4 10)
+ABSOLUTE_LEARNING_PROGRESSS=(--ABSOLUTE_LEARNING_PROGRESS --no-ABSOLUTE_LEARNING_PROGRESS)
+NUM_EVAL_ENVSS=(4 8 16 32)
 
 run_count=0
 
@@ -44,6 +47,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for num_minibatches in "${NUM_MINIBATCHES[@]}"; do
                         for goal_reward_coef in "${GOAL_REWARD_COEF[@]}"; do
                         for teacher_rollout_buffer_size in "${TEACHER_ROLLOUT_BUFFER_SIZES[@]}"; do
+                        for absolute_learning_progress in "${ABSOLUTE_LEARNING_PROGRESSS[@]}"; do
+                        for num_eval_envs in "${NUM_EVAL_ENVSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -51,6 +56,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --LR=${LR} \
                         --HIDDEN_DIM=${hidden_dim} \
                         --NUM_MINIBATCHES=${num_minibatches} \
+                        ${USE_LEARNING_PROGRESS_REWARD} \
                         --SEED=${SEED} \
                         ${ADD_GOAL_REWARD} \
                         ${CONDITION_ON_GOAL} \
@@ -60,6 +66,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --MAX_GRAD_NORM=${max_grad_norm} \
                         --UPDATE_EPOCHS=${update_epochs} \
                         --GOAL_REWARD_COEF=${goal_reward_coef} \
+                        --NUM_EVAL_ENVS=${num_eval_envs} \
+                        ${absolute_learning_progress} \
                         --COMMENT=${COMMENT} \
                         --NUM_ENVS=${num_envs} \
                         ${normalize_env} \
@@ -74,6 +82,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
           done
+        done
+        done
         done
         done
         done
