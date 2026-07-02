@@ -47,6 +47,8 @@ class TrainConfig:
     UPDATE_EPOCHS: int = 4
     NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
+    GAMMA_CL: float = 0.99
+    CL_BUFFER_SIZE: int = 64
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
@@ -394,6 +396,12 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
+    initial_state: jnp.ndarray
+    initial_action: jnp.ndarray
+    initial_competence: jnp.ndarray
+    goal: jnp.ndarray
+    current_state: jnp.ndarray
+    current_action: jnp.ndarray
 
 
 class TeacherEpisodeCarry(NamedTuple):
@@ -430,6 +438,133 @@ class TeacherFlatBatch(NamedTuple):
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
+
+
+class AgentEpisodeCarry(NamedTuple):
+    initial_state: jnp.ndarray
+    initial_action: jnp.ndarray
+    initial_competence: jnp.ndarray
+
+
+class AgentEpisodeBuffer(NamedTuple):
+    initial_state: jnp.ndarray
+    initial_action: jnp.ndarray
+    initial_competence: jnp.ndarray
+    goal: jnp.ndarray
+    current_state: jnp.ndarray
+    current_action: jnp.ndarray
+    done: jnp.ndarray
+    future_state: jnp.ndarray
+
+
+class AgentEpisodeChunk(NamedTuple):
+    initial_state: jnp.ndarray
+    initial_action: jnp.ndarray
+    initial_competence: jnp.ndarray
+    goal: jnp.ndarray
+    current_state: jnp.ndarray
+    current_action: jnp.ndarray
+    done: jnp.ndarray
+
+
+def sample_future_states(rng, obs, dones, gamma):
+    """Sample one discounted future state per timestep and environment.
+
+    Parameters
+    ----------
+    rng : jax.random.PRNGKey
+    obs : jnp.ndarray, shape (T, N, ...)
+        Buffered observations for T timesteps across N environments.
+    dones : jnp.ndarray, shape (T, N)
+        Terminal flags aligned with ``obs``.
+    gamma : float
+        Discount factor for geometric sampling over future timesteps.
+    """
+    max_steps = obs.shape[0]
+    num_envs = obs.shape[1]
+    all_indices = jnp.arange(max_steps, dtype=jnp.int32)
+    env_indices = jnp.arange(num_envs, dtype=jnp.int32)
+    rngs = jax.random.split(rng, max_steps)
+
+    dones = dones.astype(bool).at[-1].set(jnp.ones((num_envs,), dtype=bool))
+    gamma = jnp.asarray(gamma, dtype=jnp.float32)
+
+    def _sample_one_step(_, inputs):
+        i, rng_i = inputs
+        valid_done = dones & (all_indices[:, None] >= i)
+        first_done_after_i = jnp.argmax(valid_done, axis=0)
+        diff = all_indices - i
+        mask = (all_indices[:, None] >= i) & (
+            all_indices[:, None] <= first_done_after_i[None, :]
+        )
+        diff = jnp.maximum(diff, 0)
+        probs = jnp.power(gamma, diff.astype(jnp.float32))[:, None]
+        probs = jnp.where(mask, probs, 0.0)
+        probs_sum = jnp.sum(probs, axis=0, keepdims=True)
+        probs = probs / jnp.maximum(probs_sum, 1e-12)
+
+        sampled_t = jax.random.categorical(
+            rng_i, jnp.log(jnp.clip(probs.T, a_min=1e-20, a_max=1.0)), axis=-1
+        )
+        future_obs_i = obs[sampled_t, env_indices]
+        return None, future_obs_i
+
+    _, future_obs = jax.lax.scan(
+        _sample_one_step,
+        None,
+        (all_indices, rngs),
+    )
+    return future_obs
+
+
+def init_agent_episode_carry(num_envs, base_obs_dim, action_dim, num_competence, dtype):
+    return AgentEpisodeCarry(
+        initial_state=jnp.zeros((num_envs, base_obs_dim), dtype=dtype),
+        initial_action=jnp.zeros((num_envs, action_dim), dtype=dtype),
+        initial_competence=jnp.zeros((num_envs, num_competence), dtype=dtype),
+    )
+
+
+def init_agent_episode_buffer(
+    buffer_size, num_envs, base_obs_dim, action_dim, num_competence, dtype
+):
+    return AgentEpisodeBuffer(
+        initial_state=jnp.zeros((buffer_size, num_envs, base_obs_dim), dtype=dtype),
+        initial_action=jnp.zeros((buffer_size, num_envs, action_dim), dtype=dtype),
+        initial_competence=jnp.zeros(
+            (buffer_size, num_envs, num_competence), dtype=dtype
+        ),
+        goal=jnp.zeros((buffer_size, num_envs, 2), dtype=dtype),
+        current_state=jnp.zeros((buffer_size, num_envs, base_obs_dim), dtype=dtype),
+        current_action=jnp.zeros((buffer_size, num_envs, action_dim), dtype=dtype),
+        done=jnp.zeros((buffer_size, num_envs), dtype=bool),
+        future_state=jnp.zeros((buffer_size, num_envs, base_obs_dim), dtype=dtype),
+    )
+
+
+def write_agent_episode_chunk(buffer, ptr, chunk):
+    def _write(field, chunk_field):
+        return jax.lax.dynamic_update_slice_in_dim(
+            field, chunk_field, ptr, axis=0
+        )
+
+    return AgentEpisodeBuffer(
+        initial_state=_write(buffer.initial_state, chunk.initial_state),
+        initial_action=_write(buffer.initial_action, chunk.initial_action),
+        initial_competence=_write(buffer.initial_competence, chunk.initial_competence),
+        goal=_write(buffer.goal, chunk.goal),
+        current_state=_write(buffer.current_state, chunk.current_state),
+        current_action=_write(buffer.current_action, chunk.current_action),
+        done=_write(buffer.done, chunk.done),
+        future_state=buffer.future_state,
+    )
+
+
+def fill_agent_episode_future_states(buffer, rng, gamma):
+    future_state = sample_future_states(
+        rng, buffer.current_state, buffer.done, gamma
+    )
+    return buffer._replace(future_state=future_state)
 
 
 def init_teacher_episode_carry(num_envs, teacher_obs_dim, dtype):
@@ -578,6 +713,12 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    config.setdefault("GAMMA_CL", 0.99)
+    config.setdefault("CL_BUFFER_SIZE", config["NUM_STEPS"])
+    assert config["CL_BUFFER_SIZE"] > 0, "CL_BUFFER_SIZE must be positive"
+    assert (
+        config["CL_BUFFER_SIZE"] % config["NUM_STEPS"] == 0
+    ), "CL_BUFFER_SIZE must be divisible by NUM_STEPS"
     teacher_batch_size = (
         config["TEACHER_ROLLOUT_BUFFER_SIZE"] * config["NUM_ENVS"]
     )
@@ -654,6 +795,9 @@ def make_train(config):
     teacher_vf_coef = config["TEACHER_VF_COEF"]
     teacher_ent_coef = config["TEACHER_ENT_COEF"]
     teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
+    gamma_cl = config["GAMMA_CL"]
+    cl_buffer_size = int(config["CL_BUFFER_SIZE"])
+    action_dim = int(env.action_space(env_params).shape[0])
     approx_episode_cycles = (
         config["TOTAL_TIMESTEPS"]
         // config["NUM_ENVS"]
@@ -1103,6 +1247,22 @@ def make_train(config):
             teacher_obs_dim,
             obsv.dtype,
         )
+        agent_episode_carry = init_agent_episode_carry(
+            config["NUM_ENVS"],
+            base_obs_dim,
+            action_dim,
+            num_competence,
+            obsv.dtype,
+        )
+        cl_buffer = init_agent_episode_buffer(
+            cl_buffer_size,
+            config["NUM_ENVS"],
+            base_obs_dim,
+            action_dim,
+            num_competence,
+            obsv.dtype,
+        )
+        cl_buffer_ptr = jnp.array(0, dtype=jnp.int32)
         goals = raw_goals
         if condition_on_goal:
             if config["NORMALIZE_ENV"]:
@@ -1143,6 +1303,9 @@ def make_train(config):
                     episode_step_count,
                     teacher_episode_carry,
                     teacher_rollout_buffer,
+                    agent_episode_carry,
+                    cl_buffer,
+                    cl_buffer_ptr,
                     rng,
                 ) = runner_state
 
@@ -1151,6 +1314,7 @@ def make_train(config):
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
+                current_state = last_obs[..., :base_obs_dim]
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -1197,6 +1361,27 @@ def make_train(config):
                 success_part = jnp.where(done, episode_success, 0.0)
 
                 episode_step_count = episode_step_count + 1.0
+                is_episode_start = episode_step_count == 1.0
+                competence_per_env = jnp.broadcast_to(
+                    competence_vector, (config["NUM_ENVS"], num_competence)
+                )
+                agent_episode_carry = AgentEpisodeCarry(
+                    initial_state=jnp.where(
+                        is_episode_start[:, None],
+                        current_state,
+                        agent_episode_carry.initial_state,
+                    ),
+                    initial_action=jnp.where(
+                        is_episode_start[:, None],
+                        action,
+                        agent_episode_carry.initial_action,
+                    ),
+                    initial_competence=jnp.where(
+                        is_episode_start[:, None],
+                        competence_per_env,
+                        agent_episode_carry.initial_competence,
+                    ),
+                )
                 ppo_updates_per_episode = (
                     episode_step_count + config["NUM_STEPS"] - 1
                 ) // config["NUM_STEPS"]
@@ -1310,6 +1495,12 @@ def make_train(config):
                     log_prob,
                     last_obs,
                     info,
+                    agent_episode_carry.initial_state,
+                    agent_episode_carry.initial_action,
+                    agent_episode_carry.initial_competence,
+                    raw_goals,
+                    current_state,
+                    action,
                 )
                 runner_state = (
                     train_state,
@@ -1329,6 +1520,9 @@ def make_train(config):
                     episode_step_count,
                     teacher_episode_carry,
                     teacher_rollout_buffer,
+                    agent_episode_carry,
+                    cl_buffer,
+                    cl_buffer_ptr,
                     rng,
                 )
                 return runner_state, transition
@@ -1337,7 +1531,6 @@ def make_train(config):
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
-            # CALCULATE ADVANTAGE
             (
                 train_state,
                 teacher_train_state,
@@ -1356,8 +1549,49 @@ def make_train(config):
                 episode_step_count,
                 teacher_episode_carry,
                 teacher_rollout_buffer,
+                agent_episode_carry,
+                cl_buffer,
+                cl_buffer_ptr,
                 rng,
             ) = runner_state
+
+            episode_chunk = AgentEpisodeChunk(
+                initial_state=traj_batch.initial_state,
+                initial_action=traj_batch.initial_action,
+                initial_competence=traj_batch.initial_competence,
+                goal=traj_batch.goal,
+                current_state=traj_batch.current_state,
+                current_action=traj_batch.current_action,
+                done=traj_batch.done,
+            )
+            cl_buffer = write_agent_episode_chunk(cl_buffer, cl_buffer_ptr, episode_chunk)
+            new_cl_buffer_ptr = cl_buffer_ptr + config["NUM_STEPS"]
+            cl_buffer_window_full = new_cl_buffer_ptr >= cl_buffer_size
+            # import pdb; pdb.set_trace()
+
+            def _on_cl_buffer_full(operand):
+                buf, ptr, rng_in = operand
+                rng_out, future_rng = jax.random.split(rng_in)
+                new_buf = fill_agent_episode_future_states(buf, future_rng, gamma_cl)
+                return new_buf, jnp.array(0, dtype=jnp.int32), rng_out
+
+            def _on_cl_buffer_not_full(operand):
+                buf, ptr, rng_in = operand
+                return buf, ptr, rng_in
+
+            cl_buffer, cl_buffer_ptr, rng = jax.lax.cond(
+                cl_buffer_window_full,
+                _on_cl_buffer_full,
+                _on_cl_buffer_not_full,
+                (cl_buffer, new_cl_buffer_ptr, rng),
+            )
+            current_states = episode_chunk.current_state
+            future_states = cl_buffer.future_state
+            # jax.debug.print("current_states: {current_states}", current_states=current_states[..., :2])
+            # jax.debug.print("future_states: {future_states}", future_states=future_states[..., :2])
+
+
+            # CALCULATE ADVANTAGE
             _, last_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -1706,6 +1940,7 @@ def make_train(config):
             teacher_buffer_mean_reward_val = teacher_buffer_mean_reward(
                 teacher_rollout_buffer
             )
+            cl_buffer_window_full_f = cl_buffer_window_full.astype(jnp.float32)
 
             jax.lax.cond(
                 jnp.any(done_mask),
@@ -1718,6 +1953,14 @@ def make_train(config):
             )
 
             if config.get("DEBUG"):
+                jax.lax.cond(
+                    cl_buffer_window_full,
+                    lambda: jax.debug.print(
+                        "cl_buffer_window_full, future_state_mean={m}",
+                        m=cl_buffer.future_state.mean(),
+                    ),
+                    lambda: None,
+                )
 
                 def debug_callback(info):
                     return_values = info["returned_episode_returns"][
@@ -1768,6 +2011,7 @@ def make_train(config):
                         teacher_did_update,
                         teacher_current_lr,
                         teacher_update_batch_size,
+                        cl_buffer_window_full_f,
                     ) = args
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
@@ -1808,6 +2052,7 @@ def make_train(config):
                                 teacher_buffer_mean_reward_val
                             ),
                             "teacher/did_update": float(teacher_did_update),
+                            "cl_buffer/window_full": float(cl_buffer_window_full_f),
                         }
                     )
                     if config.get("NORMALIZE_ENV", False):
@@ -1882,6 +2127,7 @@ def make_train(config):
                         teacher_did_update,
                         teacher_current_lr,
                         teacher_update_batch_size,
+                        cl_buffer_window_full_f,
                     ),
                 )
 
@@ -1929,6 +2175,9 @@ def make_train(config):
                 episode_step_count,
                 teacher_episode_carry,
                 teacher_rollout_buffer,
+                agent_episode_carry,
+                cl_buffer,
+                cl_buffer_ptr,
                 rng,
             )
             return runner_state, metric
@@ -1953,18 +2202,25 @@ def make_train(config):
             episode_step_count,
             teacher_episode_carry,
             teacher_rollout_buffer,
+            agent_episode_carry,
+            cl_buffer,
+            cl_buffer_ptr,
             _rng,
         )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
-        final_teacher_rollout_buffer = runner_state[-2]
+        final_teacher_rollout_buffer = runner_state[16]
+        final_cl_buffer = runner_state[18]
+        final_cl_buffer_ptr = runner_state[19]
         return {
             "runner_state": runner_state,
             "metrics": metric,
             "teacher_params": teacher_train_state.params,
             "teacher_train_state": teacher_train_state,
             "teacher_rollout_buffer": final_teacher_rollout_buffer,
+            "cl_buffer": final_cl_buffer,
+            "cl_buffer_ptr": final_cl_buffer_ptr,
         }
 
     return train, render_eval_episode, log_teacher_softmax_snapshot
@@ -1998,6 +2254,9 @@ def main():
         _,
         _,
         final_competence,
+        _,
+        _,
+        _,
         _,
         _,
         _,
