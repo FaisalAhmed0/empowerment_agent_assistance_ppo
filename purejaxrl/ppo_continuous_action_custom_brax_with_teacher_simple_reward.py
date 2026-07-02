@@ -1,3 +1,4 @@
+import math
 import os
 import traceback
 import time
@@ -89,7 +90,16 @@ class TrainConfig:
     TEACHER_SOFTMAX_VIZ_LOG_EVERY_UPDATES: int = 0
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
     TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX: int = 0
-    TEACHER_ROLLOUT_BUFFER_SIZE: int = 10
+    TEACHER_ROLLOUT_BUFFER_SIZE: int = 4
+    TEACHER_NUM_MINIBATCHES: int = 8
+    TEACHER_UPDATE_EPOCHS: int = 4
+    TEACHER_LR: float = 3e-4
+    TEACHER_GAMMA: float = 0.99
+    TEACHER_GAE_LAMBDA: float = 0.8
+    TEACHER_CLIP_EPS: float = 0.2
+    TEACHER_ENT_COEF: float = 0.0
+    TEACHER_VF_COEF: float = 0.5
+    TEACHER_MAX_GRAD_NORM: float = 1.0
 
 
 def _inner_brax_state(state):
@@ -409,6 +419,14 @@ class TeacherRolloutBuffer(NamedTuple):
     count: jnp.ndarray
 
 
+class TeacherFlatBatch(NamedTuple):
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    value: jnp.ndarray
+    reward: jnp.ndarray
+    log_prob: jnp.ndarray
+
+
 def init_teacher_episode_carry(num_envs, teacher_obs_dim, dtype):
     return TeacherEpisodeCarry(
         teacher_obs=jnp.zeros((num_envs, teacher_obs_dim), dtype=dtype),
@@ -491,6 +509,38 @@ def teacher_buffer_mean_reward(buffer):
     return total / jnp.maximum(num_valid.astype(buffer.reward.dtype), 1.0)
 
 
+def flatten_teacher_rollout_buffer(buffer, buffer_size):
+    """Flatten valid ring-buffer slots into a terminal teacher PPO batch."""
+    num_envs = buffer.teacher_obs.shape[1]
+    start = (buffer.write_idx - buffer_size) % buffer_size
+    slot_indices = (start + jnp.arange(buffer_size)) % buffer_size
+
+    def _gather_and_flatten(field):
+        gathered = field[slot_indices]
+        return gathered.reshape((buffer_size * num_envs,) + gathered.shape[2:])
+
+    return TeacherFlatBatch(
+        obs=_gather_and_flatten(buffer.teacher_obs),
+        action=_gather_and_flatten(buffer.goal_idx),
+        value=_gather_and_flatten(buffer.value),
+        reward=_gather_and_flatten(buffer.reward),
+        log_prob=_gather_and_flatten(buffer.log_prob),
+    )
+
+
+def reset_teacher_rollout_buffer(buffer):
+    return TeacherRolloutBuffer(
+        teacher_obs=jnp.zeros_like(buffer.teacher_obs),
+        goal_idx=jnp.zeros_like(buffer.goal_idx),
+        raw_goal=jnp.zeros_like(buffer.raw_goal),
+        log_prob=jnp.zeros_like(buffer.log_prob),
+        value=jnp.zeros_like(buffer.value),
+        reward=jnp.zeros_like(buffer.reward),
+        write_idx=jnp.array(0, dtype=jnp.int32),
+        count=jnp.array(0, dtype=jnp.int32),
+    )
+
+
 def save_checkpoint(train_state, checkpoint_dir):
     """Save a Flax TrainState."""
     checkpointer = ocp.StandardCheckpointer()
@@ -522,6 +572,19 @@ def make_train(config):
     )
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+    )
+    teacher_batch_size = (
+        config["TEACHER_ROLLOUT_BUFFER_SIZE"] * config["NUM_ENVS"]
+    )
+    config["TEACHER_MINIBATCH_SIZE"] = (
+        teacher_batch_size // config["TEACHER_NUM_MINIBATCHES"]
+    )
+    assert (
+        teacher_batch_size
+        == config["TEACHER_MINIBATCH_SIZE"] * config["TEACHER_NUM_MINIBATCHES"]
+    ), (
+        "teacher batch size must equal "
+        "TEACHER_MINIBATCH_SIZE * TEACHER_NUM_MINIBATCHES"
     )
     env_kwargs = config.get("ENV_KWARGS", {})
     custom_env = make_custom_env(
@@ -577,6 +640,34 @@ def make_train(config):
             / config["NUM_UPDATES"]
         )
         return config["LR"] * frac
+
+    teacher_num_minibatches = int(config["TEACHER_NUM_MINIBATCHES"])
+    teacher_update_epochs = int(config["TEACHER_UPDATE_EPOCHS"])
+    teacher_gamma = config["TEACHER_GAMMA"]
+    teacher_gae_lambda = config["TEACHER_GAE_LAMBDA"]
+    teacher_clip_eps = config["TEACHER_CLIP_EPS"]
+    teacher_vf_coef = config["TEACHER_VF_COEF"]
+    teacher_ent_coef = config["TEACHER_ENT_COEF"]
+    teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
+    approx_episode_cycles = (
+        config["TOTAL_TIMESTEPS"]
+        // config["NUM_ENVS"]
+        // config.get("EPISODE_LENGTH", 1000)
+    )
+    teacher_num_updates = max(
+        1, approx_episode_cycles // teacher_rollout_buffer_size
+    )
+
+    def teacher_linear_schedule(count):
+        frac = (
+            1.0
+            - (
+                count
+                // (teacher_num_minibatches * teacher_update_epochs)
+            )
+            / teacher_num_updates
+        )
+        return config["TEACHER_LR"] * frac
 
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
@@ -890,25 +981,38 @@ def make_train(config):
             tx=tx,
         )
         rng, goal_rng, teacher_init_rng, _rng = jax.random.split(rng, 4)
-        teacher_params = teacher_network.init(
+        teacher_init_params = teacher_network.init(
             teacher_init_rng, jnp.zeros((teacher_obs_dim,))
+        )
+        if config["ANNEAL_LR"]:
+            teacher_tx = optax.chain(
+                optax.clip_by_global_norm(config["TEACHER_MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=teacher_linear_schedule, eps=1e-5),
+            )
+        else:
+            teacher_tx = optax.chain(
+                optax.clip_by_global_norm(config["TEACHER_MAX_GRAD_NORM"]),
+                optax.adam(config["TEACHER_LR"], eps=1e-5),
+            )
+        teacher_train_state = TrainState.create(
+            apply_fn=teacher_network.apply,
+            params=teacher_init_params,
+            tx=teacher_tx,
         )
 
         def sample_teacher_goals(obs, competence_vector, rng):
             return _sample_teacher_goals(
-                teacher_params, obs, competence_vector, rng
+                teacher_train_state.params, obs, competence_vector, rng
             )
 
         def teacher_act_and_carry(obs, competence_vector, rng):
             raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs = (
-                _teacher_act(teacher_params, obs, competence_vector, rng)
+                _teacher_act(teacher_train_state.params, obs, competence_vector, rng)
             )
             carry = teacher_carry_from_act(
                 raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs
             )
             return raw_goal, carry
-
-        teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
 
         def compute_competence_vector(student_params, stats_state):
             return evaluate_multiple_goals(
@@ -993,6 +1097,7 @@ def make_train(config):
             def _env_step(runner_state, unused):
                 (
                     train_state,
+                    teacher_train_state,
                     env_state,
                     last_obs,
                     goals,
@@ -1067,7 +1172,7 @@ def make_train(config):
                     teacher_value,
                     teacher_obs,
                 ) = _teacher_act(
-                    teacher_params,
+                    teacher_train_state.params,
                     obsv[..., :base_obs_dim],
                     competence_vector,
                     goal_rng,
@@ -1115,6 +1220,7 @@ def make_train(config):
                 )
                 runner_state = (
                     train_state,
+                    teacher_train_state,
                     env_state,
                     obsv,
                     goals,
@@ -1138,6 +1244,7 @@ def make_train(config):
             # CALCULATE ADVANTAGE
             (
                 train_state,
+                teacher_train_state,
                 env_state,
                 last_obs,
                 goals,
@@ -1263,8 +1370,169 @@ def make_train(config):
             train_state = update_state[0]
             metric = traj_batch.info
             rng = update_state[-1]
-            # import pdb; pdb.set_trace()
             total_loss = loss_info[0].mean()
+
+            teacher_should_update = (
+                teacher_rollout_buffer.count >= teacher_rollout_buffer_size
+            ) & use_average_competence_reward
+
+            def _teacher_calculate_gae(traj, last_val):
+                def _get_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done = jnp.array(1.0, dtype=transition.value.dtype)
+                    delta = (
+                        transition.reward
+                        + teacher_gamma * next_value * (1 - done)
+                        - transition.value
+                    )
+                    gae = (
+                        delta
+                        + teacher_gamma * teacher_gae_lambda * (1 - done) * gae
+                    )
+                    return (gae, transition.value), gae
+
+                _, advantages = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.array(0.0, dtype=last_val.dtype), last_val),
+                    traj,
+                    reverse=True,
+                    unroll=16,
+                )
+                return advantages, advantages + traj.value
+
+            def _run_teacher_update(operands):
+                t_train_state, t_buffer, t_rng = operands
+                flat_batch = flatten_teacher_rollout_buffer(
+                    t_buffer, teacher_rollout_buffer_size
+                )
+                last_val = jnp.array(0.0, dtype=flat_batch.value.dtype)
+                advantages, targets = _teacher_calculate_gae(flat_batch, last_val)
+
+                def _t_update_epoch(update_state, unused):
+                    def _t_update_minibatch(t_state, batch_info):
+                        traj_b, gae_b, tgt_b = batch_info
+
+                        def _t_loss_fn(params, traj_b, gae, targets):
+                            pi, value = teacher_network.apply(params, traj_b.obs)
+                            log_prob = pi.log_prob(traj_b.action)
+                            value_pred_clipped = traj_b.value + (
+                                value - traj_b.value
+                            ).clip(-teacher_clip_eps, teacher_clip_eps)
+                            value_losses = jnp.square(value - targets)
+                            value_losses_clipped = jnp.square(
+                                value_pred_clipped - targets
+                            )
+                            value_loss = 0.5 * jnp.maximum(
+                                value_losses, value_losses_clipped
+                            ).mean()
+                            ratio = jnp.exp(log_prob - traj_b.log_prob)
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                            loss_actor1 = ratio * gae
+                            loss_actor2 = (
+                                jnp.clip(
+                                    ratio,
+                                    1.0 - teacher_clip_eps,
+                                    1.0 + teacher_clip_eps,
+                                )
+                                * gae
+                            )
+                            loss_actor = -jnp.minimum(loss_actor1, loss_actor2).mean()
+                            entropy = pi.entropy().mean()
+                            total_loss = (
+                                loss_actor
+                                + teacher_vf_coef * value_loss
+                                - teacher_ent_coef * entropy
+                            )
+                            return total_loss, (value_loss, loss_actor, entropy)
+
+                        grad_fn = jax.value_and_grad(_t_loss_fn, has_aux=True)
+                        total_loss, grads = grad_fn(
+                            t_state.params, traj_b, gae_b, tgt_b
+                        )
+                        t_state = t_state.apply_gradients(grads=grads)
+                        return t_state, total_loss
+
+                    t_state, traj_b, advantages_b, targets_b, rng_b = update_state
+                    rng_b, _rng_b = jax.random.split(rng_b)
+                    permutation = jax.random.permutation(_rng_b, teacher_batch_size)
+                    batch = (traj_b, advantages_b, targets_b)
+                    shuffled_batch = jax.tree_util.tree_map(
+                        lambda x: jnp.take(x, permutation, axis=0), batch
+                    )
+                    minibatches = jax.tree_util.tree_map(
+                        lambda x: jnp.reshape(
+                            x,
+                            [teacher_num_minibatches, -1] + list(x.shape[1:]),
+                        ),
+                        shuffled_batch,
+                    )
+                    t_state, total_loss = jax.lax.scan(
+                        _t_update_minibatch, t_state, minibatches
+                    )
+                    update_state = (
+                        t_state,
+                        traj_b,
+                        advantages_b,
+                        targets_b,
+                        rng_b,
+                    )
+                    return update_state, total_loss
+
+                t_rng, epoch_rng = jax.random.split(t_rng)
+                update_state = (
+                    t_train_state,
+                    flat_batch,
+                    advantages,
+                    targets,
+                    epoch_rng,
+                )
+                update_state, t_loss_info = jax.lax.scan(
+                    _t_update_epoch, update_state, None, teacher_update_epochs
+                )
+                t_train_state = update_state[0]
+                new_buffer = reset_teacher_rollout_buffer(t_buffer)
+                metrics = (
+                    t_loss_info[0].mean(),
+                    t_loss_info[1][0].mean(),
+                    t_loss_info[1][1].mean(),
+                    t_loss_info[1][2].mean(),
+                    jnp.array(1.0, dtype=jnp.float32),
+                    jnp.array(float(teacher_batch_size), dtype=jnp.float32),
+                )
+                return t_train_state, new_buffer, t_rng, metrics
+
+            def _skip_teacher_update(operands):
+                t_train_state, t_buffer, t_rng = operands
+                z = jnp.array(0.0, dtype=jnp.float32)
+                return t_train_state, t_buffer, t_rng, (z, z, z, z, z, z)
+
+            (
+                teacher_train_state,
+                teacher_rollout_buffer,
+                rng,
+                teacher_metrics,
+            ) = jax.lax.cond(
+                teacher_should_update,
+                _run_teacher_update,
+                _skip_teacher_update,
+                (teacher_train_state, teacher_rollout_buffer, rng),
+            )
+            teacher_total_loss = teacher_metrics[0]
+            teacher_value_loss = teacher_metrics[1]
+            teacher_actor_loss = teacher_metrics[2]
+            teacher_entropy = teacher_metrics[3]
+            teacher_did_update = teacher_metrics[4]
+            teacher_update_batch_size = teacher_metrics[5]
+            teacher_current_lr = (
+                teacher_linear_schedule(
+                    update_idx
+                    * teacher_num_minibatches
+                    * teacher_update_epochs
+                )
+                if config["ANNEAL_LR"]
+                else config["TEACHER_LR"]
+            )
+
             value_loss = loss_info[1][0].mean()
             actor_loss = loss_info[1][1].mean()
             entropy = loss_info[1][2].mean()
@@ -1367,22 +1635,29 @@ def make_train(config):
                         teacher_average_competence_reward_all_steps,
                         teacher_buffer_count,
                         teacher_buffer_mean_reward_val,
+                        teacher_total_loss,
+                        teacher_value_loss,
+                        teacher_actor_loss,
+                        teacher_entropy,
+                        teacher_did_update,
+                        teacher_current_lr,
+                        teacher_update_batch_size,
                     ) = args
+                    return_values = info["returned_episode_returns"][
+                        info["returned_episode"]
+                    ]
+                    if len(return_values) == 0:
+                        return
+
                     now = time.perf_counter()
-                    log_metrics = {}
+                    log_metrics = {"episodic_return": float(return_values.mean())}
                     if _wandb_timer["last_time"] is not None:
                         elapsed = now - _wandb_timer["last_time"]
                         if elapsed > 0:
                             log_metrics["sps"] = float(steps_per_update / elapsed)
                     _wandb_timer["last_time"] = now
 
-                    # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
-                    return_values = info["returned_episode_returns"][
-                        info["returned_episode"]
-                    ]
-                    if len(return_values) > 0:
-                        log_metrics["episodic_return"] = float(return_values.mean())
                     log_metrics.update(
                         {
                             "total_loss": float(total_loss),
@@ -1398,12 +1673,7 @@ def make_train(config):
                             "goal_reward_running_mean": float(goal_reward_running_mean),
                             "goal_reward_running_std": float(goal_reward_running_std),
                             "learning_rate": float(current_lr),
-                            "obs_norm_mean": float(obs_norm_mean),
-                            "obs_norm_var": float(obs_norm_var),
                             "student_competence_mean": float(competence_mean),
-                            "teacher/average_competence_reward": float(
-                                teacher_average_competence_reward
-                            ),
                             "teacher/average_competence_reward_all_steps": float(
                                 teacher_average_competence_reward_all_steps
                             ),
@@ -1411,8 +1681,30 @@ def make_train(config):
                             "teacher/buffer_mean_reward": float(
                                 teacher_buffer_mean_reward_val
                             ),
+                            "teacher/did_update": float(teacher_did_update),
                         }
                     )
+                    if config.get("NORMALIZE_ENV", False):
+                        log_metrics["obs_norm_mean"] = float(obs_norm_mean)
+                        log_metrics["obs_norm_var"] = float(obs_norm_var)
+                    avg_competence_at_done = float(teacher_average_competence_reward)
+                    if math.isfinite(avg_competence_at_done):
+                        log_metrics["teacher/average_competence_reward"] = (
+                            avg_competence_at_done
+                        )
+                    if float(teacher_did_update) > 0:
+                        log_metrics.update(
+                            {
+                                "teacher/total_loss": float(teacher_total_loss),
+                                "teacher/value_loss": float(teacher_value_loss),
+                                "teacher/actor_loss": float(teacher_actor_loss),
+                                "teacher/entropy": float(teacher_entropy),
+                                "teacher/learning_rate": float(teacher_current_lr),
+                                "teacher/batch_size": float(
+                                    teacher_update_batch_size
+                                ),
+                            }
+                        )
                     wandb.log(log_metrics, step=step)
 
                 jax.debug.callback(
@@ -1439,6 +1731,13 @@ def make_train(config):
                         teacher_average_competence_reward_all_steps,
                         teacher_buffer_count,
                         teacher_buffer_mean_reward_val,
+                        teacher_total_loss,
+                        teacher_value_loss,
+                        teacher_actor_loss,
+                        teacher_entropy,
+                        teacher_did_update,
+                        teacher_current_lr,
+                        teacher_update_batch_size,
                     ),
                 )
 
@@ -1451,7 +1750,7 @@ def make_train(config):
                 )
                 ref_base_obs = last_obs[ref_env_index, :base_obs_dim]
                 teacher_obs = _build_teacher_input(ref_base_obs, competence_vector)
-                pi, _ = teacher_network.apply(teacher_params, teacher_obs)
+                pi, _ = teacher_network.apply(teacher_train_state.params, teacher_obs)
                 probs_snapshot = pi.probs.reshape(-1)
 
                 def _softmax_viz_callback(args):
@@ -1470,6 +1769,7 @@ def make_train(config):
 
             runner_state = (
                 train_state,
+                teacher_train_state,
                 env_state,
                 last_obs,
                 goals,
@@ -1490,6 +1790,7 @@ def make_train(config):
         reward_dtype = obsv.dtype
         runner_state = (
             train_state,
+            teacher_train_state,
             env_state,
             obsv,
             goals,
@@ -1511,7 +1812,8 @@ def make_train(config):
         return {
             "runner_state": runner_state,
             "metrics": metric,
-            "teacher_params": teacher_params,
+            "teacher_params": teacher_train_state.params,
+            "teacher_train_state": teacher_train_state,
             "teacher_rollout_buffer": final_teacher_rollout_buffer,
         }
 
@@ -1540,6 +1842,7 @@ def main():
     jax.block_until_ready(train_output["runner_state"][-1])
     (
         final_train_state,
+        _final_teacher_train_state,
         final_env_state,
         final_last_obs,
         _,
