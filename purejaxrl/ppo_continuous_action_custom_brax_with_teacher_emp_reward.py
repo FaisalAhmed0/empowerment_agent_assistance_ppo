@@ -89,7 +89,7 @@ class TrainConfig:
     NUM_EVAL_ENVS: int = 32
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
-    USE_LEARNING_PROGRESS_REWARD: bool = True
+    USE_LEARNING_PROGRESS_REWARD: bool = False
     ABSOLUTE_LEARNING_PROGRESS: bool = False
     TEACHER_SOFTMAX_VIZ_LOG_EVERY_UPDATES: int = 0
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
@@ -109,6 +109,10 @@ class TrainConfig:
     EMPOWERMENT_MAX_GRAD_NORM: float = 1.0
     EMPOWERMENT_REPR_DIM: int = 64
     EMPOWERMENT_HIDDEN_DIM: int = 256
+    EMPOWERMENT_UPDATE_EPOCHS: int = 1
+    EMPOWERMENT_NUM_MINIBATCHES: int = 1
+    EMPOWERMENT_ENERGY_FN: str = "l2"
+    EMPOWERMENT_CONTRASTIVE_LOSS: str = "fwd_infonce"
 
 
 def _inner_brax_state(state):
@@ -563,6 +567,43 @@ class AgentEpisodeChunk(NamedTuple):
     done: jnp.ndarray
 
 
+def energy_fn(name, x, y):
+    if name == "norm":
+        return -jnp.sqrt(jnp.sum((x - y) ** 2, axis=-1) + 1e-6)
+    elif name == "dot":
+        return jnp.sum(x * y, axis=-1)
+    elif name == "cosine":
+        return jnp.sum(x * y, axis=-1) / (
+            jnp.linalg.norm(x) * jnp.linalg.norm(y) + 1e-6
+        )
+    elif name == "l2":
+        return -jnp.sum((x - y) ** 2, axis=-1)
+    else:
+        raise ValueError(f"Unknown energy function: {name}")
+
+
+def contrastive_loss_fn(name, logits):
+    if name == "fwd_infonce":
+        critic_loss = -jnp.mean(
+            jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1)
+        )
+    elif name == "bwd_infonce":
+        critic_loss = -jnp.mean(
+            jnp.diag(logits) - jax.nn.logsumexp(logits, axis=0)
+        )
+    elif name == "sym_infonce":
+        critic_loss = -jnp.mean(
+            2 * jnp.diag(logits)
+            - jax.nn.logsumexp(logits, axis=1)
+            - jax.nn.logsumexp(logits, axis=0)
+        )
+    elif name == "binary_nce":
+        critic_loss = -jnp.mean(jax.nn.sigmoid(logits))
+    else:
+        raise ValueError(f"Unknown contrastive loss function: {name}")
+    return critic_loss
+
+
 def sample_future_states(rng, obs, dones, gamma):
     """Sample one discounted future state per timestep and environment.
 
@@ -665,6 +706,25 @@ def fill_agent_episode_future_states(buffer, rng, gamma):
         rng, buffer.current_state, buffer.done, gamma
     )
     return buffer._replace(future_state=future_state)
+
+
+def flatten_cl_buffer(buffer):
+    """Flatten CL buffer from (T, N, ...) to (T * N, ...) per field."""
+
+    def _flatten(field):
+        return field.reshape((field.shape[0] * field.shape[1],) + field.shape[2:])
+
+    return AgentEpisodeBuffer(
+        initial_state=_flatten(buffer.initial_state),
+        initial_action=_flatten(buffer.initial_action),
+        initial_competence=_flatten(buffer.initial_competence),
+        competence_vector=_flatten(buffer.competence_vector),
+        goal=_flatten(buffer.goal),
+        current_state=_flatten(buffer.current_state),
+        current_action=_flatten(buffer.current_action),
+        done=_flatten(buffer.done),
+        future_state=_flatten(buffer.future_state),
+    )
 
 
 def init_teacher_episode_carry(num_envs, teacher_obs_dim, dtype):
@@ -832,6 +892,18 @@ def make_train(config):
         "teacher batch size must equal "
         "TEACHER_MINIBATCH_SIZE * TEACHER_NUM_MINIBATCHES"
     )
+    empowerment_batch_size = config["CL_BUFFER_SIZE"] * config["NUM_ENVS"]
+    config["EMPOWERMENT_MINIBATCH_SIZE"] = (
+        empowerment_batch_size // config["EMPOWERMENT_NUM_MINIBATCHES"]
+    )
+    assert (
+        empowerment_batch_size
+        == config["EMPOWERMENT_MINIBATCH_SIZE"]
+        * config["EMPOWERMENT_NUM_MINIBATCHES"]
+    ), (
+        "empowerment batch size must equal "
+        "EMPOWERMENT_MINIBATCH_SIZE * EMPOWERMENT_NUM_MINIBATCHES"
+    )
     env_kwargs = config.get("ENV_KWARGS", {})
     custom_env = make_custom_env(
         env_name=config["ENV_NAME"],
@@ -897,6 +969,10 @@ def make_train(config):
     teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
     gamma_cl = config["GAMMA_CL"]
     cl_buffer_size = int(config["CL_BUFFER_SIZE"])
+    empowerment_num_minibatches = int(config["EMPOWERMENT_NUM_MINIBATCHES"])
+    empowerment_update_epochs = int(config["EMPOWERMENT_UPDATE_EPOCHS"])
+    empowerment_energy_fn = config["EMPOWERMENT_ENERGY_FN"]
+    empowerment_contrastive_loss = config["EMPOWERMENT_CONTRASTIVE_LOSS"]
     action_dim = int(env.action_space(env_params).shape[0])
     approx_episode_cycles = (
         config["TOTAL_TIMESTEPS"]
@@ -954,7 +1030,7 @@ def make_train(config):
     empowerment_network = EmpowermentModel(
         repr_dim=int(config["EMPOWERMENT_REPR_DIM"]),
         hidden_dim=int(config["EMPOWERMENT_HIDDEN_DIM"]),
-        activation=config["ACTIVATION"],
+        activation="relu",
     )
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
@@ -1414,6 +1490,7 @@ def make_train(config):
                 (
                     train_state,
                     teacher_train_state,
+                    empowerment_train_state,
                     env_state,
                     last_obs,
                     goals,
@@ -1632,6 +1709,7 @@ def make_train(config):
                 runner_state = (
                     train_state,
                     teacher_train_state,
+                    empowerment_train_state,
                     env_state,
                     obsv,
                     goals,
@@ -1661,6 +1739,7 @@ def make_train(config):
             (
                 train_state,
                 teacher_train_state,
+                empowerment_train_state,
                 env_state,
                 last_obs,
                 goals,
@@ -1834,6 +1913,104 @@ def make_train(config):
             metric = traj_batch.info
             rng = update_state[-1]
             total_loss = loss_info[0].mean()
+
+            def _run_empowerment_update(operands):
+                e_state, buf, rng_in = operands
+                flat_batch = flatten_cl_buffer(buf)
+
+                def _e_update_epoch(update_state, unused):
+                    def _e_update_minibatch(e_state, batch):
+                        def _e_loss_fn(params, batch):
+                            repr = empowerment_network.apply(
+                                params,
+                                batch.initial_state,
+                                batch.initial_action,
+                                batch.goal,
+                                batch.current_action,
+                                batch.future_state,
+                                batch.competence_vector,
+                            )
+                            logits_13 = energy_fn(
+                                empowerment_energy_fn,
+                                repr.action_cond_repr[:, None, :],
+                                repr.future_state_repr[None, :, :],
+                            )
+                            logits_23 = energy_fn(
+                                empowerment_energy_fn,
+                                repr.context_repr[:, None, :],
+                                repr.future_state_repr[None, :, :],
+                            )
+                            loss_13 = contrastive_loss_fn(
+                                empowerment_contrastive_loss, logits_13
+                            )
+                            loss_23 = contrastive_loss_fn(
+                                empowerment_contrastive_loss, logits_23
+                            )
+                            return loss_13 + loss_23, (loss_13, loss_23)
+
+                        grad_fn = jax.value_and_grad(_e_loss_fn, has_aux=True)
+                        (total_loss, (loss_13, loss_23)), grads = grad_fn(
+                            e_state.params, batch
+                        )
+                        e_state = e_state.apply_gradients(grads=grads)
+                        return e_state, jnp.stack(
+                            [total_loss, loss_13, loss_23], axis=0
+                        )
+
+                    e_state, flat_batch, rng_b = update_state
+                    rng_b, _rng_b = jax.random.split(rng_b)
+                    permutation = jax.random.permutation(
+                        _rng_b, empowerment_batch_size
+                    )
+                    shuffled_batch = jax.tree_util.tree_map(
+                        lambda x: jnp.take(x, permutation, axis=0), flat_batch
+                    )
+                    minibatches = jax.tree_util.tree_map(
+                        lambda x: jnp.reshape(
+                            x,
+                            [empowerment_num_minibatches, -1] + list(x.shape[1:]),
+                        ),
+                        shuffled_batch,
+                    )
+                    e_state, step_losses = jax.lax.scan(
+                        _e_update_minibatch, e_state, minibatches
+                    )
+                    return (e_state, flat_batch, rng_b), step_losses.mean(axis=0)
+
+                rng_in, epoch_rng = jax.random.split(rng_in)
+                update_state = (e_state, flat_batch, epoch_rng)
+                update_state, e_loss_info = jax.lax.scan(
+                    _e_update_epoch, update_state, None, empowerment_update_epochs
+                )
+                e_state = update_state[0]
+                metrics = (
+                    e_loss_info[:, 0].mean(),
+                    e_loss_info[:, 1].mean(),
+                    e_loss_info[:, 2].mean(),
+                    jnp.array(1.0, dtype=jnp.float32),
+                )
+                return e_state, buf, rng_in, metrics
+
+            def _skip_empowerment_update(operands):
+                e_state, buf, rng_in = operands
+                z = jnp.array(0.0, dtype=jnp.float32)
+                return e_state, buf, rng_in, (z, z, z, z)
+
+            (
+                empowerment_train_state,
+                cl_buffer,
+                rng,
+                empowerment_metrics,
+            ) = jax.lax.cond(
+                cl_buffer_window_full,
+                _run_empowerment_update,
+                _skip_empowerment_update,
+                (empowerment_train_state, cl_buffer, rng),
+            )
+            empowerment_total_loss = empowerment_metrics[0]
+            empowerment_loss_enc1_enc3 = empowerment_metrics[1]
+            empowerment_loss_enc2_enc3 = empowerment_metrics[2]
+            empowerment_did_update = empowerment_metrics[3]
 
             teacher_should_update = (
                 teacher_rollout_buffer.count >= teacher_rollout_buffer_size
@@ -2072,25 +2249,25 @@ def make_train(config):
             )
             cl_buffer_window_full_f = cl_buffer_window_full.astype(jnp.float32)
 
-            jax.lax.cond(
-                jnp.any(done_mask),
-                lambda: jax.debug.print(
-                    "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
-                    lp=teacher_average_learning_progress,
-                    u=average_ppo_updates_per_episode,
-                ),
-                lambda: None,
-            )
+            # jax.lax.cond(
+            #     jnp.any(done_mask),
+            #     lambda: jax.debug.print(
+            #         "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
+            #         lp=teacher_average_learning_progress,
+            #         u=average_ppo_updates_per_episode,
+            #     ),
+            #     lambda: None,
+            # )
 
             if config.get("DEBUG"):
-                jax.lax.cond(
-                    cl_buffer_window_full,
-                    lambda: jax.debug.print(
-                        "cl_buffer_window_full, future_state_mean={m}",
-                        m=cl_buffer.future_state.mean(),
-                    ),
-                    lambda: None,
-                )
+                # jax.lax.cond(
+                #     cl_buffer_window_full,
+                #     lambda: jax.debug.print(
+                #         "cl_buffer_window_full, future_state_mean={m}",
+                #         m=cl_buffer.future_state.mean(),
+                #     ),
+                #     lambda: None,
+                # )
 
                 def debug_callback(info):
                     return_values = info["returned_episode_returns"][
@@ -2142,6 +2319,10 @@ def make_train(config):
                         teacher_current_lr,
                         teacher_update_batch_size,
                         cl_buffer_window_full_f,
+                        empowerment_total_loss,
+                        empowerment_loss_enc1_enc3,
+                        empowerment_loss_enc2_enc3,
+                        empowerment_did_update,
                     ) = args
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
@@ -2183,8 +2364,23 @@ def make_train(config):
                             ),
                             "teacher/did_update": float(teacher_did_update),
                             "cl_buffer/window_full": float(cl_buffer_window_full_f),
+                            "empowerment/did_update": float(empowerment_did_update),
                         }
                     )
+                    if float(empowerment_did_update) > 0:
+                        log_metrics.update(
+                            {
+                                "empowerment/total_loss": float(
+                                    empowerment_total_loss
+                                ),
+                                "empowerment/loss_enc1_enc3": float(
+                                    empowerment_loss_enc1_enc3
+                                ),
+                                "empowerment/loss_enc2_enc3": float(
+                                    empowerment_loss_enc2_enc3
+                                ),
+                            }
+                        )
                     if config.get("NORMALIZE_ENV", False):
                         log_metrics["obs_norm_mean"] = float(obs_norm_mean)
                         log_metrics["obs_norm_var"] = float(obs_norm_var)
@@ -2258,6 +2454,10 @@ def make_train(config):
                         teacher_current_lr,
                         teacher_update_batch_size,
                         cl_buffer_window_full_f,
+                        empowerment_total_loss,
+                        empowerment_loss_enc1_enc3,
+                        empowerment_loss_enc2_enc3,
+                        empowerment_did_update,
                     ),
                 )
 
@@ -2290,6 +2490,7 @@ def make_train(config):
             runner_state = (
                 train_state,
                 teacher_train_state,
+                empowerment_train_state,
                 env_state,
                 last_obs,
                 goals,
@@ -2317,6 +2518,7 @@ def make_train(config):
         runner_state = (
             train_state,
             teacher_train_state,
+            empowerment_train_state,
             env_state,
             obsv,
             goals,
@@ -2340,15 +2542,16 @@ def make_train(config):
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
-        final_teacher_rollout_buffer = runner_state[16]
-        final_cl_buffer = runner_state[18]
-        final_cl_buffer_ptr = runner_state[19]
+        final_teacher_rollout_buffer = runner_state[17]
+        final_cl_buffer = runner_state[19]
+        final_cl_buffer_ptr = runner_state[20]
+        final_empowerment_train_state = runner_state[2]
         return {
             "runner_state": runner_state,
             "metrics": metric,
             "teacher_params": teacher_train_state.params,
             "teacher_train_state": teacher_train_state,
-            "empowerment_train_state": empowerment_train_state,
+            "empowerment_train_state": final_empowerment_train_state,
             "teacher_rollout_buffer": final_teacher_rollout_buffer,
             "cl_buffer": final_cl_buffer,
             "cl_buffer_ptr": final_cl_buffer_ptr,
@@ -2380,6 +2583,7 @@ def main():
     (
         final_train_state,
         _final_teacher_train_state,
+        _final_empowerment_train_state,
         final_env_state,
         final_last_obs,
         _,
