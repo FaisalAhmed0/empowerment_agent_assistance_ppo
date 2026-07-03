@@ -104,6 +104,11 @@ class TrainConfig:
     TEACHER_ENT_COEF: float = 0.0
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
+    # Empowerment model
+    EMPOWERMENT_LR: float = 3e-4
+    EMPOWERMENT_MAX_GRAD_NORM: float = 1.0
+    EMPOWERMENT_REPR_DIM: int = 64
+    EMPOWERMENT_HIDDEN_DIM: int = 256
 
 
 def _inner_brax_state(state):
@@ -382,6 +387,94 @@ class TeacherActorCritic(nn.Module):
         return pi, jnp.squeeze(value, axis=-1)
 
 
+class EmpowermentEncoder(nn.Module):
+    repr_dim: int = 64
+    hidden_dim: int = 256
+    activation: str = "tanh"
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        act = nn.relu if self.activation == "relu" else nn.tanh
+        h = act(
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(x)
+        )
+        h = act(
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(h)
+        )
+        return nn.Dense(
+            self.repr_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(h)
+
+
+class EmpowermentRepr(NamedTuple):
+    action_cond_repr: jnp.ndarray
+    context_repr: jnp.ndarray
+    future_state_repr: jnp.ndarray
+
+
+class EmpowermentModel(nn.Module):
+    """Three encoders for empowerment representations.
+
+    Encoder 1 (action_cond):
+        concat(initial_state, initial_action, goal, current_action, competence_vector)
+    Encoder 2 (context):
+        concat(initial_state, initial_action, goal, competence_vector)
+    Encoder 3 (future_state): future_state only
+
+    Each encoder outputs a vector of size ``repr_dim`` (default 64).
+    """
+
+    repr_dim: int = 64
+    hidden_dim: int = 256
+    activation: str = "relu"
+
+    def setup(self):
+        encoder_kwargs = {
+            "repr_dim": self.repr_dim,
+            "hidden_dim": self.hidden_dim,
+            "activation": self.activation,
+        }
+        self.action_cond_encoder = EmpowermentEncoder(**encoder_kwargs)
+        self.context_encoder = EmpowermentEncoder(**encoder_kwargs)
+        self.future_state_encoder = EmpowermentEncoder(**encoder_kwargs)
+
+    def __call__(
+        self,
+        initial_state: jnp.ndarray,
+        initial_action: jnp.ndarray,
+        goal: jnp.ndarray,
+        current_action: jnp.ndarray,
+        future_state: jnp.ndarray,
+        competence_vector: jnp.ndarray,
+    ) -> EmpowermentRepr:
+        action_cond_in = jnp.concatenate(
+            [
+                initial_state,
+                initial_action,
+                goal,
+                current_action,
+                competence_vector,
+            ],
+            axis=-1,
+        )
+        context_in = jnp.concatenate(
+            [initial_state, initial_action, goal, competence_vector], axis=-1
+        )
+        return EmpowermentRepr(
+            action_cond_repr=self.action_cond_encoder(action_cond_in),
+            context_repr=self.context_encoder(context_in),
+            future_state_repr=self.future_state_encoder(future_state),
+        )
+
+
 class Transition(NamedTuple):
     done: jnp.ndarray
     action: jnp.ndarray
@@ -399,6 +492,7 @@ class Transition(NamedTuple):
     initial_state: jnp.ndarray
     initial_action: jnp.ndarray
     initial_competence: jnp.ndarray
+    competence_vector: jnp.ndarray
     goal: jnp.ndarray
     current_state: jnp.ndarray
     current_action: jnp.ndarray
@@ -450,6 +544,7 @@ class AgentEpisodeBuffer(NamedTuple):
     initial_state: jnp.ndarray
     initial_action: jnp.ndarray
     initial_competence: jnp.ndarray
+    competence_vector: jnp.ndarray
     goal: jnp.ndarray
     current_state: jnp.ndarray
     current_action: jnp.ndarray
@@ -461,6 +556,7 @@ class AgentEpisodeChunk(NamedTuple):
     initial_state: jnp.ndarray
     initial_action: jnp.ndarray
     initial_competence: jnp.ndarray
+    competence_vector: jnp.ndarray
     goal: jnp.ndarray
     current_state: jnp.ndarray
     current_action: jnp.ndarray
@@ -534,6 +630,9 @@ def init_agent_episode_buffer(
         initial_competence=jnp.zeros(
             (buffer_size, num_envs, num_competence), dtype=dtype
         ),
+        competence_vector=jnp.zeros(
+            (buffer_size, num_envs, num_competence), dtype=dtype
+        ),
         goal=jnp.zeros((buffer_size, num_envs, 2), dtype=dtype),
         current_state=jnp.zeros((buffer_size, num_envs, base_obs_dim), dtype=dtype),
         current_action=jnp.zeros((buffer_size, num_envs, action_dim), dtype=dtype),
@@ -552,6 +651,7 @@ def write_agent_episode_chunk(buffer, ptr, chunk):
         initial_state=_write(buffer.initial_state, chunk.initial_state),
         initial_action=_write(buffer.initial_action, chunk.initial_action),
         initial_competence=_write(buffer.initial_competence, chunk.initial_competence),
+        competence_vector=_write(buffer.competence_vector, chunk.competence_vector),
         goal=_write(buffer.goal, chunk.goal),
         current_state=_write(buffer.current_state, chunk.current_state),
         current_action=_write(buffer.current_action, chunk.current_action),
@@ -851,6 +951,11 @@ def make_train(config):
         activation=config["ACTIVATION"],
         hidden_dim=config["TEACHER_HIDDEN_DIM"],
     )
+    empowerment_network = EmpowermentModel(
+        repr_dim=int(config["EMPOWERMENT_REPR_DIM"]),
+        hidden_dim=int(config["EMPOWERMENT_HIDDEN_DIM"]),
+        activation=config["ACTIVATION"],
+    )
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
         """Find observation normalization stats in nested wrapped env state."""
@@ -1130,7 +1235,9 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
-        rng, goal_rng, teacher_init_rng, _rng = jax.random.split(rng, 4)
+        rng, goal_rng, teacher_init_rng, empowerment_init_rng, _rng = jax.random.split(
+            rng, 5
+        )
         teacher_init_params = teacher_network.init(
             teacher_init_rng, jnp.zeros((teacher_obs_dim,))
         )
@@ -1148,6 +1255,24 @@ def make_train(config):
             apply_fn=teacher_network.apply,
             params=teacher_init_params,
             tx=teacher_tx,
+        )
+        empowerment_init_params = empowerment_network.init(
+            empowerment_init_rng,
+            jnp.zeros((base_obs_dim,)),
+            jnp.zeros((action_dim,)),
+            jnp.zeros((goal_dim,)),
+            jnp.zeros((action_dim,)),
+            jnp.zeros((base_obs_dim,)),
+            jnp.zeros((num_competence,)),
+        )
+        empowerment_tx = optax.chain(
+            optax.clip_by_global_norm(config["EMPOWERMENT_MAX_GRAD_NORM"]),
+            optax.adam(config["EMPOWERMENT_LR"], eps=1e-5),
+        )
+        empowerment_train_state = TrainState.create(
+            apply_fn=empowerment_network.apply,
+            params=empowerment_init_params,
+            tx=empowerment_tx,
         )
 
         def sample_teacher_goals(obs, competence_vector, rng):
@@ -1236,6 +1361,7 @@ def make_train(config):
             )
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
+        # jax.debug.print("obsv: {obsv}", obsv=obsv[..., :2])
 
         competence_vector = jnp.zeros((num_competence,), dtype=obsv.dtype)
         raw_goals, teacher_episode_carry = teacher_act_and_carry(
@@ -1498,6 +1624,7 @@ def make_train(config):
                     agent_episode_carry.initial_state,
                     agent_episode_carry.initial_action,
                     agent_episode_carry.initial_competence,
+                    competence_per_env,
                     raw_goals,
                     current_state,
                     action,
@@ -1559,6 +1686,7 @@ def make_train(config):
                 initial_state=traj_batch.initial_state,
                 initial_action=traj_batch.initial_action,
                 initial_competence=traj_batch.initial_competence,
+                competence_vector=traj_batch.competence_vector,
                 goal=traj_batch.goal,
                 current_state=traj_batch.current_state,
                 current_action=traj_batch.current_action,
@@ -1587,6 +1715,8 @@ def make_train(config):
             )
             current_states = episode_chunk.current_state
             future_states = cl_buffer.future_state
+            # jax.debug.print("initial_states: {initial_states}", initial_states=traj_batch.initial_state)
+            # jax.debug.print("initial_actions: {initial_actions}", initial_actions=traj_batch.initial_action[..., :2])
             # jax.debug.print("current_states: {current_states}", current_states=current_states[..., :2])
             # jax.debug.print("future_states: {future_states}", future_states=future_states[..., :2])
 
@@ -2218,6 +2348,7 @@ def make_train(config):
             "metrics": metric,
             "teacher_params": teacher_train_state.params,
             "teacher_train_state": teacher_train_state,
+            "empowerment_train_state": empowerment_train_state,
             "teacher_rollout_buffer": final_teacher_rollout_buffer,
             "cl_buffer": final_cl_buffer,
             "cl_buffer_ptr": final_cl_buffer_ptr,
