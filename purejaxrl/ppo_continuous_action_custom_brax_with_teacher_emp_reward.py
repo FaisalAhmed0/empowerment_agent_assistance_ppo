@@ -48,7 +48,7 @@ class TrainConfig:
     NUM_MINIBATCHES: int = 8
     GAMMA: float = 0.99
     GAMMA_CL: float = 0.99
-    CL_BUFFER_SIZE: int = 64
+    CL_BUFFER_SIZE: int = 1000
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
@@ -90,6 +90,8 @@ class TrainConfig:
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = False
+    USE_TEACHER_EMPOWERMENT_REWARD: bool = True
+    TEACHER_EMPOWERMENT_REWARD_COEF: float = 1.0
     ABSOLUTE_LEARNING_PROGRESS: bool = False
     TEACHER_SOFTMAX_VIZ_LOG_EVERY_UPDATES: int = 0
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
@@ -487,6 +489,7 @@ class Transition(NamedTuple):
     task_reward: jnp.ndarray
     goal_reward: jnp.ndarray
     teacher_reward: jnp.ndarray
+    teacher_empowerment_reward: jnp.ndarray
     teacher_success_reward: jnp.ndarray
     teacher_learning_progress_reward: jnp.ndarray
     ppo_updates_per_episode: jnp.ndarray
@@ -708,6 +711,92 @@ def fill_agent_episode_future_states(buffer, rng, gamma):
     return buffer._replace(future_state=future_state)
 
 
+def compute_teacher_empowerment_reward(
+    apply_fn,
+    params,
+    energy_name,
+    initial_state,
+    initial_action,
+    goal,
+    future_state,
+    competence_vector,
+):
+    current_action = initial_action
+
+    def _forward(p):
+        return apply_fn(
+            p,
+            initial_state,
+            initial_action,
+            goal,
+            current_action,
+            future_state,
+            competence_vector,
+        )
+
+    repr = jax.lax.stop_gradient(_forward(params))
+    e13 = energy_fn(energy_name, repr.action_cond_repr, repr.future_state_repr)
+    e23 = energy_fn(energy_name, repr.context_repr, repr.future_state_repr)
+    return jax.lax.stop_gradient(e13 - e23)
+
+
+def compute_teacher_empowerment_reward_batch(
+    apply_fn,
+    params,
+    energy_name,
+    initial_state,
+    initial_action,
+    goal,
+    future_state,
+    competence_vector,
+):
+    return jax.vmap(
+        lambda init_s, init_a, g, fut, comp: compute_teacher_empowerment_reward(
+            apply_fn, params, energy_name, init_s, init_a, g, fut, comp
+        )
+    )(initial_state, initial_action, goal, future_state, competence_vector)
+
+
+def sample_teacher_future_at_init(rng, buffer, episode_len, gamma):
+    """Sample a future state from the row-0 perspective for each env."""
+    rows = jnp.arange(buffer.current_state.shape[0])[:, None]
+    effective_done = jnp.where(
+        rows == (episode_len[None, :] - 1),
+        True,
+        jnp.where(rows >= episode_len[None, :], True, buffer.done),
+    )
+    future = sample_future_states(
+        rng, buffer.current_state, effective_done, gamma
+    )
+    return future[0]
+
+
+def write_episode_step(buffer, ptr, step, is_episode_start):
+    num_envs = step.current_state.shape[0]
+    env_idx = jnp.arange(num_envs)
+    cleared_done = jnp.where(
+        is_episode_start[None, :],
+        jnp.zeros_like(buffer.done),
+        buffer.done,
+    )
+    buffer = buffer._replace(done=cleared_done)
+    return AgentEpisodeBuffer(
+        initial_state=buffer.initial_state.at[ptr, env_idx].set(step.initial_state),
+        initial_action=buffer.initial_action.at[ptr, env_idx].set(step.initial_action),
+        initial_competence=buffer.initial_competence.at[ptr, env_idx].set(
+            step.initial_competence
+        ),
+        competence_vector=buffer.competence_vector.at[ptr, env_idx].set(
+            step.competence_vector
+        ),
+        goal=buffer.goal.at[ptr, env_idx].set(step.goal),
+        current_state=buffer.current_state.at[ptr, env_idx].set(step.current_state),
+        current_action=buffer.current_action.at[ptr, env_idx].set(step.current_action),
+        done=buffer.done.at[ptr, env_idx].set(step.done),
+        future_state=buffer.future_state,
+    )
+
+
 def flatten_cl_buffer(buffer):
     """Flatten CL buffer from (T, N, ...) to (T * N, ...) per field."""
 
@@ -874,11 +963,11 @@ def make_train(config):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     config.setdefault("GAMMA_CL", 0.99)
-    config.setdefault("CL_BUFFER_SIZE", config["NUM_STEPS"])
+    config.setdefault("CL_BUFFER_SIZE", config["EPISODE_LENGTH"])
     assert config["CL_BUFFER_SIZE"] > 0, "CL_BUFFER_SIZE must be positive"
     assert (
-        config["CL_BUFFER_SIZE"] % config["NUM_STEPS"] == 0
-    ), "CL_BUFFER_SIZE must be divisible by NUM_STEPS"
+        config["CL_BUFFER_SIZE"] >= config["NUM_STEPS"]
+    ), "CL_BUFFER_SIZE must be >= NUM_STEPS"
     teacher_batch_size = (
         config["TEACHER_ROLLOUT_BUFFER_SIZE"] * config["NUM_ENVS"]
     )
@@ -1016,6 +1105,8 @@ def make_train(config):
     condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
+    use_teacher_empowerment_reward = config.get("USE_TEACHER_EMPOWERMENT_REWARD", False)
+    teacher_empowerment_reward_coef = config.get("TEACHER_EMPOWERMENT_REWARD_COEF", 1.0)
     update_competence = (
         condition_teacher_on_competence or use_average_competence_reward
     )
@@ -1464,7 +1555,7 @@ def make_train(config):
             num_competence,
             obsv.dtype,
         )
-        cl_buffer_ptr = jnp.array(0, dtype=jnp.int32)
+        episode_buf_ptr = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
         goals = raw_goals
         if condition_on_goal:
             if config["NORMALIZE_ENV"]:
@@ -1508,12 +1599,12 @@ def make_train(config):
                     teacher_rollout_buffer,
                     agent_episode_carry,
                     cl_buffer,
-                    cl_buffer_ptr,
+                    episode_buf_ptr,
                     rng,
                 ) = runner_state
 
                 # SELECT ACTION
-                rng, goal_rng,  _rng = jax.random.split(rng, 3)
+                rng, goal_rng, _rng, teacher_emp_rng = jax.random.split(rng, 4)
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
@@ -1615,8 +1706,51 @@ def make_train(config):
                         operand=None,
                     )
 
+                safe_episode_ptr = jnp.minimum(
+                    episode_buf_ptr, cl_buffer_size - 1
+                )
+                episode_step = AgentEpisodeChunk(
+                    initial_state=agent_episode_carry.initial_state,
+                    initial_action=agent_episode_carry.initial_action,
+                    initial_competence=agent_episode_carry.initial_competence,
+                    competence_vector=competence_per_env,
+                    goal=raw_goals,
+                    current_state=current_state,
+                    current_action=action,
+                    done=done,
+                )
+                cl_buffer = write_episode_step(
+                    cl_buffer, safe_episode_ptr, episode_step, is_episode_start
+                )
+
+                teacher_emp_part = jnp.zeros_like(task_reward)
+                if use_teacher_empowerment_reward:
+                    episode_len = safe_episode_ptr + 1
+                    init_future = sample_teacher_future_at_init(
+                        teacher_emp_rng, cl_buffer, episode_len, gamma_cl
+                    )
+                    emp_reward = compute_teacher_empowerment_reward_batch(
+                        empowerment_network.apply,
+                        empowerment_train_state.params,
+                        empowerment_energy_fn,
+                        cl_buffer.initial_state[0],
+                        cl_buffer.initial_action[0],
+                        cl_buffer.goal[0],
+                        init_future,
+                        cl_buffer.initial_competence[0],
+                    )
+                    teacher_emp_part = jnp.where(done, emp_reward, 0.0)
+
                 teacher_reward = (
-                    competence_part + success_part + learning_progress_part
+                    competence_part
+                    + success_part
+                    + learning_progress_part
+                    + teacher_empowerment_reward_coef * teacher_emp_part
+                )
+                episode_buf_ptr = jnp.where(
+                    done,
+                    0,
+                    jnp.minimum(episode_buf_ptr + 1, cl_buffer_size - 1),
                 )
                 episode_success = jnp.where(done, 0.0, episode_success)
                 teacher_rollout_buffer = push_teacher_rollout_on_done(
@@ -1692,6 +1826,7 @@ def make_train(config):
                     task_reward,
                     goal_reward,
                     teacher_reward,
+                    teacher_emp_part,
                     success_part,
                     learning_progress_part,
                     ppo_updates_at_done,
@@ -1727,7 +1862,7 @@ def make_train(config):
                     teacher_rollout_buffer,
                     agent_episode_carry,
                     cl_buffer,
-                    cl_buffer_ptr,
+                    episode_buf_ptr,
                     rng,
                 )
                 return runner_state, transition
@@ -1757,48 +1892,28 @@ def make_train(config):
                 teacher_rollout_buffer,
                 agent_episode_carry,
                 cl_buffer,
-                cl_buffer_ptr,
+                episode_buf_ptr,
                 rng,
             ) = runner_state
 
-            episode_chunk = AgentEpisodeChunk(
-                initial_state=traj_batch.initial_state,
-                initial_action=traj_batch.initial_action,
-                initial_competence=traj_batch.initial_competence,
-                competence_vector=traj_batch.competence_vector,
-                goal=traj_batch.goal,
-                current_state=traj_batch.current_state,
-                current_action=traj_batch.current_action,
-                done=traj_batch.done,
-            )
-            cl_buffer = write_agent_episode_chunk(cl_buffer, cl_buffer_ptr, episode_chunk)
-            new_cl_buffer_ptr = cl_buffer_ptr + config["NUM_STEPS"]
-            cl_buffer_window_full = new_cl_buffer_ptr >= cl_buffer_size
-            # import pdb; pdb.set_trace()
+            empowerment_should_update = jnp.any(traj_batch.done)
 
-            def _on_cl_buffer_full(operand):
-                buf, ptr, rng_in = operand
+            def _on_episode_done(operand):
+                buf, rng_in = operand
                 rng_out, future_rng = jax.random.split(rng_in)
                 new_buf = fill_agent_episode_future_states(buf, future_rng, gamma_cl)
-                return new_buf, jnp.array(0, dtype=jnp.int32), rng_out
+                return new_buf, rng_out
 
-            def _on_cl_buffer_not_full(operand):
-                buf, ptr, rng_in = operand
-                return buf, ptr, rng_in
+            def _on_episode_not_done(operand):
+                buf, rng_in = operand
+                return buf, rng_in
 
-            cl_buffer, cl_buffer_ptr, rng = jax.lax.cond(
-                cl_buffer_window_full,
-                _on_cl_buffer_full,
-                _on_cl_buffer_not_full,
-                (cl_buffer, new_cl_buffer_ptr, rng),
+            cl_buffer, rng = jax.lax.cond(
+                empowerment_should_update,
+                _on_episode_done,
+                _on_episode_not_done,
+                (cl_buffer, rng),
             )
-            current_states = episode_chunk.current_state
-            future_states = cl_buffer.future_state
-            # jax.debug.print("initial_states: {initial_states}", initial_states=traj_batch.initial_state)
-            # jax.debug.print("initial_actions: {initial_actions}", initial_actions=traj_batch.initial_action[..., :2])
-            # jax.debug.print("current_states: {current_states}", current_states=current_states[..., :2])
-            # jax.debug.print("future_states: {future_states}", future_states=future_states[..., :2])
-
 
             # CALCULATE ADVANTAGE
             _, last_val = network.apply(train_state.params, last_obs)
@@ -2002,7 +2117,7 @@ def make_train(config):
                 rng,
                 empowerment_metrics,
             ) = jax.lax.cond(
-                cl_buffer_window_full,
+                empowerment_should_update,
                 _run_empowerment_update,
                 _skip_empowerment_update,
                 (empowerment_train_state, cl_buffer, rng),
@@ -2014,7 +2129,11 @@ def make_train(config):
 
             teacher_should_update = (
                 teacher_rollout_buffer.count >= teacher_rollout_buffer_size
-            ) & (use_average_competence_reward | use_learning_progress_reward)
+            ) & (
+                use_average_competence_reward
+                | use_learning_progress_reward
+                | use_teacher_empowerment_reward
+            )
 
             def _teacher_calculate_gae(traj, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -2239,6 +2358,13 @@ def make_train(config):
             teacher_average_learning_progress = jnp.nanmean(
                 teacher_learning_progress_at_done
             )
+            teacher_empowerment_at_done = jnp.where(
+                done_mask, traj_batch.teacher_empowerment_reward, jnp.nan
+            )
+            teacher_average_empowerment_reward = jnp.nanmean(teacher_empowerment_at_done)
+            teacher_average_empowerment_reward_all_steps = (
+                traj_batch.teacher_empowerment_reward.mean()
+            )
             ppo_updates_at_done = jnp.where(
                 done_mask, traj_batch.ppo_updates_per_episode, jnp.nan
             )
@@ -2247,7 +2373,7 @@ def make_train(config):
             teacher_buffer_mean_reward_val = teacher_buffer_mean_reward(
                 teacher_rollout_buffer
             )
-            cl_buffer_window_full_f = cl_buffer_window_full.astype(jnp.float32)
+            empowerment_episode_done_f = empowerment_should_update.astype(jnp.float32)
 
             # jax.lax.cond(
             #     jnp.any(done_mask),
@@ -2308,6 +2434,8 @@ def make_train(config):
                         teacher_average_competence_reward_all_steps,
                         teacher_average_success_reward,
                         teacher_average_learning_progress,
+                        teacher_average_empowerment_reward,
+                        teacher_average_empowerment_reward_all_steps,
                         average_ppo_updates_per_episode,
                         teacher_buffer_count,
                         teacher_buffer_mean_reward_val,
@@ -2318,7 +2446,7 @@ def make_train(config):
                         teacher_did_update,
                         teacher_current_lr,
                         teacher_update_batch_size,
-                        cl_buffer_window_full_f,
+                        empowerment_episode_done_f,
                         empowerment_total_loss,
                         empowerment_loss_enc1_enc3,
                         empowerment_loss_enc2_enc3,
@@ -2363,7 +2491,9 @@ def make_train(config):
                                 teacher_buffer_mean_reward_val
                             ),
                             "teacher/did_update": float(teacher_did_update),
-                            "cl_buffer/window_full": float(cl_buffer_window_full_f),
+                            "empowerment/episode_done_trigger": float(
+                                empowerment_episode_done_f
+                            ),
                             "empowerment/did_update": float(empowerment_did_update),
                         }
                     )
@@ -2399,6 +2529,14 @@ def make_train(config):
                         log_metrics["teacher/average_learning_progress_reward"] = (
                             avg_learning_progress
                         )
+                    avg_empowerment_at_done = float(teacher_average_empowerment_reward)
+                    if math.isfinite(avg_empowerment_at_done):
+                        log_metrics["teacher/empowerment_reward_at_done"] = (
+                            avg_empowerment_at_done
+                        )
+                    log_metrics["teacher/empowerment_reward_all_steps"] = float(
+                        teacher_average_empowerment_reward_all_steps
+                    )
                     avg_ppo_updates = float(average_ppo_updates_per_episode)
                     if math.isfinite(avg_ppo_updates):
                         log_metrics["teacher/average_ppo_updates_per_episode"] = (
@@ -2443,6 +2581,8 @@ def make_train(config):
                         teacher_average_competence_reward_all_steps,
                         teacher_average_success_reward,
                         teacher_average_learning_progress,
+                        teacher_average_empowerment_reward,
+                        teacher_average_empowerment_reward_all_steps,
                         average_ppo_updates_per_episode,
                         teacher_buffer_count,
                         teacher_buffer_mean_reward_val,
@@ -2453,7 +2593,7 @@ def make_train(config):
                         teacher_did_update,
                         teacher_current_lr,
                         teacher_update_batch_size,
-                        cl_buffer_window_full_f,
+                        empowerment_episode_done_f,
                         empowerment_total_loss,
                         empowerment_loss_enc1_enc3,
                         empowerment_loss_enc2_enc3,
@@ -2508,7 +2648,7 @@ def make_train(config):
                 teacher_rollout_buffer,
                 agent_episode_carry,
                 cl_buffer,
-                cl_buffer_ptr,
+                episode_buf_ptr,
                 rng,
             )
             return runner_state, metric
@@ -2536,7 +2676,7 @@ def make_train(config):
             teacher_rollout_buffer,
             agent_episode_carry,
             cl_buffer,
-            cl_buffer_ptr,
+            episode_buf_ptr,
             _rng,
         )
         runner_state, metric = jax.lax.scan(
@@ -2544,7 +2684,7 @@ def make_train(config):
         )
         final_teacher_rollout_buffer = runner_state[17]
         final_cl_buffer = runner_state[19]
-        final_cl_buffer_ptr = runner_state[20]
+        final_episode_buf_ptr = runner_state[20]
         final_empowerment_train_state = runner_state[2]
         return {
             "runner_state": runner_state,
@@ -2554,7 +2694,7 @@ def make_train(config):
             "empowerment_train_state": final_empowerment_train_state,
             "teacher_rollout_buffer": final_teacher_rollout_buffer,
             "cl_buffer": final_cl_buffer,
-            "cl_buffer_ptr": final_cl_buffer_ptr,
+            "episode_buf_ptr": final_episode_buf_ptr,
         }
 
     return train, render_eval_episode, log_teacher_softmax_snapshot
