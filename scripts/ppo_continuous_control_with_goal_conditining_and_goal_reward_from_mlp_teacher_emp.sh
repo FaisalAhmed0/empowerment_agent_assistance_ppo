@@ -14,7 +14,7 @@ COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(256 1024 2048)
+NUM_ENVSS=(256)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0)
 GAE_LAMBDA=(0.8)
@@ -26,11 +26,12 @@ NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
 GOAL_REWARD_COEF=(1)
 ### Teacher hyperparameters
-TEACHER_ROLLOUT_BUFFER_SIZES=(1 2 4 10 30)
+TEACHER_ROLLOUT_BUFFER_SIZES=(1 2 4 10)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
 ENERGY_FUNCTIONS=(l2 norm dot cosine)
 CONTRASTIVE_LOSS_TYPES=(fwd_infonce bwd_infonce sym_infonce binary_nce)
 run_count=0
+EMPOWERMENT_NUM_MINIBATCHES=(32 128 256 512)
 
 for ENV_NAME in "${ENV_NAMES[@]}"; do
   for TOTAL_TIMESTEPS in "${TOTAL_TIMESTEPS_[@]}"; do
@@ -51,6 +52,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for absolute_learning_progress in "${ABSOLUTE_LEARNING_PROGRESSS[@]}"; do
                         for energy_function in "${ENERGY_FUNCTIONS[@]}"; do
                         for contrastive_loss_type in "${CONTRASTIVE_LOSS_TYPES[@]}"; do
+                        for empowerment_num_minibatches in "${EMPOWERMENT_NUM_MINIBATCHES[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -62,6 +64,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${USE_TEACHER_EMPOWERMENT_REWARD} \
                         --EMPOWERMENT_ENERGY_FN=${energy_function} \
                         --EMPOWERMENT_CONTRASTIVE_LOSS=${contrastive_loss_type} \
+                        --EMPOWERMENT_NUM_MINIBATCHES=${empowerment_num_minibatches} \
                         --SEED=${SEED} \
                         ${ADD_GOAL_REWARD} \
                         ${CONDITION_ON_GOAL} \
@@ -71,7 +74,6 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --MAX_GRAD_NORM=${max_grad_norm} \
                         --UPDATE_EPOCHS=${update_epochs} \
                         --GOAL_REWARD_COEF=${goal_reward_coef} \
-                        --NUM_EVAL_ENVS=${num_eval_envs} \
                         ${absolute_learning_progress} \
                         --COMMENT=${COMMENT} \
                         --NUM_ENVS=${num_envs} \
@@ -85,6 +87,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                   done
                 done
               done
+            done
             done
           done
         done

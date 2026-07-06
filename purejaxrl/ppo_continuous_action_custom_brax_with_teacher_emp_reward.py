@@ -993,6 +993,9 @@ def make_train(config):
         "empowerment batch size must equal "
         "EMPOWERMENT_MINIBATCH_SIZE * EMPOWERMENT_NUM_MINIBATCHES"
     )
+    # minibatch_size = config["EMPOWERMENT_MINIBATCH_SIZE"]
+    # print(f"empowerment minibatch size: {minibatch_size}")
+    # quit()
     env_kwargs = config.get("ENV_KWARGS", {})
     custom_env = make_custom_env(
         env_name=config["ENV_NAME"],
