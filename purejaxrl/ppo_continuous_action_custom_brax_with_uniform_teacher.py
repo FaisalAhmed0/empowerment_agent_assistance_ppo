@@ -84,7 +84,7 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     GOAL_REWARD_COEF: float = 1.0
     INTERPOLATED_REWARD: bool = False
-    NUM_EVAL_ENVS: int = 32
+    NUM_EVAL_ENVS: int = 2
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = True
