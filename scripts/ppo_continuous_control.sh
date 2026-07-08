@@ -1,27 +1,27 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_sparse_reward_more_training_steps"
+WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal"
 
-ENV_NAMES=("ant_u_maze")
+ENV_NAMES=("ant_u_maze_single_goal")
 SAVE_MODEL="--SAVE_MODEL"
-TOTAL_TIMESTEPS_=(500000000)
+TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
-SEEDS=(30 7597 9234)
-COMMENT="running_with_more_seeds_and_saving_the_model_and_more_training_steps"
+SEEDS=(30 0 8943)
+COMMENT="no_teacher_baseline"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(2048)
+NUM_ENVSS=(256)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0)
 GAE_LAMBDA=(0.8)
 CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4)
-HIDDEN_DIMS=(64 128 256)
+HIDDEN_DIMS=(256)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
-NUM_MINIBATCHES=(4 8 16)
+NUM_MINIBATCHES=(8 16)
 
 
 run_count=0
