@@ -93,6 +93,8 @@ class TrainConfig:
     TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS: int = 0  # in-training softmax visuals (evenly spaced); 0 disables
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
     TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX: int = 0
+    SAVE_AGENT_TRAJECTORY_XY: bool = True
+    AGENT_TRAJECTORY_REF_ENV_INDEX: int = 0
     TEACHER_ROLLOUT_BUFFER_SIZE: int = 4
     TEACHER_NUM_MINIBATCHES: int = 8
     TEACHER_UPDATE_EPOCHS: int = 4
@@ -138,6 +140,80 @@ def _denorm_xy(xy, mean, var):
     mean_xy = mean[..., :2]
     var_xy = var[..., :2]
     return xy * jnp.sqrt(var_xy + 1e-8) + mean_xy
+
+
+def _agent_world_xy(obsv, env_state, env_index, *, normalize_env, base_obs_dim):
+    if normalize_env:
+        return env_state.org_obs[env_index, :2]
+    return obsv[env_index, :base_obs_dim][:2]
+
+
+def save_agent_trajectory_xy(agent_xy, config, output_dir, exp_name):
+    """Save a single agent's training trajectory for offline visualization."""
+    agent_xy = np.asarray(agent_xy)
+    flat_xy = agent_xy.reshape(-1, 2)
+    num_updates, num_steps = agent_xy.shape[:2]
+    update_idx = np.repeat(np.arange(num_updates), num_steps)
+    step_in_update = np.tile(np.arange(num_steps), num_updates)
+    env_step = update_idx * num_steps + step_in_update + 1
+    global_step = env_step * config["NUM_ENVS"]
+
+    path = os.path.join(output_dir, f"{exp_name}_agent_trajectory_xy.npz")
+    np.savez(
+        path,
+        agent_xy=flat_xy,
+        update_idx=update_idx,
+        step_in_update=step_in_update,
+        env_step=env_step,
+        global_step=global_step,
+        ref_env_index=config["AGENT_TRAJECTORY_REF_ENV_INDEX"],
+        num_envs=config["NUM_ENVS"],
+        num_steps_per_update=config["NUM_STEPS"],
+    )
+    return path, flat_xy, global_step
+
+
+def plot_agent_trajectory_xy(xy, steps, save_path, *, title="Agent Trajectory"):
+    """Scatter plot of agent (x, y) positions colored by training progress."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xy = np.asarray(xy).reshape(-1, 2)
+    steps = np.asarray(steps).reshape(-1)
+    if len(xy) == 0:
+        raise ValueError("Need at least one trajectory point to plot.")
+
+    cmap = plt.get_cmap("Blues")
+    step_min = float(steps.min())
+    step_max = float(steps.max())
+    if step_max > step_min:
+        color_values = (steps - step_min) / (step_max - step_min)
+    else:
+        color_values = np.zeros_like(steps, dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    scatter = ax.scatter(
+        xy[:, 0],
+        xy[:, 1],
+        c=color_values,
+        cmap=cmap,
+        s=4,
+        alpha=0.7,
+        linewidths=0,
+    )
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(title)
+    ax.axis("off")
+
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label("normalized training steps")
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return fig, save_path
 
 
 def _collapse_obs_norm_stats(stats_state, obs_dim):
@@ -815,6 +891,12 @@ def make_train(config):
     teacher_vf_coef = config["TEACHER_VF_COEF"]
     teacher_ent_coef = config["TEACHER_ENT_COEF"]
     teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
+    should_save_agent_trajectory_xy = bool(
+        config.get("SAVE_AGENT_TRAJECTORY_XY", False)
+    )
+    agent_trajectory_ref_env_index = int(
+        config.get("AGENT_TRAJECTORY_REF_ENV_INDEX", 0)
+    )
     approx_episode_cycles = (
         config["TOTAL_TIMESTEPS"]
         // config["NUM_ENVS"]
@@ -1596,11 +1678,25 @@ def make_train(config):
                     teacher_rollout_buffer,
                     rng,
                 )
+                if should_save_agent_trajectory_xy:
+                    agent_xy = _agent_world_xy(
+                        obsv,
+                        env_state,
+                        agent_trajectory_ref_env_index,
+                        normalize_env=config["NORMALIZE_ENV"],
+                        base_obs_dim=base_obs_dim,
+                    )
+                    return runner_state, (transition, agent_xy)
                 return runner_state, transition
 
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
-            )
+            if should_save_agent_trajectory_xy:
+                runner_state, (traj_batch, agent_xy_chunk) = jax.lax.scan(
+                    _env_step, runner_state, None, config["NUM_STEPS"]
+                )
+            else:
+                runner_state, traj_batch = jax.lax.scan(
+                    _env_step, runner_state, None, config["NUM_STEPS"]
+                )
 
             # CALCULATE ADVANTAGE
             (
@@ -2232,6 +2328,8 @@ def make_train(config):
                 teacher_rollout_buffer,
                 rng,
             )
+            if should_save_agent_trajectory_xy:
+                return runner_state, (metric, agent_xy_chunk)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
@@ -2258,17 +2356,25 @@ def make_train(config):
             teacher_rollout_buffer,
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
-        )
+        if should_save_agent_trajectory_xy:
+            runner_state, (metric, agent_trajectory_xy) = jax.lax.scan(
+                _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
+            )
+        else:
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
+            )
         final_teacher_rollout_buffer = runner_state[-2]
-        return {
+        train_output = {
             "runner_state": runner_state,
             "metrics": metric,
             "teacher_params": teacher_train_state.params,
             "teacher_train_state": teacher_train_state,
             "teacher_rollout_buffer": final_teacher_rollout_buffer,
         }
+        if should_save_agent_trajectory_xy:
+            train_output["agent_trajectory_xy"] = agent_trajectory_xy
+        return train_output
 
     return train, render_eval_episode, log_teacher_softmax_snapshot
 
@@ -2316,6 +2422,40 @@ def main():
         final_rng,
     ) = train_output["runner_state"]
     teacher_params = train_output["teacher_params"]
+    exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
+    exp_name = (
+        wandb.run.name
+        if wandb.run is not None and wandb.run.name
+        else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+    )
+    if config.get("SAVE_AGENT_TRAJECTORY_XY", False):
+        agent_xy = np.asarray(jax.device_get(train_output["agent_trajectory_xy"]))
+        trajectory_path, flat_xy, global_step = save_agent_trajectory_xy(
+            agent_xy, config, exp_dir, exp_name
+        )
+        num_points = int(flat_xy.shape[0])
+        print(
+            f"[agent_trajectory] saved {trajectory_path} with {num_points} points"
+        )
+        trajectory_plot_path = os.path.join(
+            exp_dir, f"{exp_name}_agent_trajectory.png"
+        )
+        plot_agent_trajectory_xy(
+            flat_xy,
+            global_step,
+            trajectory_plot_path,
+            title=f'Agent trajectory ({config["ENV_NAME"]})',
+        )
+        print(f"[agent_trajectory] saved plot {trajectory_plot_path}")
+        if config.get("WANDB_MODE", "disabled") == "online":
+            wandb.save(trajectory_path, base_path=exp_dir, policy="now")
+            wandb.save(trajectory_plot_path, base_path=exp_dir, policy="now")
+            wandb.log(
+                {
+                    "agent/trajectory_plot": wandb.Image(trajectory_plot_path),
+                },
+                step=int(config["TOTAL_TIMESTEPS"]),
+            )
     if config["SAVE_MODEL"]:
         scratch = os.environ.get("SCRATCH")   
         random_name = RandomWord().word()
