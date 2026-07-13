@@ -96,7 +96,7 @@ class TrainConfig:
     TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS: int = 0  # in-training softmax visuals (evenly spaced); 0 disables
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
     TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX: int = 0
-    EMPOWERMENT_VIZ_NUM_FUTURE_SAMPLES: int = 16  # MC futures averaged for grid heatmap only
+    EMPOWERMENT_VIZ_NUM_FUTURE_SAMPLES: int = 32  # MC futures averaged for grid heatmap only
     SAVE_AGENT_TRAJECTORY_XY: bool = True
     AGENT_TRAJECTORY_REF_ENV_INDEX: int = 0
     TEACHER_ROLLOUT_BUFFER_SIZE: int = 4
