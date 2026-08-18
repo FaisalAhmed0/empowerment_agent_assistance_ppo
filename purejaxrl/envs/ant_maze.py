@@ -24,6 +24,14 @@ U_MAZE = [
     [1, 1, 1, 1, 1],
 ]
 
+U_MAZE_ALL_STATES = [
+    [1, 1, 1, 1, 1],
+    [1, G, G, G, 1],
+    [1, 1, 1, G, 1],
+    [1, G, G, G, 1],
+    [1, 1, 1, 1, 1],
+]
+
 U_MAZE_MANY_STARTS = [
     [1, 1, 1, 1, 1],
     [1, 0, 0, R, 1],
@@ -215,7 +223,7 @@ HARDEST_MAZE_HARD_GOALS = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 MAZE_HEIGHT = 0.5
 
 
-def all_possible_goals(structure=U_MAZE, size_scaling=4):
+def all_possible_goals(structure=U_MAZE_ALL_STATES, size_scaling=4):
     possible_goals = find_goals(structure, size_scaling)
     return possible_goals
 

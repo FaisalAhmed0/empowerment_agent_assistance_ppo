@@ -275,15 +275,18 @@ def evaluate_multiple_goals(
     norm_mean = eval_stats.mean if eval_stats is not None else None
     norm_var = eval_stats.var if eval_stats is not None else None
 
-    def _reinit_with_goal(brax_state, goal):
-        q = brax_state.pipeline_state.q.at[-2:].set(goal)
-        pipeline_state = brax_env.pipeline_init(q, brax_state.pipeline_state.qd)
-        obs = brax_env._get_obs(pipeline_state)
-        return brax_state.replace(pipeline_state=pipeline_state, obs=obs)
+    # def _reinit_with_goal(brax_state, goal):
+    #     q = brax_state.pipeline_state.q.at[-2:].set(goal)
+    #     pipeline_state = brax_env.pipeline_init(q, brax_state.pipeline_state.qd)
+    #     obs = brax_env._get_obs(pipeline_state)
+    #     # jax.debug.print("goal in eval goals reinit_with_goal: {x}", x=goal)
+    #     return brax_state.replace(pipeline_state=pipeline_state, obs=obs)
 
-    reinit_with_goal = jax.vmap(_reinit_with_goal, in_axes=(0, None))
+    # reinit_with_goal = jax.vmap(_reinit_with_goal, in_axes=(0, None))
+
 
     def eval_one_goal(rng, specific_goal):
+        # This function evaluates the policy on a single goal.
         reset_rngs = jax.random.split(rng, num_envs_per_goal)
         if eval_stats is not None:
             obsv, env_state = env.reset_with_stats(
@@ -293,7 +296,7 @@ def evaluate_multiple_goals(
             obsv, env_state = env.reset(reset_rngs, env_params)
 
         brax_state = _inner_brax_state(env_state)
-        brax_state = reinit_with_goal(brax_state, specific_goal)
+        # brax_state = reinit_with_goal(brax_state, specific_goal)
         env_state = _replace_inner_brax_state(env_state, brax_state)
 
         if normalize_obs:
@@ -309,6 +312,10 @@ def evaluate_multiple_goals(
             goal_batch = jnp.broadcast_to(
                 policy_goal, (num_envs_per_goal, policy_goal.shape[-1])
             )
+            raw_goal_batch = jnp.broadcast_to(
+                specific_goal, (num_envs_per_goal, policy_goal.shape[-1])
+            )
+            
 
         def step_fn(carry, _):
             obsv, env_state, rng = carry
@@ -318,20 +325,35 @@ def evaluate_multiple_goals(
                 policy_obs = jnp.concatenate([obsv, goal_batch], axis=-1)
             else:
                 policy_obs = obsv
+            # import pdb;pdb.set_trace()
+            # jax.debug.print("policy input in step_fn: {x}", x=policy_obs)
             pi, _ = network.apply(params, policy_obs)
             action = pi.sample(seed=action_rng)
             obsv, env_state, reward, done, info = env.step(
                 step_rngs, env_state, action, env_params
             )
-            success = _success_metric(env_state)
+            # Success should be computed againt the proposed goal
+            # compute the success in recacing the goal 
+            # import pdb;pdb.set_trace()
+            current_xy = env_state.org_obs[..., :2]
+            # jax.debug.print("current_xy is {x}", x=current_xy)
+            dist_success = jnp.linalg.norm(current_xy-raw_goal_batch)
+            success = dist_success <= 0.5
+            # jax.debug.print("xy goal is {x}", x=raw_goal_batch)
+            # success = _success_metric(env_state)
+            # jax.debug.print("dist_success value is {s}", s=dist_success)
+            # jax.debug.print("dist_success value is {s}", s=success)
+            # import pdb;pdb.set_trace()
+            # jax.debug.print("reward valuea is {r}",r=reward)
             return (obsv, env_state, rng), success
 
         _, successes = jax.lax.scan(
             step_fn, (obsv, env_state, rng), None, length=max_steps
         )
-
+        # import pdb;pdb.set_trace()
         return successes.max(axis=0).mean()
 
+    # To evalute the policy on multiple goals use vmap that batches the evaluation over the goals.
     vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
     goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])
     return vmap_goals(goal_rngs, goals)
@@ -1257,7 +1279,7 @@ def make_train(config):
     )
     config.setdefault("GAMMA_CL", 0.99)
     config.setdefault("CL_BUFFER_SIZE", config["EPISODE_LENGTH"])
-    assert config["CL_BUFFER_SIZE"] > 0, "CL_BUFFER_SIZE must be positive"
+    # assert config["CL_BUFFER_SIZE"] > 0, "CL_BUFFER_SIZE must be positive"
     assert (
         config["CL_BUFFER_SIZE"] >= config["NUM_STEPS"]
     ), "CL_BUFFER_SIZE must be >= NUM_STEPS"
@@ -1267,6 +1289,9 @@ def make_train(config):
     config["TEACHER_MINIBATCH_SIZE"] = (
         teacher_batch_size // config["TEACHER_NUM_MINIBATCHES"]
     )
+    print(teacher_batch_size)
+    print(config["TEACHER_MINIBATCH_SIZE"])
+    print(config["TEACHER_NUM_MINIBATCHES"])
     assert (
         teacher_batch_size
         == config["TEACHER_MINIBATCH_SIZE"] * config["TEACHER_NUM_MINIBATCHES"]
@@ -1939,7 +1964,7 @@ def make_train(config):
             jnp.zeros((action_dim,)),
             jnp.zeros((base_obs_dim,)),
             jnp.zeros((num_competence,)),
-        )
+        ) # empowerment model is as follow: 
         empowerment_tx = optax.chain(
             optax.clip_by_global_norm(config["EMPOWERMENT_MAX_GRAD_NORM"]),
             optax.adam(config["EMPOWERMENT_LR"], eps=1e-5),
@@ -2144,7 +2169,8 @@ def make_train(config):
                 episode_success = jnp.maximum(episode_success, step_success)
                 # jax.debug.print("done: {done}", done=done)
                 task_reward = reward
-                goal_reward = jnp.zeros_like(task_reward)
+                goal_reward = jnp.zeros_like(task_reward) 
+                ## Calulcate the goal reaching reward for following the teacher instructive goals
                 if add_goal_reward:
                     if config["NORMALIZE_ENV"]:
                         dist = jnp.linalg.norm(
@@ -2160,6 +2186,7 @@ def make_train(config):
                     reward = task_reward + config["GOAL_REWARD_COEF"] * goal_reward
                     if config["INTERPOLATED_REWARD"]:
                         reward = (1-config["GOAL_REWARD_COEF"]) * task_reward + config["GOAL_REWARD_COEF"] * goal_reward
+                ## Update the teacher's state input
                 if update_competence:
                     competence_vector = jax.lax.cond(
                         jnp.any(done),
@@ -2169,19 +2196,26 @@ def make_train(config):
                         lambda _: competence_vector,
                         operand=None,
                     )
+                    # import pdb;pdb.set_trace()
                     # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
                 if use_average_competence_reward:
+                    # NOTE: review this
                     avg_competence = competence_vector.mean()
                     competence_part = jnp.where(done, avg_competence, 0.0)
                 else:
                     competence_part = jnp.zeros_like(task_reward)
                 success_part = jnp.where(done, episode_success, 0.0)
 
+                # NOTE: is this jax jitting friendly?
+                # import pdb;pdb.set_trace()
                 episode_step_count = episode_step_count + 1.0
                 is_episode_start = episode_step_count == 1.0
+                # NOTE: what is the shpae of this vector?
                 competence_per_env = jnp.broadcast_to(
                     competence_vector, (config["NUM_ENVS"], num_competence)
                 )
+                # an object to save the initial state, action, and competence vector for the episode and carry them over to the next step.
+                # update where the episode step count is 1 which indicates a new starting state from the next episode.
                 agent_episode_carry = AgentEpisodeCarry(
                     initial_state=jnp.where(
                         is_episode_start[:, None],
@@ -2204,6 +2238,7 @@ def make_train(config):
                 ) // config["NUM_STEPS"]
                 ppo_updates_at_done = jnp.where(done, ppo_updates_per_episode, 0.0)
 
+                # NOTE: this code train the teacher based on empowerment reward, so I need to remove this learning progress part.
                 learning_progress_part = jnp.zeros_like(task_reward)
                 if use_learning_progress_reward:
 
@@ -2244,6 +2279,7 @@ def make_train(config):
                 safe_episode_ptr = jnp.minimum(
                     episode_buf_ptr, cl_buffer_size - 1
                 )
+                # create an episode step object and add the contrastive learning buffer.
                 episode_step = AgentEpisodeChunk(
                     initial_state=agent_episode_carry.initial_state,
                     initial_action=agent_episode_carry.initial_action,
@@ -2264,6 +2300,7 @@ def make_train(config):
                     init_future = sample_teacher_future_at_init(
                         teacher_emp_rng, cl_buffer, episode_len, gamma_cl
                     )
+                    # NOTE: why the states are indexed by 0?
                     emp_reward = compute_teacher_empowerment_reward_batch(
                         empowerment_network.apply,
                         empowerment_train_state.params,
@@ -2287,18 +2324,19 @@ def make_train(config):
                         operand=None,
                     )
 
-                teacher_reward = (
-                    competence_part
-                    + success_part
-                    + learning_progress_part
+                # compute the final teacher's reward
+                teacher_reward = ( success_part
                     + teacher_empowerment_reward_coef * teacher_emp_part
                 )
+                # update the buffer pointer
                 episode_buf_ptr = jnp.where(
                     done,
                     0,
                     jnp.minimum(episode_buf_ptr + 1, cl_buffer_size - 1),
                 )
                 episode_success = jnp.where(done, 0.0, episode_success)
+                # store done episodes in the teacher's buffer
+                # NOTE: I do not understand is this vectorized?
                 teacher_rollout_buffer = push_teacher_rollout_on_done(
                     teacher_rollout_buffer,
                     teacher_episode_carry,
@@ -2347,6 +2385,7 @@ def make_train(config):
                         lambda _: episode_goal_success_start,
                         operand=None,
                     )
+                # NOTE: check the shape of episode_step_count, it should be a vecotr of size number of environments.
                 episode_step_count = jnp.where(done, 0.0, episode_step_count)
                 # jax.debug.print("done: {done}", done=jnp.any(done))
                 # jax.lax.cond(
