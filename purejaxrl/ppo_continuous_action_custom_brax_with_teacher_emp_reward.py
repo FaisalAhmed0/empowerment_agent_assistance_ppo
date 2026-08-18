@@ -88,6 +88,7 @@ class TrainConfig:
     INTERPOLATED_REWARD: bool = False
     NUM_EVAL_ENVS: int = 32
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
+    USE_DISTANCE_IN_COMPETENCE: bool = False
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = False
     USE_TEACHER_EMPOWERMENT_REWARD: bool = True
@@ -254,6 +255,7 @@ def evaluate_multiple_goals(
     warmup_env_state=None,
     normalize_obs=False,
     condition_on_goal=True,
+    use_distance_in_competence=False
 ):
     """Evaluate success rate for each goal over multiple random starts.
 
@@ -338,7 +340,7 @@ def evaluate_multiple_goals(
             current_xy = env_state.org_obs[..., :2]
             # jax.debug.print("current_xy is {x}", x=current_xy)
             dist_success = jnp.linalg.norm(current_xy-raw_goal_batch)
-            success = dist_success <= 0.5
+            success = dist_success if use_distance_in_competence else dist_success <= 0.5
             # jax.debug.print("xy goal is {x}", x=raw_goal_batch)
             # success = _success_metric(env_state)
             # jax.debug.print("dist_success value is {s}", s=dist_success)
@@ -350,8 +352,11 @@ def evaluate_multiple_goals(
         _, successes = jax.lax.scan(
             step_fn, (obsv, env_state, rng), None, length=max_steps
         )
-        # import pdb;pdb.set_trace()
-        return successes.max(axis=0).mean()
+        # NOTE: for new will aggregrate the vectors using by computing the mean, but there are other options. 
+        if use_distance_in_competence:
+            return successes.mean(axis=0).mean()
+        else:
+            return successes.mean(axis=0).mean()
 
     # To evalute the policy on multiple goals use vmap that batches the evaluation over the goals.
     vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
@@ -2001,6 +2006,7 @@ def make_train(config):
                 warmup_env_state=stats_state,
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
+                use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"]
             )
 
         def evaluate_teacher_goal_success_rates(student_params, stats_state, goals):
@@ -2015,6 +2021,7 @@ def make_train(config):
                 warmup_env_state=stats_state,
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
+                use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"]
             )
 
         if config["NORMALIZE_ENV"]:
@@ -2064,7 +2071,11 @@ def make_train(config):
         # jax.debug.print("obsv: {obsv}", obsv=obsv[..., :2])
 
         episode_initial_base_obs = obsv[..., :base_obs_dim]
-        competence_vector = jnp.zeros((num_competence,), dtype=obsv.dtype)
+        # NOTE: replace this with the competence of the randomly initilized policy
+        competence_vector = compute_competence_vector(train_state.params, env_state)
+        # import pdb;pdb.set_trace()
+        # competence_vector = jnp.zeros((num_competence,), dtype=obsv.dtype)
+        # import pdb;pdb.set_trace()
         raw_goals, teacher_episode_carry = teacher_act_and_carry(
             obsv[..., :base_obs_dim], competence_vector, goal_rng
         )
@@ -2197,7 +2208,7 @@ def make_train(config):
                         operand=None,
                     )
                     # import pdb;pdb.set_trace()
-                    # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
+                    jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
                 if use_average_competence_reward:
                     # NOTE: review this
                     avg_competence = competence_vector.mean()
