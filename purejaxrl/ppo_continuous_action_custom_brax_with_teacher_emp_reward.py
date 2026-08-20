@@ -68,7 +68,7 @@ class TrainConfig:
     WANDB_MODE: str = "online"
     ENTITY: str = ""
     PROJECT: str = "purejaxrl"
-    EVAL_RENDER_STEPS: int = 300
+    EVAL_RENDER_STEPS: int = 1000
     EVAL_RENDER_MAX_FRAMES: int = 100
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
@@ -81,6 +81,8 @@ class TrainConfig:
     TEACHER_GOAL_Y_MIN: float = 4.0
     TEACHER_GOAL_Y_MAX: float = 12.0
     TEACHER_NUM_GOAL_POINTS: int = 30
+    TEACHER_GOAL_COUNT_VIZ_LOG_WANDB: bool = True
+    TEACHER_GOAL_COUNT_VIZ_FREQ: int = 25
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
@@ -94,12 +96,6 @@ class TrainConfig:
     USE_TEACHER_EMPOWERMENT_REWARD: bool = True
     TEACHER_EMPOWERMENT_REWARD_COEF: float = 1.0
     ABSOLUTE_LEARNING_PROGRESS: bool = False
-    TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS: int = 0  # in-training softmax visuals (evenly spaced); 0 disables
-    TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
-    TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX: int = 0
-    EMPOWERMENT_VIZ_NUM_FUTURE_SAMPLES: int = 32  # MC futures averaged for grid heatmap only
-    SAVE_AGENT_TRAJECTORY_XY: bool = True
-    AGENT_TRAJECTORY_REF_ENV_INDEX: int = 0
     TEACHER_ROLLOUT_BUFFER_SIZE: int = 4
     TEACHER_NUM_MINIBATCHES: int = 8
     TEACHER_UPDATE_EPOCHS: int = 4
@@ -119,6 +115,13 @@ class TrainConfig:
     EMPOWERMENT_NUM_MINIBATCHES: int = 128
     EMPOWERMENT_ENERGY_FN: str = "l2"
     EMPOWERMENT_CONTRASTIVE_LOSS: str = "fwd_infonce"
+    # Agent XY logging
+    AGENT_POSITIONS_LOG_FREQ: int = 0
+    AGENT_POSITIONS_REF_ENV_INDEX: int = 0
+    AGENT_POSITIONS_INJIT_SUBSAMPLE_EVERY: int = 1
+    AGENT_POSITIONS_SAVE_DIR: str | None = None
+    AGENT_POSITIONS_MAX_POINTS: int = 10000
+    AGENT_POSITIONS_ONLY_REF_ENV: bool = False
 
 
 def _inner_brax_state(state):
@@ -148,86 +151,6 @@ def _normalize_xy(goal, mean, var):
     mean_xy = mean[..., :2]
     var_xy = var[..., :2]
     return (goal - mean_xy) / jnp.sqrt(var_xy + 1e-8)
-
-
-def _denorm_xy(xy, mean, var):
-    mean_xy = mean[..., :2]
-    var_xy = var[..., :2]
-    return xy * jnp.sqrt(var_xy + 1e-8) + mean_xy
-
-
-def _agent_world_xy(obsv, env_state, env_index, *, normalize_env, base_obs_dim):
-    if normalize_env:
-        return env_state.org_obs[env_index, :2]
-    return obsv[env_index, :base_obs_dim][:2]
-
-
-def save_agent_trajectory_xy(agent_xy, config, output_dir, exp_name):
-    """Save a single agent's training trajectory for offline visualization."""
-    agent_xy = np.asarray(agent_xy)
-    flat_xy = agent_xy.reshape(-1, 2)
-    num_updates, num_steps = agent_xy.shape[:2]
-    update_idx = np.repeat(np.arange(num_updates), num_steps)
-    step_in_update = np.tile(np.arange(num_steps), num_updates)
-    env_step = update_idx * num_steps + step_in_update + 1
-    global_step = env_step * config["NUM_ENVS"]
-
-    path = os.path.join(output_dir, f"{exp_name}_agent_trajectory_xy.npz")
-    np.savez(
-        path,
-        agent_xy=flat_xy,
-        update_idx=update_idx,
-        step_in_update=step_in_update,
-        env_step=env_step,
-        global_step=global_step,
-        ref_env_index=config["AGENT_TRAJECTORY_REF_ENV_INDEX"],
-        num_envs=config["NUM_ENVS"],
-        num_steps_per_update=config["NUM_STEPS"],
-    )
-    return path, flat_xy, global_step
-
-
-def plot_agent_trajectory_xy(xy, steps, save_path, *, title="Agent Trajectory"):
-    """Scatter plot of agent (x, y) positions colored by training progress."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    xy = np.asarray(xy).reshape(-1, 2)
-    steps = np.asarray(steps).reshape(-1)
-    if len(xy) == 0:
-        raise ValueError("Need at least one trajectory point to plot.")
-
-    cmap = plt.get_cmap("Blues")
-    step_min = float(steps.min())
-    step_max = float(steps.max())
-    if step_max > step_min:
-        color_values = (steps - step_min) / (step_max - step_min)
-    else:
-        color_values = np.zeros_like(steps, dtype=np.float64)
-
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    scatter = ax.scatter(
-        xy[:, 0],
-        xy[:, 1],
-        c=color_values,
-        cmap=cmap,
-        s=4,
-        alpha=0.7,
-        linewidths=0,
-    )
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title(title)
-    ax.axis("off")
-
-    cbar = plt.colorbar(scatter, ax=ax)
-    cbar.set_label("normalized training steps")
-
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return fig, save_path
 
 
 def _collapse_obs_norm_stats(stats_state, obs_dim):
@@ -368,35 +291,6 @@ def parse_config_from_cli() -> TrainConfig:
     return tyro.cli(TrainConfig)
 
 
-def _compute_teacher_softmax_snapshot_indices(
-    num_updates: int, num_snapshots: int
-) -> np.ndarray:
-    """Evenly spaced update indices for in-training teacher softmax visuals."""
-    if num_snapshots <= 0 or num_updates <= 0:
-        return np.array([], dtype=np.int64)
-    count = min(num_snapshots, num_updates)
-    if count == 1:
-        return np.array([num_updates - 1], dtype=np.int64)
-    return np.unique(
-        np.linspace(0, num_updates - 1, count, dtype=np.int64)
-    )
-
-
-def _verify_teacher_softmax_snapshot_indices(
-    indices: np.ndarray, num_updates: int, num_snapshots: int
-) -> None:
-    """Validate precomputed snapshot indices for common scheduling invariants."""
-    expected_count = (
-        0 if num_snapshots <= 0 or num_updates <= 0 else min(num_snapshots, num_updates)
-    )
-    assert len(indices) == expected_count
-    if len(indices) == 0:
-        return
-    assert indices.min() >= 0
-    assert indices.max() <= num_updates - 1
-    assert np.all(np.diff(indices) > 0)
-
-
 def _scatter_goal_learning_progress(cache, goal_idx, lp_values, done):
     updated = jnp.where(
         done,
@@ -413,195 +307,6 @@ def _scatter_goal_empowerment_reward(cache, goal_idx, emp_values, done):
         cache[goal_idx],
     )
     return cache.at[goal_idx].set(updated)
-
-
-def plot_teacher_goal_grid_heatmap(
-    goal_grid_xy,
-    values,
-    num_points,
-    *,
-    colorbar_label="Value",
-    cmap="viridis",
-    vmin=None,
-    vmax=None,
-    start_xy=None,
-    title=None,
-    save_path=None,
-):
-    """Heatmap of per-goal scalar values over the teacher goal grid."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-
-    goal_grid_xy = np.asarray(goal_grid_xy)
-    values = np.asarray(values).reshape(-1)
-    gx = goal_grid_xy[:, 0].reshape(num_points, num_points)
-    gy = goal_grid_xy[:, 1].reshape(num_points, num_points)
-    vgrid = values.reshape(num_points, num_points)
-
-    mesh_kwargs = {"shading": "nearest", "cmap": cmap}
-    if vmin is not None or vmax is not None:
-        mesh_kwargs["vmin"] = vmin
-        mesh_kwargs["vmax"] = vmax
-    mesh = ax.pcolormesh(gx, gy, vgrid, **mesh_kwargs)
-    fig.colorbar(mesh, ax=ax, label=colorbar_label)
-
-    if start_xy is not None:
-        start_xy = np.asarray(start_xy).reshape(-1)
-        ax.scatter(
-            start_xy[0],
-            start_xy[1],
-            s=200,
-            marker="*",
-            c="tab:red",
-            edgecolors="black",
-            linewidths=0.5,
-            zorder=3,
-            label="Agent start",
-        )
-        ax.legend(loc="best")
-
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_aspect("equal", adjustable="datalim")
-    if title is not None:
-        ax.set_title(title)
-    if save_path is not None:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    return fig, ax
-
-
-def plot_teacher_softmax(
-    goal_grid_xy, probs, num_points, *, start_xy=None, title=None, save_path=None
-):
-    """Heatmap of the teacher's categorical distribution over its goal grid."""
-    return plot_teacher_goal_grid_heatmap(
-        goal_grid_xy,
-        probs,
-        num_points,
-        colorbar_label="P(goal)",
-        cmap="viridis",
-        start_xy=start_xy,
-        title=title,
-        save_path=save_path,
-    )
-
-
-def plot_teacher_learning_progress_heatmap(
-    goal_grid_xy, values, num_points, *, start_xy=None, title=None, save_path=None
-):
-    """Heatmap of cached learning-progress reward per teacher goal."""
-    values = np.asarray(values).reshape(-1)
-    abs_max = float(np.max(np.abs(values))) if values.size else 0.0
-    vmin = -abs_max if abs_max > 0.0 else None
-    vmax = abs_max if abs_max > 0.0 else None
-    return plot_teacher_goal_grid_heatmap(
-        goal_grid_xy,
-        values,
-        num_points,
-        colorbar_label="Learning progress reward",
-        cmap="RdBu_r",
-        vmin=vmin,
-        vmax=vmax,
-        start_xy=start_xy,
-        title=title,
-        save_path=save_path,
-    )
-
-
-def plot_teacher_empowerment_reward_heatmap(
-    goal_grid_xy, values, num_points, *, start_xy=None, title=None, save_path=None
-):
-    """Heatmap of empowerment reward per teacher goal."""
-    values = np.asarray(values).reshape(-1)
-    abs_max = float(np.max(np.abs(values))) if values.size else 0.0
-    vmin = -abs_max if abs_max > 0.0 else None
-    vmax = abs_max if abs_max > 0.0 else None
-    return plot_teacher_goal_grid_heatmap(
-        goal_grid_xy,
-        values,
-        num_points,
-        colorbar_label="Empowerment reward",
-        cmap="RdBu_r",
-        vmin=vmin,
-        vmax=vmax,
-        start_xy=start_xy,
-        title=title,
-        save_path=save_path,
-    )
-
-
-def plot_teacher_softmax_bar(probs, *, title=None, save_path=None):
-    """Bar chart of P(goal_i) over discrete teacher goal indices."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    probs = np.asarray(probs).reshape(-1)
-    num_goals = probs.shape[0]
-    goal_indices = np.arange(num_goals)
-    fig_width = max(8.0, num_goals * 0.01)
-    fig, ax = plt.subplots(figsize=(fig_width, 4.5))
-
-    colors = plt.cm.viridis(probs / max(probs.max(), 1e-8))
-    ax.bar(goal_indices, probs, width=0.85, color=colors, edgecolor="none")
-    y_max = max(float(probs.max()) * 1.05, 1e-6)
-    if y_max > 0.95:
-        y_max = 1.0
-    ax.set_ylim(0.0, y_max)
-    ax.set_xlabel("Goal index")
-    ax.set_ylabel("P(goal)")
-
-    num_ticks = min(10, num_goals)
-    if num_goals > 1:
-        tick_positions = np.linspace(0, num_goals - 1, num_ticks, dtype=int)
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels([str(int(t)) for t in tick_positions])
-
-    if title is not None:
-        ax.set_title(title)
-    if save_path is not None:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    return fig, ax
-
-
-def plot_competence_vector_bar(competence, *, title=None, save_path=None):
-    """Bar chart of student competence per discrete goal index."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    competence = np.asarray(competence).reshape(-1)
-    num_goals = competence.shape[0]
-    goal_indices = np.arange(num_goals)
-    fig_width = max(8.0, num_goals * 0.01)
-    fig, ax = plt.subplots(figsize=(fig_width, 4.5))
-
-    colors = plt.cm.viridis(competence / max(competence.max(), 1e-8))
-    ax.bar(goal_indices, competence, width=0.85, color=colors, edgecolor="none")
-    y_max = max(float(competence.max()) * 1.05, 1e-6)
-    if y_max > 0.95:
-        y_max = 1.0
-    ax.set_ylim(0.0, y_max)
-    ax.set_xlabel("Goal index")
-    ax.set_ylabel("Competence")
-
-    num_ticks = min(10, num_goals)
-    if num_goals > 1:
-        tick_positions = np.linspace(0, num_goals - 1, num_ticks, dtype=int)
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels([str(int(t)) for t in tick_positions])
-
-    if title is not None:
-        ax.set_title(title)
-    if save_path is not None:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    return fig, ax
 
 
 class ActorCritic(nn.Module):
@@ -798,6 +503,7 @@ class Transition(NamedTuple):
     goal: jnp.ndarray
     current_state: jnp.ndarray
     current_action: jnp.ndarray
+    agent_xy: jnp.ndarray
 
 
 class TeacherEpisodeCarry(NamedTuple):
@@ -1275,6 +981,22 @@ def load_checkpoint(train_state, checkpoint_dir):
         train_state,
     )
 
+
+def load_agent_positions(save_dir: str, index: int):
+    """Load agent positions saved as `{index}_agent_positions.npz`.
+
+    Returns a dict with keys `agent_xy` (numpy array) and `update_idx`.
+    """
+    import numpy as _np
+
+    fname = os.path.join(save_dir, f"{int(index)}_agent_positions.npz")
+    if not os.path.exists(fname):
+        raise FileNotFoundError(fname)
+    with _np.load(fname) as data:
+        agent_xy = data["agent_xy"].copy()
+        update_idx = int(data["update_idx"]) if "update_idx" in data else int(index)
+    return {"agent_xy": agent_xy, "update_idx": update_idx}
+
 def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -1382,12 +1104,6 @@ def make_train(config):
     teacher_vf_coef = config["TEACHER_VF_COEF"]
     teacher_ent_coef = config["TEACHER_ENT_COEF"]
     teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
-    should_save_agent_trajectory_xy = bool(
-        config.get("SAVE_AGENT_TRAJECTORY_XY", False)
-    )
-    agent_trajectory_ref_env_index = int(
-        config.get("AGENT_TRAJECTORY_REF_ENV_INDEX", 0)
-    )
     gamma_cl = config["GAMMA_CL"]
     cl_buffer_size = int(config["CL_BUFFER_SIZE"])
     empowerment_num_minibatches = int(config["EMPOWERMENT_NUM_MINIBATCHES"])
@@ -1440,9 +1156,6 @@ def make_train(config):
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     use_teacher_empowerment_reward = config.get("USE_TEACHER_EMPOWERMENT_REWARD", False)
     teacher_empowerment_reward_coef = config.get("TEACHER_EMPOWERMENT_REWARD_COEF", 1.0)
-    empowerment_viz_num_future_samples = int(
-        config.get("EMPOWERMENT_VIZ_NUM_FUTURE_SAMPLES", 16)
-    )
     update_competence = (
         condition_teacher_on_competence or use_average_competence_reward
     )
@@ -1512,7 +1225,7 @@ def make_train(config):
             return _normalize_xy(raw_goal, obs_mean, obs_var)
         return raw_goal
 
-    render_sim_steps = int(config.get("EVAL_RENDER_STEPS", 500))
+    render_sim_steps = int(config.get("EVAL_RENDER_STEPS", 1000))
     render_max_frames = int(config.get("EVAL_RENDER_MAX_FRAMES", 120))
     render_action_repeat = int(config.get("ACTION_REPEAT", 1))
     action_low = jnp.asarray(env.action_space(env_params).low)
@@ -1605,270 +1318,6 @@ def make_train(config):
             jax.tree_util.tree_map(lambda x: x[i], pipeline_states)
             for i in range(n)
         ]
-
-    teacher_softmax_viz_log_wandb = bool(
-        config.get("TEACHER_SOFTMAX_VIZ_LOG_WANDB", True)
-    )
-    teacher_softmax_viz_num_snapshots = int(
-        config.get("TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS", 0)
-    )
-    num_updates = int(config["NUM_UPDATES"])
-    snapshot_indices = _compute_teacher_softmax_snapshot_indices(
-        num_updates, teacher_softmax_viz_num_snapshots
-    )
-    _verify_teacher_softmax_snapshot_indices(
-        snapshot_indices, num_updates, teacher_softmax_viz_num_snapshots
-    )
-    snapshot_indices_jnp = jnp.asarray(snapshot_indices, dtype=jnp.int32)
-    if teacher_softmax_viz_num_snapshots > 0:
-        print(
-            f"[teacher_softmax_viz] scheduling {len(snapshot_indices)} snapshots "
-            f"over {num_updates} updates; "
-            f"first={snapshot_indices[:3].tolist()} "
-            f"last={snapshot_indices[-3:].tolist()}"
-        )
-
-    def log_teacher_softmax_viz(
-        probs,
-        ref_obs,
-        env_state,
-        step,
-        competence_vector,
-        goal_learning_progress_cache=None,
-        goal_empowerment_reward_cache=None,
-        empowerment_grid_values=None,
-    ):
-        """Plot teacher softmax, competence, and reward visuals; log to wandb."""
-        try:
-            import matplotlib.pyplot as plt
-
-            probs = np.asarray(jax.device_get(probs)).reshape(-1)
-            competence = np.asarray(jax.device_get(competence_vector)).reshape(-1)
-            goal_grid_xy = np.asarray(jax.device_get(goal_grid))
-            ref_obs = np.asarray(jax.device_get(ref_obs)).reshape(-1)
-            start_xy = ref_obs[:2].copy()
-
-            obs_mean, obs_var = _extract_obs_norm_stats(env_state, base_obs_dim)
-            if config.get("NORMALIZE_ENV", False) and obs_mean is not None:
-                obs_mean = np.asarray(jax.device_get(obs_mean))
-                obs_var = np.asarray(jax.device_get(obs_var))
-                start_xy = np.asarray(
-                    jax.device_get(_denorm_xy(start_xy, obs_mean, obs_var))
-                ).reshape(-1)
-
-            exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
-            exp_name = (
-                wandb.run.name
-                if wandb.run is not None and wandb.run.name
-                else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
-            )
-            save_path = os.path.join(
-                exp_dir, f"{exp_name}_teacher_softmax_{step}.png"
-            )
-            fig, _ = plot_teacher_softmax(
-                goal_grid_xy,
-                probs,
-                teacher_num_goal_points,
-                start_xy=start_xy,
-                title=f'Teacher softmax @ step {step} ({config["ENV_NAME"]})',
-                save_path=save_path,
-            )
-            bar_save_path = os.path.join(
-                exp_dir, f"{exp_name}_teacher_softmax_bar_{step}.png"
-            )
-            bar_fig, _ = plot_teacher_softmax_bar(
-                probs,
-                title=f'Teacher softmax bar @ step {step} ({config["ENV_NAME"]})',
-                save_path=bar_save_path,
-            )
-            competence_save_path = os.path.join(
-                exp_dir, f"{exp_name}_competence_vector_bar_{step}.png"
-            )
-            competence_fig, _ = plot_competence_vector_bar(
-                competence,
-                title=f'Competence vector @ step {step} ({config["ENV_NAME"]})',
-                save_path=competence_save_path,
-            )
-            lp_fig = None
-            if use_learning_progress_reward and goal_learning_progress_cache is not None:
-                lp_values = np.asarray(
-                    jax.device_get(goal_learning_progress_cache)
-                ).reshape(-1)
-                lp_save_path = os.path.join(
-                    exp_dir, f"{exp_name}_teacher_learning_progress_{step}.png"
-                )
-                lp_fig, _ = plot_teacher_learning_progress_heatmap(
-                    goal_grid_xy,
-                    lp_values,
-                    teacher_num_goal_points,
-                    start_xy=start_xy,
-                    title=(
-                        f'Learning progress reward @ step {step} '
-                        f'({config["ENV_NAME"]})'
-                    ),
-                    save_path=lp_save_path,
-                )
-            emp_cache_fig = None
-            if (
-                use_teacher_empowerment_reward
-                and goal_empowerment_reward_cache is not None
-            ):
-                emp_cache_values = np.asarray(
-                    jax.device_get(goal_empowerment_reward_cache)
-                ).reshape(-1)
-                emp_cache_save_path = os.path.join(
-                    exp_dir, f"{exp_name}_teacher_empowerment_cache_{step}.png"
-                )
-                emp_cache_fig, _ = plot_teacher_empowerment_reward_heatmap(
-                    goal_grid_xy,
-                    emp_cache_values,
-                    teacher_num_goal_points,
-                    start_xy=start_xy,
-                    title=(
-                        f'Empowerment reward cache @ step {step} '
-                        f'({config["ENV_NAME"]})'
-                    ),
-                    save_path=emp_cache_save_path,
-                )
-            emp_grid_fig = None
-            if (
-                use_teacher_empowerment_reward
-                and empowerment_grid_values is not None
-            ):
-                emp_grid_values = np.asarray(
-                    jax.device_get(empowerment_grid_values)
-                ).reshape(-1)
-                emp_grid_save_path = os.path.join(
-                    exp_dir, f"{exp_name}_teacher_empowerment_grid_{step}.png"
-                )
-                emp_grid_fig, _ = plot_teacher_empowerment_reward_heatmap(
-                    goal_grid_xy,
-                    emp_grid_values,
-                    teacher_num_goal_points,
-                    start_xy=start_xy,
-                    title=(
-                        f'Empowerment reward grid (avg {empowerment_viz_num_future_samples} futures) '
-                        f'@ step {step} ({config["ENV_NAME"]})'
-                    ),
-                    save_path=emp_grid_save_path,
-                )
-            if (
-                teacher_softmax_viz_log_wandb
-                and config.get("WANDB_MODE", "disabled") == "online"
-            ):
-                log_payload = {
-                    "teacher/goal_softmax": wandb.Image(fig),
-                    "teacher/goal_softmax_bar": wandb.Image(bar_fig),
-                    "teacher/competence_vector_bar": wandb.Image(competence_fig),
-                }
-                if lp_fig is not None:
-                    log_payload["teacher/learning_progress_heatmap"] = wandb.Image(
-                        lp_fig
-                    )
-                if emp_cache_fig is not None:
-                    log_payload["teacher/empowerment_reward_cache_heatmap"] = (
-                        wandb.Image(emp_cache_fig)
-                    )
-                if emp_grid_fig is not None:
-                    log_payload["teacher/empowerment_reward_grid_heatmap"] = (
-                        wandb.Image(emp_grid_fig)
-                    )
-                wandb.log(log_payload, step=step)
-            plt.close(fig)
-            plt.close(bar_fig)
-            plt.close(competence_fig)
-            if lp_fig is not None:
-                plt.close(lp_fig)
-            if emp_cache_fig is not None:
-                plt.close(emp_cache_fig)
-            if emp_grid_fig is not None:
-                plt.close(emp_grid_fig)
-        except Exception as err:
-            print(f"[log_teacher_softmax_viz] skipped teacher visual plots: {err}")
-            traceback.print_exc()
-
-    def log_teacher_softmax_snapshot(
-        teacher_params,
-        ref_obs,
-        competence_vector,
-        env_state,
-        step,
-        goal_learning_progress_cache=None,
-        goal_empowerment_reward_cache=None,
-        empowerment_grid_values=None,
-        cl_buffer=None,
-        episode_buf_ptr=None,
-        empowerment_params=None,
-        rng=None,
-    ):
-        """Compute teacher probs and log teacher visual snapshots."""
-        if (
-            empowerment_grid_values is None
-            and use_teacher_empowerment_reward
-            and cl_buffer is not None
-            and episode_buf_ptr is not None
-            and empowerment_params is not None
-            and rng is not None
-        ):
-            ref_env_index = int(config.get("TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX", 0))
-            empowerment_grid_values = compute_empowerment_grid_for_ref_env(
-                empowerment_params,
-                cl_buffer,
-                episode_buf_ptr,
-                ref_env_index,
-                competence_vector,
-                rng,
-            )
-        ref_obs = jnp.asarray(ref_obs).reshape(-1)
-        teacher_obs = _build_teacher_input(ref_obs, competence_vector)
-        pi, _ = teacher_network.apply(teacher_params, teacher_obs)
-        probs = pi.probs.reshape(-1)
-        log_teacher_softmax_viz(
-            probs,
-            ref_obs,
-            env_state,
-            step,
-            competence_vector,
-            goal_learning_progress_cache,
-            goal_empowerment_reward_cache,
-            empowerment_grid_values,
-        )
-
-    def compute_empowerment_grid_for_ref_env(
-        empowerment_params,
-        cl_buffer,
-        episode_buf_ptr,
-        ref_env_index,
-        competence_vector,
-        rng,
-    ):
-        """Monte Carlo empowerment grid for visualization (not used in teacher reward)."""
-        initial_state = cl_buffer.initial_state[0, ref_env_index]
-        initial_action = cl_buffer.initial_action[0, ref_env_index]
-        episode_len = episode_buf_ptr + 1
-
-        def _grid_for_one_future(rng_i):
-            init_future_all = sample_teacher_future_at_init(
-                rng_i, cl_buffer, episode_len, gamma_cl
-            )
-            return evaluate_teacher_empowerment_reward_grid(
-                empowerment_network.apply,
-                empowerment_params,
-                empowerment_energy_fn,
-                initial_state,
-                initial_action,
-                init_future_all[ref_env_index],
-                competence_vector,
-                goal_grid,
-            )
-
-        num_samples = empowerment_viz_num_future_samples
-        if num_samples <= 1:
-            return _grid_for_one_future(rng)
-
-        rngs = jax.random.split(rng, num_samples)
-        grids = jax.vmap(_grid_for_one_future)(rngs)
-        return jnp.mean(grids, axis=0)
 
     def render_eval_episode(
         params, teacher_params, competence_vector, rng, final_env_state
@@ -2060,12 +1509,12 @@ def make_train(config):
             obsv, env_state = env.reset_with_stats(
                 reset_rng, warmup_env_state, env_params
             )
-            jax.debug.print(
-                "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
-            )
-            jax.debug.print(
-                "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
-            )
+            # jax.debug.print(
+            #     "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
+            # )
+            # jax.debug.print(
+            #     "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
+            # )
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
         # jax.debug.print("obsv: {obsv}", obsv=obsv[..., :2])
@@ -2124,6 +1573,107 @@ def make_train(config):
         goal_empowerment_reward_cache = jnp.zeros(
             (num_teacher_goals,), dtype=obsv.dtype
         )
+        teacher_goal_count_grid = jnp.zeros(
+            (num_teacher_goals,), dtype=jnp.int32
+        )
+        def plot_teacher_goal_selection_counts(
+            goal_grid_xy,
+            counts,
+            num_points,
+            *,
+            start_xy=None,
+            title=None,
+            save_path=None,
+        ):
+            """Heatmap of normalized teacher goal selection frequency in [0, 1]."""
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6.5, 6))
+            goal_grid_xy = np.asarray(goal_grid_xy)
+            counts = np.asarray(counts).reshape(-1)
+            gx = goal_grid_xy[:, 0].reshape(num_points, num_points)
+            gy = goal_grid_xy[:, 1].reshape(num_points, num_points)
+            cgrid = counts.reshape(num_points, num_points).astype(np.float32)
+            max_count = float(np.max(cgrid)) if cgrid.size else 0.0
+            normalized_grid = np.zeros_like(cgrid, dtype=np.float32)
+            if max_count > 0.0:
+                normalized_grid = cgrid / max_count
+            mesh = ax.pcolormesh(
+                gx,
+                gy,
+                normalized_grid,
+                shading="nearest",
+                cmap="Blues",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            fig.colorbar(mesh, ax=ax, label="Normalized goal selection frequency")
+
+            if start_xy is not None:
+                start_xy = np.asarray(start_xy).reshape(-1)
+                ax.scatter(
+                    start_xy[0],
+                    start_xy[1],
+                    s=200,
+                    marker="*",
+                    c="tab:red",
+                    edgecolors="black",
+                    linewidths=0.5,
+                    zorder=3,
+                    label="Agent start",
+                )
+                ax.legend(loc="best")
+
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.set_aspect("equal", adjustable="datalim")
+            if title is not None:
+                ax.set_title(title)
+            if save_path is not None:
+                fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            return fig, ax
+
+        def log_teacher_goal_selection_count_grid(goal_count_grid, step):
+            """Log a count heatmap showing teacher goal selections over time."""
+            try:
+                if config.get("WANDB_MODE", "disabled") != "online":
+                    return
+                import matplotlib.pyplot as plt
+
+                counts = np.asarray(jax.device_get(goal_count_grid)).reshape(-1)
+                goal_grid_xy = np.asarray(jax.device_get(goal_grid))
+                exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
+                exp_name = (
+                    wandb.run.name
+                    if wandb.run is not None and wandb.run.name
+                    else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+                )
+                save_path = os.path.join(
+                    exp_dir, f"{exp_name}_teacher_goal_counts_{int(step)}.png"
+                )
+                fig, _ = plot_teacher_goal_selection_counts(
+                    goal_grid_xy,
+                    counts,
+                    teacher_num_goal_points,
+                    title=(
+                        f"Teacher goal selections @ step {int(step)} "
+                        f"({config['ENV_NAME']})"
+                    ),
+                    save_path=save_path,
+                )
+                wandb.log(
+                    {"teacher/goal_selection_counts": wandb.Image(fig)},
+                    step=int(step),
+                )
+                plt.close(fig)
+            except Exception as err:
+                print(
+                    f"[log_teacher_goal_selection_count_grid] skipped count-grid visual: {err}"
+                )
+                traceback.print_exc()
 
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
@@ -2154,6 +1704,7 @@ def make_train(config):
                     agent_episode_carry,
                     cl_buffer,
                     episode_buf_ptr,
+                    teacher_goal_count_grid,
                     rng,
                 ) = runner_state
 
@@ -2208,7 +1759,7 @@ def make_train(config):
                         operand=None,
                     )
                     # import pdb;pdb.set_trace()
-                    jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
+                    # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
                 if use_average_competence_reward:
                     # NOTE: review this
                     avg_competence = competence_vector.mean()
@@ -2379,6 +1930,9 @@ def make_train(config):
                     fresh_carry,
                     teacher_episode_carry,
                 )
+                teacher_goal_count_grid = teacher_goal_count_grid.at[goal_idx].add(
+                    jnp.ones_like(goal_idx, dtype=jnp.int32)
+                )
                 raw_goals = jnp.where(done[:, None], new_raw_goals, raw_goals)
                 if use_learning_progress_reward:
 
@@ -2414,6 +1968,8 @@ def make_train(config):
                 goals = normalize_goals(raw_goals, env_state)
                 if condition_on_goal:
                     obsv = jnp.concatenate([obsv, goals], axis=-1)
+                # capture x,y from the inner brax state (original/un-normalized coordinates)
+                current_xy = env_state.org_obs[..., :2]
                 transition = Transition(
                     done,
                     action,
@@ -2436,6 +1992,7 @@ def make_train(config):
                     raw_goals,
                     current_state,
                     action,
+                    current_xy,
                 )
                 runner_state = (
                     train_state,
@@ -2462,27 +2019,13 @@ def make_train(config):
                     agent_episode_carry,
                     cl_buffer,
                     episode_buf_ptr,
+                    teacher_goal_count_grid,
                     rng,
                 )
-                if should_save_agent_trajectory_xy:
-                    agent_xy = _agent_world_xy(
-                        obsv,
-                        env_state,
-                        agent_trajectory_ref_env_index,
-                        normalize_env=config["NORMALIZE_ENV"],
-                        base_obs_dim=base_obs_dim,
-                    )
-                    return runner_state, (transition, agent_xy)
                 return runner_state, transition
-
-            if should_save_agent_trajectory_xy:
-                runner_state, (traj_batch, agent_xy_chunk) = jax.lax.scan(
-                    _env_step, runner_state, None, config["NUM_STEPS"]
-                )
-            else:
-                runner_state, traj_batch = jax.lax.scan(
-                    _env_step, runner_state, None, config["NUM_STEPS"]
-                )
+            runner_state, traj_batch = jax.lax.scan(
+                _env_step, runner_state, None, config["NUM_STEPS"]
+            )
 
             (
                 train_state,
@@ -2509,6 +2052,7 @@ def make_train(config):
                 agent_episode_carry,
                 cl_buffer,
                 episode_buf_ptr,
+                teacher_goal_count_grid,
                 rng,
             ) = runner_state
 
@@ -3217,89 +2761,70 @@ def make_train(config):
                     ),
                 )
 
-            if (
-                teacher_softmax_viz_num_snapshots > 0
-                and config.get("WANDB_MODE", "disabled") == "online"
-            ):
-                should_log_viz = jnp.isin(update_idx, snapshot_indices_jnp)
+            if config.get("TEACHER_GOAL_COUNT_VIZ_LOG_WANDB", True):
+                freq = int(config.get("TEACHER_GOAL_COUNT_VIZ_FREQ", 0))
+                if freq > 0:
+                    should_log_goal_count_viz = (update_idx + 1) % freq == 0
 
-                def _run_teacher_viz(rng_in):
-                    _, emp_rng = jax.random.split(rng_in)
-                    ref_env_index = int(
-                        config.get("TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX", 0)
-                    )
-                    ref_base_obs = episode_initial_base_obs[ref_env_index]
-                    teacher_obs = _build_teacher_input(
-                        ref_base_obs, competence_vector
-                    )
-                    pi, _ = teacher_network.apply(
-                        teacher_train_state.params, teacher_obs
-                    )
-                    probs_snapshot = pi.probs.reshape(-1)
-                    empowerment_grid_values = jnp.zeros(
-                        (num_teacher_goals,), dtype=last_obs.dtype
-                    )
-                    if use_teacher_empowerment_reward:
-                        empowerment_grid_values = compute_empowerment_grid_for_ref_env(
-                            empowerment_train_state.params,
-                            cl_buffer,
-                            episode_buf_ptr,
-                            ref_env_index,
-                            competence_vector,
-                            emp_rng,
-                        )
-
-                    def _softmax_viz_callback(args):
-                        (
+                    def _run_goal_count_viz(_):
+                        step = (update_idx + 1) * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        jax.debug.callback(
+                            log_teacher_goal_selection_count_grid,
+                            teacher_goal_count_grid,
                             step,
-                            probs,
-                            ref_obs,
-                            env_state,
-                            competence,
-                            lp_cache,
-                            emp_cache,
-                            emp_grid,
-                        ) = args
-                        log_teacher_softmax_viz(
-                            probs,
-                            ref_obs,
-                            env_state,
-                            int(step),
-                            competence,
-                            lp_cache,
-                            emp_cache,
-                            emp_grid,
                         )
+                        return jnp.array(0, dtype=jnp.int32)
 
-                    step = (
-                        (update_idx + 1)
-                        * config["NUM_STEPS"]
-                        * config["NUM_ENVS"]
+                    def _skip_goal_count_viz(_):
+                        return jnp.array(0, dtype=jnp.int32)
+
+                    jax.lax.cond(
+                        should_log_goal_count_viz,
+                        _run_goal_count_viz,
+                        _skip_goal_count_viz,
+                        operand=None,
                     )
-                    jax.debug.callback(
-                        _softmax_viz_callback,
-                        (
-                            step,
-                            probs_snapshot,
-                            ref_base_obs,
-                            env_state,
-                            competence_vector,
-                            goal_learning_progress_cache,
-                            goal_empowerment_reward_cache,
-                            empowerment_grid_values,
-                        ),
-                    )
-                    return rng_in
 
-                def _skip_teacher_viz(rng_in):
-                    return rng_in
+            # Agent positions saving (in-jit trigger calling host callback)
+            freq_xy = int(config.get("AGENT_POSITIONS_LOG_FREQ", 0))
+            if freq_xy > 0:
+                should_save_xy = (update_idx + 1) % freq_xy == 0
 
-                rng = jax.lax.cond(
-                    should_log_viz,
-                    _run_teacher_viz,
-                    _skip_teacher_viz,
-                    rng,
-                )
+                def _run_save(_):
+                    def _save_agent_xy_host(args):
+                        agent_xy, uidx = args
+                        try:
+                            import numpy as _np
+
+                            agent_xy_np = jax.device_get(agent_xy)
+                            # default: save only reference env to limit size
+                            ref = int(config.get("AGENT_POSITIONS_REF_ENV_INDEX", 0))
+                            only_ref = bool(config.get("AGENT_POSITIONS_ONLY_REF_ENV", True))
+                            if only_ref:
+                                # agent_xy shape: (NUM_STEPS, NUM_ENVS, 2)
+                                agent_xy_np = agent_xy_np[:, ref, :]
+                            flat = agent_xy_np.reshape(-1, 2)
+                            maxp = int(config.get("AGENT_POSITIONS_MAX_POINTS", 10000))
+                            if flat.shape[0] > maxp:
+                                idx = _np.linspace(0, flat.shape[0] - 1, maxp).astype(_np.int32)
+                                flat = flat[idx]
+                            exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
+                            save_dir = config.get("AGENT_POSITIONS_SAVE_DIR") or exp_dir
+                            os.makedirs(save_dir, exist_ok=True)
+                            fname = os.path.join(save_dir, f"{int(uidx)}_agent_positions.npz")
+                            _np.savez(fname, agent_xy=flat, update_idx=int(uidx))
+                        except Exception as err:
+                            print(f"[save_agent_xy_host] skipped saving agent xy: {err}")
+                            traceback.print_exc()
+                        return 0
+
+                    jax.debug.callback(_save_agent_xy_host, (traj_batch.agent_xy, update_idx))
+                    return jnp.array(0, dtype=jnp.int32)
+
+                def _skip_save(_):
+                    return jnp.array(0, dtype=jnp.int32)
+
+                jax.lax.cond(should_save_xy, _run_save, _skip_save, operand=None)
 
             runner_state = (
                 train_state,
@@ -3326,10 +2851,9 @@ def make_train(config):
                 agent_episode_carry,
                 cl_buffer,
                 episode_buf_ptr,
+                teacher_goal_count_grid,
                 rng,
             )
-            if should_save_agent_trajectory_xy:
-                return runner_state, (metric, agent_xy_chunk)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
@@ -3359,16 +2883,12 @@ def make_train(config):
             agent_episode_carry,
             cl_buffer,
             episode_buf_ptr,
+            teacher_goal_count_grid,
             _rng,
         )
-        if should_save_agent_trajectory_xy:
-            runner_state, (metric, agent_trajectory_xy) = jax.lax.scan(
-                _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
-            )
-        else:
-            runner_state, metric = jax.lax.scan(
-                _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
-            )
+        runner_state, metric = jax.lax.scan(
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
+        )
         final_teacher_rollout_buffer = runner_state[20]
         final_cl_buffer = runner_state[22]
         final_episode_buf_ptr = runner_state[23]
@@ -3383,11 +2903,9 @@ def make_train(config):
             "cl_buffer": final_cl_buffer,
             "episode_buf_ptr": final_episode_buf_ptr,
         }
-        if should_save_agent_trajectory_xy:
-            train_output["agent_trajectory_xy"] = agent_trajectory_xy
         return train_output
 
-    return train, render_eval_episode, log_teacher_softmax_snapshot
+    return train, render_eval_episode
 
 
 def main():
@@ -3395,6 +2913,16 @@ def main():
     config = asdict(config_obj)
     gpu_names = sorted({d.device_kind for d in jax.devices("gpu")})
     config["GPU_NAME"] = gpu_names[0]
+
+    # save directory 
+    scratch = os.environ.get("SCRATCH")
+    random_name = RandomWord().word()
+    random_id = np.random.randint(1000000)
+    while os.path.exists(os.path.join(scratch, "purejaxrl", "states", random_name + f"_{random_id}")):
+        random_name = RandomWord().word()
+        random_id = np.random.randint(1000000)
+    config["AGENT_POSITIONS_SAVE_DIR"] = os.path.join(scratch, "purejaxrl", "states", random_name + f"_{random_id}")
+
 
     wandb.init(
         entity=config["ENTITY"],
@@ -3406,14 +2934,13 @@ def main():
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
-    train_fn, render_eval_episode, log_teacher_softmax_snapshot = make_train(config)
+    train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
     jax.block_until_ready(train_output["runner_state"][-1])
     (
         final_train_state,
         _final_teacher_train_state,
-        final_empowerment_train_state,
         final_env_state,
         _final_last_obs,
         _,
@@ -3427,51 +2954,17 @@ def main():
         _,
         _,
         _,
-        final_episode_initial_base_obs,
-        final_goal_learning_progress_cache,
-        final_goal_empowerment_reward_cache,
         _,
         _,
         _,
-        final_cl_buffer,
-        final_episode_buf_ptr,
+        _,
+        _,
+        _,
+        _,
+        _,
         final_rng,
     ) = train_output["runner_state"]
     teacher_params = train_output["teacher_params"]
-    exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
-    exp_name = (
-        wandb.run.name
-        if wandb.run is not None and wandb.run.name
-        else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
-    )
-    if config.get("SAVE_AGENT_TRAJECTORY_XY", False):
-        agent_xy = np.asarray(jax.device_get(train_output["agent_trajectory_xy"]))
-        trajectory_path, flat_xy, global_step = save_agent_trajectory_xy(
-            agent_xy, config, exp_dir, exp_name
-        )
-        num_points = int(flat_xy.shape[0])
-        print(
-            f"[agent_trajectory] saved {trajectory_path} with {num_points} points"
-        )
-        trajectory_plot_path = os.path.join(
-            exp_dir, f"{exp_name}_agent_trajectory.png"
-        )
-        plot_agent_trajectory_xy(
-            flat_xy,
-            global_step,
-            trajectory_plot_path,
-            title=f'Agent trajectory ({config["ENV_NAME"]})',
-        )
-        print(f"[agent_trajectory] saved plot {trajectory_plot_path}")
-        if config.get("WANDB_MODE", "disabled") == "online":
-            wandb.save(trajectory_path, base_path=exp_dir, policy="now")
-            wandb.save(trajectory_plot_path, base_path=exp_dir, policy="now")
-            wandb.log(
-                {
-                    "agent/trajectory_plot": wandb.Image(trajectory_plot_path),
-                },
-                step=int(config["TOTAL_TIMESTEPS"]),
-            )
     if config["SAVE_MODEL"]:
         scratch = os.environ.get("SCRATCH")   
         random_name = RandomWord().word()
@@ -3490,41 +2983,7 @@ def main():
         final_rng,
         final_env_state,
     )
-    ref_env_index = int(config.get("TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX", 0))
-    ref_base_obs = np.asarray(
-        jax.device_get(final_episode_initial_base_obs[ref_env_index])
-    )
-    log_teacher_softmax_snapshot(
-        teacher_params,
-        ref_base_obs,
-        final_competence,
-        final_env_state,
-        int(config["TOTAL_TIMESTEPS"]),
-        final_goal_learning_progress_cache,
-        final_goal_empowerment_reward_cache,
-        cl_buffer=final_cl_buffer,
-        episode_buf_ptr=final_episode_buf_ptr,
-        empowerment_params=final_empowerment_train_state.params,
-        rng=final_rng,
-    )
-
-
-def _run_teacher_softmax_snapshot_index_checks() -> None:
-    """Lightweight host-side checks for snapshot index scheduling."""
-    for num_updates, num_snapshots in (
-        (18310, 100),
-        (18310, 1000),
-        (100, 1000),
-        (1_831_050, 10_000),
-    ):
-        indices = _compute_teacher_softmax_snapshot_indices(
-            num_updates, num_snapshots
-        )
-        _verify_teacher_softmax_snapshot_indices(
-            indices, num_updates, num_snapshots
-        )
 
 
 if __name__ == "__main__":
-    _run_teacher_softmax_snapshot_index_checks()
     main()

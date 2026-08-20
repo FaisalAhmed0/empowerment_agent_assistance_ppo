@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_emp_reward_2"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_emp_reward_3"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--no-USE_LEARNING_PROGRESS_REWARD"
@@ -28,6 +28,7 @@ GOAL_REWARD_COEF=(1)
 ### Teacher hyperparameters
 TEACHER_ROLLOUT_BUFFER_SIZES=(1 2 4 30)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
+USE_DISTANCE_IN_COMPETENCES=(--no-USE_DISTANCE_IN_COMPETENCE)
 ENERGY_FUNCTIONS=(l2 norm dot cosine)
 CONTRASTIVE_LOSS_TYPES=(fwd_infonce bwd_infonce sym_infonce)
 run_count=0
@@ -57,6 +58,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for empowerment_num_minibatches in "${EMPOWERMENT_NUM_MINIBATCHES[@]}"; do
                         for gamma_cls in "${GAMMA_CLS[@]}"; do
                         for empowerment_update_epochs in "${EMPOWERMENT_UPDATE_EPOCHSS[@]}"; do
+                        for USE_DISTANCE_IN_COMPETENCE in "${USE_DISTANCE_IN_COMPETENCES[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -73,6 +75,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --EMPOWERMENT_NUM_MINIBATCHES=${empowerment_num_minibatches} \
                         --SEED=${SEED} \
                         ${ADD_GOAL_REWARD} \
+                        ${USE_DISTANCE_IN_COMPETENCE} \
                         ${CONDITION_ON_GOAL} \
                         --NUM_STEPS=${num_steps} \
                         --GAE_LAMBDA=${gae_lambda} \
@@ -96,6 +99,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
             done
             done
           done
+        done
         done
         done
         done
