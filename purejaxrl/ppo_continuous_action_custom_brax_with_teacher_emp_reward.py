@@ -69,7 +69,7 @@ class TrainConfig:
     ENTITY: str = ""
     PROJECT: str = "purejaxrl"
     EVAL_RENDER_STEPS: int = 1000
-    EVAL_RENDER_MAX_FRAMES: int = 100
+    EVAL_RENDER_MAX_FRAMES: int = 1000
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     COMMENT: str = ""
@@ -82,7 +82,11 @@ class TrainConfig:
     TEACHER_GOAL_Y_MAX: float = 12.0
     TEACHER_NUM_GOAL_POINTS: int = 30
     TEACHER_GOAL_COUNT_VIZ_LOG_WANDB: bool = True
-    TEACHER_GOAL_COUNT_VIZ_FREQ: int = 25
+    TEACHER_GOAL_COUNT_VIZ_FREQ: int = 100
+    TEACHER_EMPOWERMENT_GRID_VIZ_LOG_WANDB: bool = True
+    TEACHER_EMPOWERMENT_GRID_VIZ_FREQ: int = 100
+    TEACHER_EMPOWERMENT_GRID_NUM_FUTURES: int = 64
+    TEACHER_EMPOWERMENT_GRID_REF_ENV_INDEX: int = 0
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
@@ -106,6 +110,7 @@ class TrainConfig:
     TEACHER_ENT_COEF: float = 0.0
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
+    TEACHER_USE_ENCODERS: bool = True
     # Empowerment model
     EMPOWERMENT_LR: float = 3e-4
     EMPOWERMENT_MAX_GRAD_NORM: float = 1.0
@@ -116,7 +121,7 @@ class TrainConfig:
     EMPOWERMENT_ENERGY_FN: str = "l2"
     EMPOWERMENT_CONTRASTIVE_LOSS: str = "fwd_infonce"
     # Agent XY logging
-    AGENT_POSITIONS_LOG_FREQ: int = 0
+    AGENT_POSITIONS_LOG_FREQ: int = 10
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
     AGENT_POSITIONS_INJIT_SUBSAMPLE_EVERY: int = 1
     AGENT_POSITIONS_SAVE_DIR: str | None = None
@@ -309,6 +314,11 @@ def _scatter_goal_empowerment_reward(cache, goal_idx, emp_values, done):
     return cache.at[goal_idx].set(updated)
 
 
+def _global_gradient_norm(grads):
+    flat_grads, _ = jax.flatten_util.ravel_pytree(grads)
+    return jnp.linalg.norm(flat_grads)
+
+
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
@@ -329,6 +339,10 @@ class ActorCritic(nn.Module):
         )(actor_mean)
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
+                    self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(actor_mean)
+        actor_mean = activation(actor_mean)
+        actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
@@ -342,6 +356,10 @@ class ActorCritic(nn.Module):
             self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic)
         critic = activation(critic)
+        critic = nn.Dense(
+                    self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(critic)
+        critic = activation(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -351,12 +369,38 @@ class ActorCritic(nn.Module):
 
 class TeacherActorCritic(nn.Module):
     num_actions: int
+    obs_dim: int
+    competence_dim: int
+    student_action_dim: int
     activation: str = "tanh"
     hidden_dim: int = 128
+    use_encoders: bool = False
 
     @nn.compact
     def __call__(self, x):
         act = nn.relu if self.activation == "relu" else nn.tanh
+        if self.use_encoders:
+            obs = x[..., :self.obs_dim]
+            competence = x[..., self.obs_dim:self.obs_dim+self.competence_dim]
+            student_action = x[..., self.obs_dim+self.competence_dim:self.obs_dim+self.competence_dim+self.student_action_dim]
+            obs = nn.Dense(
+                            32,
+                            kernel_init=orthogonal(np.sqrt(2)),
+                            bias_init=constant(0.0),
+                        )(obs)
+            competence = nn.Dense(
+                            32,
+                            kernel_init=orthogonal(np.sqrt(2)),
+                            bias_init=constant(0.0),
+                        )(competence)
+            student_action = nn.Dense(
+                        32,
+                        kernel_init=orthogonal(np.sqrt(2)),
+                        bias_init=constant(0.0),
+                    )(student_action)
+            x = jnp.concatenate([obs, competence, student_action], axis=-1)
+        else:
+            x = x
         actor_mean = act(
             nn.Dense(
                 self.hidden_dim,
@@ -721,8 +765,10 @@ def compute_teacher_empowerment_reward(
     goal,
     future_state,
     competence_vector,
+    current_action=None,
 ):
-    current_action = initial_action
+    if current_action is None:
+        current_action = initial_action
 
     def _forward(p):
         return apply_fn(
@@ -781,6 +827,131 @@ def evaluate_teacher_empowerment_reward_grid(
             )
         )
     )(init_s, init_a, goal_grid, fut, comp)
+
+
+def evaluate_teacher_empowerment_reward_grid_over_futures(
+    apply_fn,
+    params,
+    energy_name,
+    initial_state,
+    initial_action,
+    current_action,
+    future_states,
+    competence_vector,
+    goal_grid,
+):
+    """Average empowerment reward over future states for every goal."""
+    def evaluate_one_future(future_state):
+        return jax.vmap(
+            lambda goal: compute_teacher_empowerment_reward(
+                apply_fn,
+                params,
+                energy_name,
+                initial_state,
+                initial_action,
+                goal,
+                future_state,
+                competence_vector,
+                current_action=current_action,
+            )
+        )(goal_grid)
+
+    return jax.vmap(evaluate_one_future)(future_states).mean(axis=0)
+
+
+def sample_empowerment_grid_inputs(
+    rng,
+    buffer,
+    episode_len,
+    ref_env_index,
+    num_futures,
+    gamma,
+):
+    """Select one episode-start tuple and sample its valid future states."""
+    ref_env_index = jnp.asarray(ref_env_index, dtype=jnp.int32)
+    episode_len = jnp.maximum(episode_len, jnp.array(1, dtype=jnp.int32))
+    rows = jnp.arange(buffer.current_state.shape[0])
+    valid_rows = rows < episode_len
+    distances = rows.astype(jnp.float32)
+    probabilities = jnp.where(valid_rows, jnp.power(gamma, distances), 0.0)
+    probabilities = probabilities / jnp.maximum(probabilities.sum(), 1e-12)
+    future_indices = jax.random.categorical(
+        rng,
+        jnp.broadcast_to(
+            jnp.log(jnp.clip(probabilities, a_min=1e-20, a_max=1.0)),
+            (num_futures, probabilities.shape[0]),
+        ),
+        axis=-1,
+    )
+    future_states = buffer.current_state[future_indices, ref_env_index]
+    latest_index = jnp.minimum(
+        episode_len - 1, buffer.current_state.shape[0] - 1
+    )
+    return (
+        buffer.initial_state[0, ref_env_index],
+        buffer.initial_action[0, ref_env_index],
+        buffer.current_action[0, ref_env_index],
+        future_states[:num_futures],
+        buffer.competence_vector[latest_index, ref_env_index],
+    )
+
+
+def plot_teacher_empowerment_grid(
+    goal_grid_xy,
+    values,
+    num_points,
+    *,
+    start_xy=None,
+    title=None,
+    save_path=None,
+):
+    """Plot empowerment reward averaged over future states on the goal grid."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    goal_grid_xy = np.asarray(goal_grid_xy)
+    values = np.asarray(values).reshape(-1)
+    gx = goal_grid_xy[:, 0].reshape(num_points, num_points)
+    gy = goal_grid_xy[:, 1].reshape(num_points, num_points)
+    value_grid = values.reshape(num_points, num_points)
+    abs_max = float(np.max(np.abs(value_grid))) if value_grid.size else 0.0
+    limit = abs_max if abs_max > 0.0 else 1.0
+
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    mesh = ax.pcolormesh(
+        gx,
+        gy,
+        value_grid,
+        shading="nearest",
+        cmap="copper",
+        vmin=-limit,
+        vmax=limit,
+    )
+    fig.colorbar(mesh, ax=ax, label="Empowerment reward")
+    if start_xy is not None:
+        start_xy = np.asarray(start_xy).reshape(-1)
+        ax.scatter(
+            start_xy[0],
+            start_xy[1],
+            s=200,
+            marker="*",
+            c="tab:red",
+            edgecolors="black",
+            linewidths=0.5,
+            zorder=3,
+            label="Agent start",
+        )
+        ax.legend(loc="best")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="datalim")
+    if title is not None:
+        ax.set_title(title)
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig, ax
 
 
 def sample_teacher_future_at_init(rng, buffer, episode_len, gamma):
@@ -1131,10 +1302,24 @@ def make_train(config):
         )
         return config["TEACHER_LR"] * frac
 
+    empowerment_num_updates = max(1, approx_episode_cycles)
+
+    def empowerment_linear_schedule(count):
+        frac = (
+            1.0
+            - (
+                count
+                // (empowerment_num_minibatches * empowerment_update_epochs)
+            )
+            / empowerment_num_updates
+        )
+        return config["EMPOWERMENT_LR"] * frac
+
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
     )
     base_obs_dim = int(env.observation_space(env_params).shape[0])
+    # import pdb;pdb.set_trace
     teacher_num_goal_points = int(config["TEACHER_NUM_GOAL_POINTS"])
     xs = jnp.linspace(
         config["TEACHER_GOAL_X_MIN"],
@@ -1160,12 +1345,18 @@ def make_train(config):
         condition_teacher_on_competence or use_average_competence_reward
     )
     teacher_obs_dim = (
-        base_obs_dim + num_competence if condition_teacher_on_competence else base_obs_dim
+        base_obs_dim
+        + (num_competence if condition_teacher_on_competence else 0)
+        + action_dim
     )
     teacher_network = TeacherActorCritic(
         num_actions=teacher_num_goal_points * teacher_num_goal_points,
+        obs_dim=base_obs_dim, 
+        competence_dim=num_competence if condition_teacher_on_competence else 0,
+        student_action_dim=action_dim,
         activation=config["ACTIVATION"],
         hidden_dim=config["TEACHER_HIDDEN_DIM"],
+        use_encoders=config["TEACHER_USE_ENCODERS"]
     )
     empowerment_network = EmpowermentModel(
         repr_dim=int(config["EMPOWERMENT_REPR_DIM"]),
@@ -1196,27 +1387,35 @@ def make_train(config):
             obs = obs[0]
         return (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
 
-    def _build_teacher_input(obs, competence_vector):
+    def _build_teacher_input(obs, competence_vector, action):
         if obs.ndim == 1:
             obs = obs[None, :]
-        if not condition_teacher_on_competence:
-            return obs
-        comp_batch = jnp.broadcast_to(
-            competence_vector, (obs.shape[0], competence_vector.shape[0])
-        )
-        return jnp.concatenate([obs, comp_batch], axis=-1)
+        if action.ndim == 1:
+            action = action[None, :]
+        # import pdb; pdb.set_trace()
+        action_batch = jnp.broadcast_to(action, (obs.shape[0], action.shape[-1]))
+        inputs = [obs]
+        if condition_teacher_on_competence:
+            comp_batch = jnp.broadcast_to(
+                competence_vector, (obs.shape[0], competence_vector.shape[0])
+            )
+            inputs.append(comp_batch)
+        inputs.append(action_batch)
+        return jnp.concatenate(inputs, axis=-1)
 
-    def _teacher_act(teacher_params, obs, competence_vector, rng):
-        teacher_obs = _build_teacher_input(obs, competence_vector)
+    def _teacher_act(teacher_params, obs, competence_vector, action, rng):
+        teacher_obs = _build_teacher_input(obs, competence_vector, action)
         pi, value = teacher_network.apply(teacher_params, teacher_obs)
         goal_idx = pi.sample(seed=rng)
         raw_goal = goal_grid[goal_idx].astype(jnp.float32)
         log_prob = pi.log_prob(goal_idx)
         return raw_goal, goal_idx, log_prob, value, teacher_obs
 
-    def _sample_teacher_goals(teacher_params, obs, competence_vector, rng):
+    def _sample_teacher_goals(
+        teacher_params, obs, competence_vector, action, rng
+    ):
         raw_goal, _, _, _, _ = _teacher_act(
-            teacher_params, obs, competence_vector, rng
+            teacher_params, obs, competence_vector, action, rng
         )
         return raw_goal
 
@@ -1226,7 +1425,7 @@ def make_train(config):
         return raw_goal
 
     render_sim_steps = int(config.get("EVAL_RENDER_STEPS", 1000))
-    render_max_frames = int(config.get("EVAL_RENDER_MAX_FRAMES", 120))
+    render_max_frames = int(config.get("EVAL_RENDER_MAX_FRAMES", 1000))
     render_action_repeat = int(config.get("ACTION_REPEAT", 1))
     action_low = jnp.asarray(env.action_space(env_params).low)
     action_high = jnp.asarray(env.action_space(env_params).high)
@@ -1248,6 +1447,15 @@ def make_train(config):
         pi, _ = network.apply(params, policy_obs)
         return jnp.clip(pi.mean(), action_low, action_high)
 
+    def _sample_render_action(params, obs, obs_mean, obs_var, policy_goal, rng):
+        norm_obs = _normalize_eval_obs(obs, obs_mean, obs_var)
+        if condition_on_goal:
+            policy_obs = jnp.concatenate([norm_obs, policy_goal], axis=-1)
+        else:
+            policy_obs = norm_obs
+        pi, _ = network.apply(params, policy_obs)
+        return jnp.clip(pi.sample(seed=rng), action_low, action_high)
+
     def _render_rollout_impl(
         params, teacher_params, competence_vector, rng, obs_mean, obs_var
     ):
@@ -1258,8 +1466,15 @@ def make_train(config):
         if condition_on_goal:
             rng, goal_rng = jax.random.split(rng)
             norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
+            bootstrap_action = _sample_render_action(
+                params, state.obs, obs_mean, obs_var, policy_goal, goal_rng
+            )
             raw_goal = _sample_teacher_goals(
-                teacher_params, norm_obs, competence_vector, goal_rng
+                teacher_params,
+                norm_obs,
+                competence_vector,
+                bootstrap_action,
+                goal_rng,
             )
             if raw_goal.ndim > 1:
                 raw_goal = raw_goal[0]
@@ -1267,12 +1482,15 @@ def make_train(config):
 
         def step_fn(carry, _):
             state, raw_goal, policy_goal, rng = carry
+            rng, action_rng, goal_rng = jax.random.split(rng, 3)
             if condition_on_goal:
-                action = _eval_render_action(
-                    params, state.obs, obs_mean, obs_var, policy_goal
+                action = _sample_render_action(
+                    params, state.obs, obs_mean, obs_var, policy_goal, action_rng
                 )
             else:
-                action = _eval_render_action(params, state.obs, obs_mean, obs_var)
+                action = _sample_render_action(
+                    params, state.obs, obs_mean, obs_var, policy_goal, action_rng
+                )
 
             def repeat_step(s, __):
                 return base_env.step(s, action), None
@@ -1281,10 +1499,22 @@ def make_train(config):
                 repeat_step, state, None, length=render_action_repeat
             )
             if condition_on_goal:
-                rng, goal_rng = jax.random.split(rng)
                 norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
+                bootstrap_goal = jnp.zeros_like(policy_goal)
+                bootstrap_action = _sample_render_action(
+                    params,
+                    state.obs,
+                    obs_mean,
+                    obs_var,
+                    bootstrap_goal,
+                    action_rng,
+                )
                 new_raw_goal = _sample_teacher_goals(
-                    teacher_params, norm_obs, competence_vector, goal_rng
+                    teacher_params,
+                    norm_obs,
+                    competence_vector,
+                    bootstrap_action,
+                    goal_rng,
                 )
                 if new_raw_goal.ndim > 1:
                     new_raw_goal = new_raw_goal[0]
@@ -1419,24 +1649,36 @@ def make_train(config):
             jnp.zeros((base_obs_dim,)),
             jnp.zeros((num_competence,)),
         ) # empowerment model is as follow: 
-        empowerment_tx = optax.chain(
-            optax.clip_by_global_norm(config["EMPOWERMENT_MAX_GRAD_NORM"]),
-            optax.adam(config["EMPOWERMENT_LR"], eps=1e-5),
-        )
+        if config["ANNEAL_LR"]:
+            empowerment_tx = optax.chain(
+                optax.clip_by_global_norm(config["EMPOWERMENT_MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=empowerment_linear_schedule, eps=1e-5),
+            )
+        else:
+            empowerment_tx = optax.chain(
+                optax.clip_by_global_norm(config["EMPOWERMENT_MAX_GRAD_NORM"]),
+                optax.adam(config["EMPOWERMENT_LR"], eps=1e-5),
+            )
         empowerment_train_state = TrainState.create(
             apply_fn=empowerment_network.apply,
             params=empowerment_init_params,
             tx=empowerment_tx,
         )
 
-        def sample_teacher_goals(obs, competence_vector, rng):
+        def sample_teacher_goals(obs, competence_vector, action, rng):
             return _sample_teacher_goals(
-                teacher_train_state.params, obs, competence_vector, rng
+                teacher_train_state.params, obs, competence_vector, action, rng
             )
 
-        def teacher_act_and_carry(obs, competence_vector, rng):
+        def teacher_act_and_carry(obs, competence_vector, action, rng):
             raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs = (
-                _teacher_act(teacher_train_state.params, obs, competence_vector, rng)
+                _teacher_act(
+                    teacher_train_state.params,
+                    obs,
+                    competence_vector,
+                    action,
+                    rng,
+                )
             )
             carry = teacher_carry_from_act(
                 raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs
@@ -1522,11 +1764,19 @@ def make_train(config):
         episode_initial_base_obs = obsv[..., :base_obs_dim]
         # NOTE: replace this with the competence of the randomly initilized policy
         competence_vector = compute_competence_vector(train_state.params, env_state)
+        bootstrap_policy_obs = obsv
+        if condition_on_goal:
+            bootstrap_policy_obs = jnp.concatenate(
+                [bootstrap_policy_obs, jnp.zeros((config["NUM_ENVS"], goal_dim))],
+                axis=-1,
+            )
+        bootstrap_pi, _ = network.apply(train_state.params, bootstrap_policy_obs)
+        bootstrap_action = bootstrap_pi.sample(seed=goal_rng)
         # import pdb;pdb.set_trace()
         # competence_vector = jnp.zeros((num_competence,), dtype=obsv.dtype)
         # import pdb;pdb.set_trace()
         raw_goals, teacher_episode_carry = teacher_act_and_carry(
-            obsv[..., :base_obs_dim], competence_vector, goal_rng
+            obsv[..., :base_obs_dim], competence_vector, bootstrap_action, goal_rng
         )
         teacher_rollout_buffer = init_teacher_rollout_buffer(
             teacher_rollout_buffer_size,
@@ -1675,6 +1925,47 @@ def make_train(config):
                 )
                 traceback.print_exc()
 
+        def log_teacher_empowerment_grid(values, start_xy, step):
+            """Log a future-state-averaged empowerment heatmap to WandB."""
+            try:
+                if config.get("WANDB_MODE", "disabled") != "online":
+                    return
+                import matplotlib.pyplot as plt
+
+                values = np.asarray(jax.device_get(values)).reshape(-1)
+                start_xy = np.asarray(jax.device_get(start_xy)).reshape(-1)
+                goal_grid_xy = np.asarray(jax.device_get(goal_grid))
+                exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
+                exp_name = (
+                    wandb.run.name
+                    if wandb.run is not None and wandb.run.name
+                    else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+                )
+                save_path = os.path.join(
+                    exp_dir, f"{exp_name}_teacher_empowerment_grid_{int(step)}.png"
+                )
+                fig, _ = plot_teacher_empowerment_grid(
+                    goal_grid_xy,
+                    values,
+                    teacher_num_goal_points,
+                    start_xy=start_xy,
+                    title=(
+                        f"Teacher empowerment reward @ step {int(step)} "
+                        f"({config['ENV_NAME']})"
+                    ),
+                    save_path=save_path,
+                )
+                wandb.log(
+                    {"teacher/empowerment_reward_grid": wandb.Image(fig)},
+                    step=int(step),
+                )
+                plt.close(fig)
+            except Exception as err:
+                print(
+                    f"[log_teacher_empowerment_grid] skipped empowerment visual: {err}"
+                )
+                traceback.print_exc()
+
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
             # COLLECT TRAJECTORIES
@@ -1745,6 +2036,7 @@ def make_train(config):
                     # jax.debug.print("dist: {dist}", dist=dist)
                     # jax.debug.print("goals: {goals}", goals=goals)
                     # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
+                    # import pdb;pdb.set_trace()
                     reward = task_reward + config["GOAL_REWARD_COEF"] * goal_reward
                     if config["INTERPOLATED_REWARD"]:
                         reward = (1-config["GOAL_REWARD_COEF"]) * task_reward + config["GOAL_REWARD_COEF"] * goal_reward
@@ -1887,7 +2179,7 @@ def make_train(config):
                     )
 
                 # compute the final teacher's reward
-                teacher_reward = ( success_part
+                teacher_reward = ( step_success
                     + teacher_empowerment_reward_coef * teacher_emp_part
                 )
                 # update the buffer pointer
@@ -1914,8 +2206,9 @@ def make_train(config):
                     teacher_obs,
                 ) = _teacher_act(
                     teacher_train_state.params,
-                    obsv[..., :base_obs_dim],
+                    current_state,
                     competence_vector,
+                    action,
                     goal_rng,
                 )
                 fresh_carry = teacher_carry_from_act(
@@ -2148,11 +2441,18 @@ def make_train(config):
                         return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
+                    (total_loss, (value_loss, actor_loss, entropy)), grads = grad_fn(
                         train_state.params, traj_batch, advantages, targets
                     )
+                    gradient_norm = _global_gradient_norm(grads)
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    return train_state, (
+                        total_loss,
+                        value_loss,
+                        actor_loss,
+                        entropy,
+                        gradient_norm,
+                    )
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
@@ -2188,6 +2488,10 @@ def make_train(config):
             metric = traj_batch.info
             rng = update_state[-1]
             total_loss = loss_info[0].mean()
+            value_loss = loss_info[1].mean()
+            actor_loss = loss_info[2].mean()
+            entropy = loss_info[3].mean()
+            student_gradient_norm = loss_info[4].mean()
 
             def _run_empowerment_update(operands):
                 e_state, buf, rng_in = operands
@@ -2228,8 +2532,9 @@ def make_train(config):
                             e_state.params, batch
                         )
                         e_state = e_state.apply_gradients(grads=grads)
+                        gradient_norm = _global_gradient_norm(grads)
                         return e_state, jnp.stack(
-                            [total_loss, loss_13, loss_23], axis=0
+                            [total_loss, loss_13, loss_23, gradient_norm], axis=0
                         )
 
                     e_state, flat_batch, rng_b = update_state
@@ -2262,6 +2567,7 @@ def make_train(config):
                     e_loss_info[:, 0].mean(),
                     e_loss_info[:, 1].mean(),
                     e_loss_info[:, 2].mean(),
+                    e_loss_info[:, 3].mean(),
                     jnp.array(1.0, dtype=jnp.float32),
                 )
                 return e_state, buf, rng_in, metrics
@@ -2269,7 +2575,7 @@ def make_train(config):
             def _skip_empowerment_update(operands):
                 e_state, buf, rng_in = operands
                 z = jnp.array(0.0, dtype=jnp.float32)
-                return e_state, buf, rng_in, (z, z, z, z)
+                return e_state, buf, rng_in, (z, z, z, z, z)
 
             (
                 empowerment_train_state,
@@ -2285,7 +2591,87 @@ def make_train(config):
             empowerment_total_loss = empowerment_metrics[0]
             empowerment_loss_enc1_enc3 = empowerment_metrics[1]
             empowerment_loss_enc2_enc3 = empowerment_metrics[2]
-            empowerment_did_update = empowerment_metrics[3]
+            empowerment_gradient_norm = empowerment_metrics[3]
+            empowerment_did_update = empowerment_metrics[4]
+            empowerment_current_lr = (
+                empowerment_linear_schedule(empowerment_train_state.step)
+                if config["ANNEAL_LR"]
+                else config["EMPOWERMENT_LR"]
+            )
+
+            if config.get("TEACHER_EMPOWERMENT_GRID_VIZ_LOG_WANDB", True):
+                empowerment_grid_freq = int(
+                    config.get("TEACHER_EMPOWERMENT_GRID_VIZ_FREQ", 25)
+                )
+                if empowerment_grid_freq > 0:
+                    should_log_empowerment_grid = (
+                        (update_idx + 1) % empowerment_grid_freq == 0
+                    )
+
+                    def _run_empowerment_grid_viz(_):
+                        ref_env_index = int(
+                            config.get("TEACHER_EMPOWERMENT_GRID_REF_ENV_INDEX", 0)
+                        )
+                        num_futures = int(
+                            config.get("TEACHER_EMPOWERMENT_GRID_NUM_FUTURES", 64)
+                        )
+                        viz_rng, next_rng = jax.random.split(rng)
+                        episode_len = jnp.minimum(
+                            episode_buf_ptr[ref_env_index] + 1,
+                            cl_buffer_size,
+                        )
+                        (
+                            initial_state,
+                            initial_action,
+                            current_action,
+                            future_states,
+                            latest_competence,
+                        ) = sample_empowerment_grid_inputs(
+                            viz_rng,
+                            cl_buffer,
+                            episode_len,
+                            ref_env_index,
+                            num_futures,
+                            gamma_cl,
+                        )
+                        values = (
+                            evaluate_teacher_empowerment_reward_grid_over_futures(
+                                empowerment_network.apply,
+                                empowerment_train_state.params,
+                                empowerment_energy_fn,
+                                initial_state,
+                                initial_action,
+                                current_action,
+                                future_states,
+                                latest_competence,
+                                goal_grid,
+                            )
+                        )
+                        if config.get("NORMALIZE_ENV", False):
+                            start_xy = (
+                                initial_state[:2]
+                                * jnp.sqrt(env_state.var[ref_env_index, :2] + 1e-8)
+                                + env_state.mean[ref_env_index, :2]
+                            )
+                        else:
+                            start_xy = initial_state[:2]
+                        jax.debug.callback(
+                            log_teacher_empowerment_grid,
+                            values,
+                            start_xy,
+                            (update_idx + 1) * config["NUM_STEPS"] * config["NUM_ENVS"],
+                        )
+                        return next_rng
+
+                    def _skip_empowerment_grid_viz(_):
+                        return rng
+
+                    rng = jax.lax.cond(
+                        should_log_empowerment_grid,
+                        _run_empowerment_grid_viz,
+                        _skip_empowerment_grid_viz,
+                        operand=None,
+                    )
 
             teacher_should_update = (
                 teacher_rollout_buffer.count >= teacher_rollout_buffer_size
@@ -2365,11 +2751,18 @@ def make_train(config):
                             return total_loss, (value_loss, loss_actor, entropy)
 
                         grad_fn = jax.value_and_grad(_t_loss_fn, has_aux=True)
-                        total_loss, grads = grad_fn(
+                        (total_loss, (value_loss, actor_loss, entropy)), grads = grad_fn(
                             t_state.params, traj_b, gae_b, tgt_b
                         )
+                        gradient_norm = _global_gradient_norm(grads)
                         t_state = t_state.apply_gradients(grads=grads)
-                        return t_state, total_loss
+                        return t_state, (
+                            total_loss,
+                            value_loss,
+                            actor_loss,
+                            entropy,
+                            gradient_norm,
+                        )
 
                     t_state, traj_b, advantages_b, targets_b, rng_b = update_state
                     rng_b, _rng_b = jax.random.split(rng_b)
@@ -2412,9 +2805,10 @@ def make_train(config):
                 new_buffer = reset_teacher_rollout_buffer(t_buffer)
                 metrics = (
                     t_loss_info[0].mean(),
-                    t_loss_info[1][0].mean(),
-                    t_loss_info[1][1].mean(),
-                    t_loss_info[1][2].mean(),
+                    t_loss_info[1].mean(),
+                    t_loss_info[2].mean(),
+                    t_loss_info[3].mean(),
+                    t_loss_info[4].mean(),
                     jnp.array(1.0, dtype=jnp.float32),
                     jnp.array(float(teacher_batch_size), dtype=jnp.float32),
                 )
@@ -2423,7 +2817,7 @@ def make_train(config):
             def _skip_teacher_update(operands):
                 t_train_state, t_buffer, t_rng = operands
                 z = jnp.array(0.0, dtype=jnp.float32)
-                return t_train_state, t_buffer, t_rng, (z, z, z, z, z, z)
+                return t_train_state, t_buffer, t_rng, (z, z, z, z, z, z, z)
 
             (
                 teacher_train_state,
@@ -2440,8 +2834,9 @@ def make_train(config):
             teacher_value_loss = teacher_metrics[1]
             teacher_actor_loss = teacher_metrics[2]
             teacher_entropy = teacher_metrics[3]
-            teacher_did_update = teacher_metrics[4]
-            teacher_update_batch_size = teacher_metrics[5]
+            teacher_gradient_norm = teacher_metrics[4]
+            teacher_did_update = teacher_metrics[5]
+            teacher_update_batch_size = teacher_metrics[6]
             teacher_current_lr = (
                 teacher_linear_schedule(
                     update_idx
@@ -2452,9 +2847,6 @@ def make_train(config):
                 else config["TEACHER_LR"]
             )
 
-            value_loss = loss_info[1][0].mean()
-            actor_loss = loss_info[1][1].mean()
-            entropy = loss_info[1][2].mean()
             task_reward_mean = traj_batch.task_reward.mean()
             task_reward_std = traj_batch.task_reward.std()
             goal_reward_mean = traj_batch.goal_reward.mean()
@@ -2578,6 +2970,7 @@ def make_train(config):
                         value_loss,
                         actor_loss,
                         entropy,
+                        student_gradient_norm,
                         task_reward_mean,
                         task_reward_std,
                         goal_reward_mean,
@@ -2606,20 +2999,23 @@ def make_train(config):
                         teacher_did_update,
                         teacher_current_lr,
                         teacher_update_batch_size,
+                        teacher_gradient_norm,
                         empowerment_episode_done_f,
                         empowerment_total_loss,
                         empowerment_loss_enc1_enc3,
                         empowerment_loss_enc2_enc3,
+                        empowerment_gradient_norm,
                         empowerment_did_update,
+                        empowerment_current_lr,
                     ) = args
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
                     ]
-                    if len(return_values) == 0:
-                        return
 
                     now = time.perf_counter()
-                    log_metrics = {"episodic_return": float(return_values.mean())}
+                    log_metrics = {}
+                    if len(return_values) > 0:
+                        log_metrics["episodic_return"] = float(return_values.mean())
                     if _wandb_timer["last_time"] is not None:
                         elapsed = now - _wandb_timer["last_time"]
                         if elapsed > 0:
@@ -2633,6 +3029,7 @@ def make_train(config):
                             "value_loss": float(value_loss),
                             "actor_loss": float(actor_loss),
                             "entropy": float(entropy),
+                            "student/gradient_norm": float(student_gradient_norm),
                             "task_reward_mean": float(task_reward_mean),
                             "task_reward_std": float(task_reward_std),
                             "goal_reward_mean": float(goal_reward_mean),
@@ -2660,6 +3057,9 @@ def make_train(config):
                     if float(empowerment_did_update) > 0:
                         log_metrics.update(
                             {
+                                "empowerment/learning_rate": float(
+                                    empowerment_current_lr
+                                ),
                                 "empowerment/total_loss": float(
                                     empowerment_total_loss
                                 ),
@@ -2713,7 +3113,12 @@ def make_train(config):
                                 "teacher/batch_size": float(
                                     teacher_update_batch_size
                                 ),
+                                "teacher/gradient_norm": float(teacher_gradient_norm),
                             }
+                        )
+                    if float(empowerment_did_update) > 0:
+                        log_metrics["empowerment/gradient_norm"] = float(
+                            empowerment_gradient_norm
                         )
                     wandb.log(log_metrics, step=step)
 
@@ -2725,6 +3130,7 @@ def make_train(config):
                         value_loss,
                         actor_loss,
                         entropy,
+                        student_gradient_norm,
                         task_reward_mean,
                         task_reward_std,
                         goal_reward_mean,
@@ -2753,11 +3159,14 @@ def make_train(config):
                         teacher_did_update,
                         teacher_current_lr,
                         teacher_update_batch_size,
+                        teacher_gradient_norm,
                         empowerment_episode_done_f,
                         empowerment_total_loss,
                         empowerment_loss_enc1_enc3,
                         empowerment_loss_enc2_enc3,
+                        empowerment_gradient_norm,
                         empowerment_did_update,
+                        empowerment_current_lr,
                     ),
                 )
 
@@ -2941,11 +3350,13 @@ def main():
     (
         final_train_state,
         _final_teacher_train_state,
+        _final_empowerment_train_state,
         final_env_state,
         _final_last_obs,
         _,
         _,
         final_competence,
+        _,
         _,
         _,
         _,

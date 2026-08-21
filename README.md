@@ -247,7 +247,7 @@ Trains an **EmpowermentModel** (contrastive encoders) based on [https://arxiv.or
 | `TEACHER_EMPOWERMENT_REWARD_COEF` | `1.0`         | Scale on empowerment reward                          |
 | `GAMMA_CL`                        | `0.99`        | Discount for future-state sampling                   |
 | `CL_BUFFER_SIZE`                  | `1000`        | Contrastive-learning episode buffer size             |
-| `EMPOWERMENT_LR`                  | `3e-4`        | Empowerment model learning rate                      |
+| `EMPOWERMENT_LR`                  | `3e-4`        | Initial empowerment model learning rate; linearly annealed when `ANNEAL_LR=True` |
 | `EMPOWERMENT_REPR_DIM`            | `64`          | Representation dimension                             |
 | `EMPOWERMENT_HIDDEN_DIM`          | `256`         | Empowerment MLP hidden size                          |
 | `EMPOWERMENT_UPDATE_EPOCHS`       | `1`           | Training epochs per empowerment update               |
