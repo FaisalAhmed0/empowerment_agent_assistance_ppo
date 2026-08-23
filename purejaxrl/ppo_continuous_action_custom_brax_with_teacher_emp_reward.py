@@ -51,7 +51,7 @@ class TrainConfig:
     CL_BUFFER_SIZE: int = 1000
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
-    ENT_COEF: float = 0.0
+    ENT_COEF: float = 0.05
     VF_COEF: float = 0.5
     HIDDEN_DIM: int = 256
     MAX_GRAD_NORM: float = 1.0
@@ -107,7 +107,7 @@ class TrainConfig:
     TEACHER_GAMMA: float = 0.99
     TEACHER_GAE_LAMBDA: float = 0.8
     TEACHER_CLIP_EPS: float = 0.2
-    TEACHER_ENT_COEF: float = 0.0
+    TEACHER_ENT_COEF: float = 0.05
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
     TEACHER_USE_ENCODERS: bool = True
@@ -118,8 +118,10 @@ class TrainConfig:
     EMPOWERMENT_HIDDEN_DIM: int = 256
     EMPOWERMENT_UPDATE_EPOCHS: int = 1
     EMPOWERMENT_NUM_MINIBATCHES: int = 128
+    EMPOWERMENT_SUBSAMPLE_SIZE: int = 0
     EMPOWERMENT_ENERGY_FN: str = "l2"
     EMPOWERMENT_CONTRASTIVE_LOSS: str = "fwd_infonce"
+    USE_SEPARATE_FUTURE_STATE_ENCODERS: bool = False
     # Agent XY logging
     AGENT_POSITIONS_LOG_FREQ: int = 10
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
@@ -468,16 +470,21 @@ class EmpowermentRepr(NamedTuple):
     action_cond_repr: jnp.ndarray
     context_repr: jnp.ndarray
     future_state_repr: jnp.ndarray
+    action_cond_future_state_repr: jnp.ndarray
+    context_future_state_repr: jnp.ndarray
 
 
 class EmpowermentModel(nn.Module):
-    """Three encoders for empowerment representations.
+    """Empowerment representation encoders.
 
     Encoder 1 (action_cond):
         concat(initial_state, initial_action, goal, current_action, competence_vector)
     Encoder 2 (context):
         concat(initial_state, initial_action, goal, competence_vector)
-    Encoder 3 (future_state): future_state only
+    Encoder 3 (future_state): future_state only. When
+        ``use_separate_future_state_encoders`` is enabled, two independent
+        future-state encoders are used for the action-conditioned and context
+        energies.
 
     Each encoder outputs a vector of size ``repr_dim`` (default 64).
     """
@@ -485,6 +492,7 @@ class EmpowermentModel(nn.Module):
     repr_dim: int = 64
     hidden_dim: int = 256
     activation: str = "relu"
+    use_separate_future_state_encoders: bool = False
 
     def setup(self):
         encoder_kwargs = {
@@ -495,6 +503,9 @@ class EmpowermentModel(nn.Module):
         self.action_cond_encoder = EmpowermentEncoder(**encoder_kwargs)
         self.context_encoder = EmpowermentEncoder(**encoder_kwargs)
         self.future_state_encoder = EmpowermentEncoder(**encoder_kwargs)
+        if self.use_separate_future_state_encoders:
+            self.action_cond_future_state_encoder = EmpowermentEncoder(**encoder_kwargs)
+            self.context_future_state_encoder = EmpowermentEncoder(**encoder_kwargs)
 
     def __call__(
         self,
@@ -518,10 +529,23 @@ class EmpowermentModel(nn.Module):
         context_in = jnp.concatenate(
             [initial_state, initial_action, goal, competence_vector], axis=-1
         )
+        if self.use_separate_future_state_encoders:
+            action_cond_future_state_repr = self.action_cond_future_state_encoder(
+                future_state
+            )
+            context_future_state_repr = self.context_future_state_encoder(
+                future_state
+            )
+        else:
+            future_state_repr = self.future_state_encoder(future_state)
+            action_cond_future_state_repr = future_state_repr
+            context_future_state_repr = future_state_repr
         return EmpowermentRepr(
             action_cond_repr=self.action_cond_encoder(action_cond_in),
             context_repr=self.context_encoder(context_in),
-            future_state_repr=self.future_state_encoder(future_state),
+            future_state_repr=action_cond_future_state_repr,
+            action_cond_future_state_repr=action_cond_future_state_repr,
+            context_future_state_repr=context_future_state_repr,
         )
 
 
@@ -782,8 +806,12 @@ def compute_teacher_empowerment_reward(
         )
 
     repr = jax.lax.stop_gradient(_forward(params))
-    e13 = energy_fn(energy_name, repr.action_cond_repr, repr.future_state_repr)
-    e23 = energy_fn(energy_name, repr.context_repr, repr.future_state_repr)
+    e13 = energy_fn(
+        energy_name, repr.action_cond_repr, repr.action_cond_future_state_repr
+    )
+    e23 = energy_fn(
+        energy_name, repr.context_repr, repr.context_future_state_repr
+    )
     return jax.lax.stop_gradient(e13 - e23)
 
 
@@ -1197,16 +1225,24 @@ def make_train(config):
         "teacher batch size must equal "
         "TEACHER_MINIBATCH_SIZE * TEACHER_NUM_MINIBATCHES"
     )
-    empowerment_batch_size = config["CL_BUFFER_SIZE"] * config["NUM_ENVS"]
+    full_empowerment_batch_size = config["CL_BUFFER_SIZE"] * config["NUM_ENVS"]
+    empowerment_subsample_size = int(config.get("EMPOWERMENT_SUBSAMPLE_SIZE", 0))
+    if empowerment_subsample_size > 0:
+        effective_empowerment_batch_size = empowerment_subsample_size
+    else:
+        effective_empowerment_batch_size = full_empowerment_batch_size
+    assert (
+        effective_empowerment_batch_size <= full_empowerment_batch_size
+    ), "EMPOWERMENT_SUBSAMPLE_SIZE must be <= CL_BUFFER_SIZE * NUM_ENVS"
     config["EMPOWERMENT_MINIBATCH_SIZE"] = (
-        empowerment_batch_size // config["EMPOWERMENT_NUM_MINIBATCHES"]
+        effective_empowerment_batch_size // config["EMPOWERMENT_NUM_MINIBATCHES"]
     )
     assert (
-        empowerment_batch_size
+        effective_empowerment_batch_size
         == config["EMPOWERMENT_MINIBATCH_SIZE"]
         * config["EMPOWERMENT_NUM_MINIBATCHES"]
     ), (
-        "empowerment batch size must equal "
+        "effective empowerment batch size must equal "
         "EMPOWERMENT_MINIBATCH_SIZE * EMPOWERMENT_NUM_MINIBATCHES"
     )
     # minibatch_size = config["EMPOWERMENT_MINIBATCH_SIZE"]
@@ -1362,6 +1398,9 @@ def make_train(config):
         repr_dim=int(config["EMPOWERMENT_REPR_DIM"]),
         hidden_dim=int(config["EMPOWERMENT_HIDDEN_DIM"]),
         activation="relu",
+        use_separate_future_state_encoders=config.get(
+            "USE_SEPARATE_FUTURE_STATE_ENCODERS", False
+        ),
     )
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
@@ -2179,7 +2218,7 @@ def make_train(config):
                     )
 
                 # compute the final teacher's reward
-                teacher_reward = ( step_success
+                teacher_reward = ( task_reward
                     + teacher_empowerment_reward_coef * teacher_emp_part
                 )
                 # update the buffer pointer
@@ -2496,6 +2535,14 @@ def make_train(config):
             def _run_empowerment_update(operands):
                 e_state, buf, rng_in = operands
                 flat_batch = flatten_cl_buffer(buf)
+                rng_in, subsample_rng = jax.random.split(rng_in)
+                if effective_empowerment_batch_size < full_empowerment_batch_size:
+                    subsample_indices = jax.random.permutation(
+                        subsample_rng, full_empowerment_batch_size
+                    )[:effective_empowerment_batch_size]
+                    flat_batch = jax.tree_util.tree_map(
+                        lambda x: jnp.take(x, subsample_indices, axis=0), flat_batch
+                    )
 
                 def _e_update_epoch(update_state, unused):
                     def _e_update_minibatch(e_state, batch):
@@ -2512,12 +2559,12 @@ def make_train(config):
                             logits_13 = energy_fn(
                                 empowerment_energy_fn,
                                 repr.action_cond_repr[:, None, :],
-                                repr.future_state_repr[None, :, :],
+                                repr.action_cond_future_state_repr[None, :, :],
                             )
                             logits_23 = energy_fn(
                                 empowerment_energy_fn,
                                 repr.context_repr[:, None, :],
-                                repr.future_state_repr[None, :, :],
+                                repr.context_future_state_repr[None, :, :],
                             )
                             loss_13 = contrastive_loss_fn(
                                 empowerment_contrastive_loss, logits_13
@@ -2540,7 +2587,7 @@ def make_train(config):
                     e_state, flat_batch, rng_b = update_state
                     rng_b, _rng_b = jax.random.split(rng_b)
                     permutation = jax.random.permutation(
-                        _rng_b, empowerment_batch_size
+                        _rng_b, effective_empowerment_batch_size
                     )
                     shuffled_batch = jax.tree_util.tree_map(
                         lambda x: jnp.take(x, permutation, axis=0), flat_batch

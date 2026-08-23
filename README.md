@@ -252,8 +252,10 @@ Trains an **EmpowermentModel** (contrastive encoders) based on [https://arxiv.or
 | `EMPOWERMENT_HIDDEN_DIM`          | `256`         | Empowerment MLP hidden size                          |
 | `EMPOWERMENT_UPDATE_EPOCHS`       | `1`           | Training epochs per empowerment update               |
 | `EMPOWERMENT_NUM_MINIBATCHES`     | `128`         | Minibatches per empowerment epoch                    |
+| `EMPOWERMENT_SUBSAMPLE_SIZE`      | `0`           | Optional subsample size for empowerment training batch (`0` uses full `CL_BUFFER_SIZE * NUM_ENVS`) |
 | `EMPOWERMENT_ENERGY_FN`           | `l2`          | Options: `l2`, `norm`, `dot`, `cosine`               |
 | `EMPOWERMENT_CONTRASTIVE_LOSS`    | `fwd_infonce` | Options: `fwd_infonce`, `bwd_infonce`, `sym_infonce` |
+| `USE_SEPARATE_FUTURE_STATE_ENCODERS` | `False`    | Use independent future-state encoders for the action-conditioned and context energies |
 
 
 
@@ -284,6 +286,7 @@ python purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
   --GAMMA_CL=0.9 \
   --EMPOWERMENT_UPDATE_EPOCHS=2 \
   --EMPOWERMENT_NUM_MINIBATCHES=128 \
+  --EMPOWERMENT_SUBSAMPLE_SIZE=1024 \
   --EMPOWERMENT_ENERGY_FN=l2 \
   --EMPOWERMENT_CONTRASTIVE_LOSS=fwd_infonce \
   --SEED=30 \
