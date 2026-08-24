@@ -80,7 +80,7 @@ class TrainConfig:
     TEACHER_GOAL_X_MAX: float = 12.0
     TEACHER_GOAL_Y_MIN: float = 4.0
     TEACHER_GOAL_Y_MAX: float = 12.0
-    TEACHER_NUM_GOAL_POINTS: int = 30
+    TEACHER_NUM_GOAL_POINTS: int = 30  # number of unit-circle directions for viz / emp grid
     TEACHER_GOAL_COUNT_VIZ_LOG_WANDB: bool = True
     TEACHER_GOAL_COUNT_VIZ_FREQ: int = 100
     TEACHER_EMPOWERMENT_GRID_VIZ_LOG_WANDB: bool = True
@@ -107,7 +107,7 @@ class TrainConfig:
     TEACHER_GAMMA: float = 0.99
     TEACHER_GAE_LAMBDA: float = 0.8
     TEACHER_CLIP_EPS: float = 0.2
-    TEACHER_ENT_COEF: float = 0.05
+    TEACHER_ENT_COEF: float = 0.01
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
     TEACHER_USE_ENCODERS: bool = True
@@ -298,24 +298,6 @@ def parse_config_from_cli() -> TrainConfig:
     return tyro.cli(TrainConfig)
 
 
-def _scatter_goal_learning_progress(cache, goal_idx, lp_values, done):
-    updated = jnp.where(
-        done,
-        lp_values,
-        cache[goal_idx],
-    )
-    return cache.at[goal_idx].set(updated)
-
-
-def _scatter_goal_empowerment_reward(cache, goal_idx, emp_values, done):
-    updated = jnp.where(
-        done,
-        emp_values,
-        cache[goal_idx],
-    )
-    return cache.at[goal_idx].set(updated)
-
-
 def _global_gradient_norm(grads):
     flat_grads, _ = jax.flatten_util.ravel_pytree(grads)
     return jnp.linalg.norm(flat_grads)
@@ -370,7 +352,7 @@ class ActorCritic(nn.Module):
 
 
 class TeacherActorCritic(nn.Module):
-    num_actions: int
+    action_dim: int
     obs_dim: int
     competence_dim: int
     student_action_dim: int
@@ -417,10 +399,15 @@ class TeacherActorCritic(nn.Module):
                 bias_init=constant(0.0),
             )(actor_mean)
         )
-        logits = nn.Dense(
-            self.num_actions, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        actor_mean = nn.Dense(
+            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
-        pi = distrax.Categorical(logits=logits)
+        actor_log_std = self.param(
+            "log_std", nn.initializers.zeros, (self.action_dim,)
+        )
+        pi = distrax.MultivariateNormalDiag(
+            actor_mean, jnp.exp(actor_log_std)
+        )
         critic = act(
             nn.Dense(
                 self.hidden_dim,
@@ -572,20 +559,22 @@ class Transition(NamedTuple):
     current_state: jnp.ndarray
     current_action: jnp.ndarray
     agent_xy: jnp.ndarray
+    task_return: jnp.ndarray
+    goal_return: jnp.ndarray
 
 
 class TeacherEpisodeCarry(NamedTuple):
     teacher_obs: jnp.ndarray
-    goal_idx: jnp.ndarray
     raw_goal: jnp.ndarray
+    action: jnp.ndarray
     log_prob: jnp.ndarray
     value: jnp.ndarray
 
 
 class TeacherRolloutTransition(NamedTuple):
     teacher_obs: jnp.ndarray
-    goal_idx: jnp.ndarray
     raw_goal: jnp.ndarray
+    action: jnp.ndarray
     log_prob: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
@@ -593,8 +582,8 @@ class TeacherRolloutTransition(NamedTuple):
 
 class TeacherRolloutBuffer(NamedTuple):
     teacher_obs: jnp.ndarray
-    goal_idx: jnp.ndarray
     raw_goal: jnp.ndarray
+    action: jnp.ndarray
     log_prob: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
@@ -842,7 +831,7 @@ def evaluate_teacher_empowerment_reward_grid(
     competence_vector,
     goal_grid,
 ):
-    """Evaluate empowerment reward for every goal on the teacher grid."""
+    """Evaluate empowerment reward for every direction on the teacher ring."""
     num_goals = goal_grid.shape[0]
     init_s = jnp.broadcast_to(initial_state, (num_goals,) + initial_state.shape)
     init_a = jnp.broadcast_to(initial_action, (num_goals,) + initial_action.shape)
@@ -868,7 +857,7 @@ def evaluate_teacher_empowerment_reward_grid_over_futures(
     competence_vector,
     goal_grid,
 ):
-    """Average empowerment reward over future states for every goal."""
+    """Average empowerment reward over future states for every direction."""
     def evaluate_one_future(future_state):
         return jax.vmap(
             lambda goal: compute_teacher_empowerment_reward(
@@ -933,7 +922,10 @@ def plot_teacher_empowerment_grid(
     title=None,
     save_path=None,
 ):
-    """Plot empowerment reward averaged over future states on the goal grid."""
+    """Plot empowerment reward over the unit-circle direction ring.
+
+    Uses an angle-vs-value line plot so signed empowerment values remain readable.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -941,45 +933,32 @@ def plot_teacher_empowerment_grid(
 
     goal_grid_xy = np.asarray(goal_grid_xy)
     values = np.asarray(values).reshape(-1)
-    gx = goal_grid_xy[:, 0].reshape(num_points, num_points)
-    gy = goal_grid_xy[:, 1].reshape(num_points, num_points)
-    value_grid = values.reshape(num_points, num_points)
-    abs_max = float(np.max(np.abs(value_grid))) if value_grid.size else 0.0
-    limit = abs_max if abs_max > 0.0 else 1.0
+    angles = np.arctan2(goal_grid_xy[:, 1], goal_grid_xy[:, 0])
+    order = np.argsort(angles)
+    angles = angles[order]
+    values = values[order]
+    # Close the ring for a continuous curve.
+    angles_closed = np.concatenate([angles, angles[:1] + 2.0 * np.pi])
+    values_closed = np.concatenate([values, values[:1]])
 
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    mesh = ax.pcolormesh(
-        gx,
-        gy,
-        value_grid,
-        shading="nearest",
-        cmap="copper",
-        vmin=-limit,
-        vmax=limit,
-    )
-    fig.colorbar(mesh, ax=ax, label="Empowerment reward")
-    if start_xy is not None:
-        start_xy = np.asarray(start_xy).reshape(-1)
-        ax.scatter(
-            start_xy[0],
-            start_xy[1],
-            s=200,
-            marker="*",
-            c="tab:red",
-            edgecolors="black",
-            linewidths=0.5,
-            zorder=3,
-            label="Agent start",
-        )
-        ax.legend(loc="best")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_aspect("equal", adjustable="datalim")
+    fig, ax = plt.subplots(figsize=(7.0, 4.5))
+    ax.plot(angles_closed, values_closed, color="tab:orange", linewidth=2.0)
+    ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("direction angle (rad)")
+    ax.set_ylabel("empowerment reward")
+    ax.set_xlim(float(angles_closed[0]), float(angles_closed[-1]))
     if title is not None:
         ax.set_title(title)
     if save_path is not None:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     return fig, ax
+
+
+def direction_bin_indices(directions, num_bins):
+    """Map 2D unit vectors to angular bins in ``[0, num_bins)`` via atan2."""
+    angles = jnp.arctan2(directions[..., 1], directions[..., 0])
+    bins = jnp.floor((angles + jnp.pi) / (2.0 * jnp.pi) * num_bins).astype(jnp.int32)
+    return bins % num_bins
 
 
 def sample_teacher_future_at_init(rng, buffer, episode_len, gamma):
@@ -1044,18 +1023,18 @@ def flatten_cl_buffer(buffer):
 def init_teacher_episode_carry(num_envs, teacher_obs_dim, dtype):
     return TeacherEpisodeCarry(
         teacher_obs=jnp.zeros((num_envs, teacher_obs_dim), dtype=dtype),
-        goal_idx=jnp.zeros((num_envs,), dtype=jnp.int32),
         raw_goal=jnp.zeros((num_envs, 2), dtype=dtype),
+        action=jnp.zeros((num_envs, 2), dtype=dtype),
         log_prob=jnp.zeros((num_envs,), dtype=dtype),
         value=jnp.zeros((num_envs,), dtype=dtype),
     )
 
 
-def teacher_carry_from_act(raw_goal, goal_idx, log_prob, value, teacher_obs):
+def teacher_carry_from_act(raw_goal, action, log_prob, value, teacher_obs):
     return TeacherEpisodeCarry(
         teacher_obs=teacher_obs,
-        goal_idx=goal_idx,
         raw_goal=raw_goal,
+        action=action,
         log_prob=log_prob,
         value=value,
     )
@@ -1064,8 +1043,8 @@ def teacher_carry_from_act(raw_goal, goal_idx, log_prob, value, teacher_obs):
 def init_teacher_rollout_buffer(buffer_size, num_envs, teacher_obs_dim, dtype):
     return TeacherRolloutBuffer(
         teacher_obs=jnp.zeros((buffer_size, num_envs, teacher_obs_dim), dtype=dtype),
-        goal_idx=jnp.zeros((buffer_size, num_envs), dtype=jnp.int32),
         raw_goal=jnp.zeros((buffer_size, num_envs, 2), dtype=dtype),
+        action=jnp.zeros((buffer_size, num_envs, 2), dtype=dtype),
         log_prob=jnp.zeros((buffer_size, num_envs), dtype=dtype),
         value=jnp.zeros((buffer_size, num_envs), dtype=dtype),
         reward=jnp.zeros((buffer_size, num_envs), dtype=dtype),
@@ -1079,8 +1058,8 @@ def push_teacher_transition(buffer, transition):
     buffer_size = buffer.teacher_obs.shape[0]
     return TeacherRolloutBuffer(
         teacher_obs=buffer.teacher_obs.at[idx].set(transition.teacher_obs),
-        goal_idx=buffer.goal_idx.at[idx].set(transition.goal_idx),
         raw_goal=buffer.raw_goal.at[idx].set(transition.raw_goal),
+        action=buffer.action.at[idx].set(transition.action),
         log_prob=buffer.log_prob.at[idx].set(transition.log_prob),
         value=buffer.value.at[idx].set(transition.value),
         reward=buffer.reward.at[idx].set(transition.reward),
@@ -1098,8 +1077,8 @@ def _where_done(done, fresh, old):
 def push_teacher_rollout_on_done(buffer, carry, teacher_reward, done):
     transition = TeacherRolloutTransition(
         teacher_obs=carry.teacher_obs,
-        goal_idx=carry.goal_idx,
         raw_goal=carry.raw_goal,
+        action=carry.action,
         log_prob=carry.log_prob,
         value=carry.value,
         reward=teacher_reward,
@@ -1135,7 +1114,7 @@ def flatten_teacher_rollout_buffer(buffer, buffer_size):
 
     return TeacherFlatBatch(
         obs=_gather_and_flatten(buffer.teacher_obs),
-        action=_gather_and_flatten(buffer.goal_idx),
+        action=_gather_and_flatten(buffer.action),
         value=_gather_and_flatten(buffer.value),
         reward=_gather_and_flatten(buffer.reward),
         log_prob=_gather_and_flatten(buffer.log_prob),
@@ -1145,8 +1124,8 @@ def flatten_teacher_rollout_buffer(buffer, buffer_size):
 def reset_teacher_rollout_buffer(buffer):
     return TeacherRolloutBuffer(
         teacher_obs=jnp.zeros_like(buffer.teacher_obs),
-        goal_idx=jnp.zeros_like(buffer.goal_idx),
         raw_goal=jnp.zeros_like(buffer.raw_goal),
+        action=jnp.zeros_like(buffer.action),
         log_prob=jnp.zeros_like(buffer.log_prob),
         value=jnp.zeros_like(buffer.value),
         reward=jnp.zeros_like(buffer.reward),
@@ -1261,7 +1240,6 @@ def make_train(config):
     )
     add_goal_reward = config.get("ADD_GOAL_REWARD", False)
     condition_on_goal = config.get("CONDITION_ON_GOAL", False)
-    goal_reach_epsilon = config.get("GOAL_REACH_EPSILON", 0.5)
     if custom_env is not None:
         base_env = custom_env
         base_env_2 = custom_env_2
@@ -1339,7 +1317,10 @@ def make_train(config):
             )
             / teacher_num_updates
         )
-        frac = jnp.maximum(frac, 0.000000001)
+        # lrt = config["TEACHER_LR"]
+        # jax.debug.print("teacher_lr: {lr}", lr=lrt)
+        # jax.debug.print("frac: {f}", f=frac)
+        frac = jnp.maximum(frac, 0.0)
         return config["TEACHER_LR"] * frac
 
     empowerment_num_updates = max(1, approx_episode_cycles)
@@ -1359,21 +1340,15 @@ def make_train(config):
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
     )
     base_obs_dim = int(env.observation_space(env_params).shape[0])
-    # import pdb;pdb.set_trace
+    # Number of discrete directions on the unit circle used for viz / emp grid.
     teacher_num_goal_points = int(config["TEACHER_NUM_GOAL_POINTS"])
-    xs = jnp.linspace(
-        config["TEACHER_GOAL_X_MIN"],
-        config["TEACHER_GOAL_X_MAX"],
-        teacher_num_goal_points,
+    num_teacher_goals = teacher_num_goal_points
+    direction_angles = jnp.linspace(
+        0.0, 2.0 * jnp.pi, num_teacher_goals, endpoint=False
     )
-    ys = jnp.linspace(
-        config["TEACHER_GOAL_Y_MIN"],
-        config["TEACHER_GOAL_Y_MAX"],
-        teacher_num_goal_points,
+    goal_grid = jnp.stack(
+        [jnp.cos(direction_angles), jnp.sin(direction_angles)], axis=-1
     )
-    gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
-    goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
-    num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
     all_goals = all_possible_goals()
     num_competence = int(all_goals.shape[0])
     condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
@@ -1390,7 +1365,7 @@ def make_train(config):
         + action_dim
     )
     teacher_network = TeacherActorCritic(
-        num_actions=teacher_num_goal_points * teacher_num_goal_points,
+        action_dim=2,
         obs_dim=base_obs_dim, 
         competence_dim=num_competence if condition_teacher_on_competence else 0,
         student_action_dim=action_dim,
@@ -1449,22 +1424,22 @@ def make_train(config):
     def _teacher_act(teacher_params, obs, competence_vector, action, rng):
         teacher_obs = _build_teacher_input(obs, competence_vector, action)
         pi, value = teacher_network.apply(teacher_params, teacher_obs)
-        goal_idx = pi.sample(seed=rng)
-        raw_goal = goal_grid[goal_idx].astype(jnp.float32)
-        log_prob = pi.log_prob(goal_idx)
-        return raw_goal, goal_idx, log_prob, value, teacher_obs
+        action = pi.sample(seed=rng)
+        direction = action / jnp.maximum(
+            jnp.linalg.norm(action, axis=-1, keepdims=True), 1e-8
+        )
+        log_prob = pi.log_prob(action)
+        return direction, action, log_prob, value, teacher_obs
 
-    def _sample_teacher_goals(
+    def _sample_teacher_direction(
         teacher_params, obs, competence_vector, action, rng
     ):
-        raw_goal, _, _, _, _ = _teacher_act(
+        direction, _, _, _, _ = _teacher_act(
             teacher_params, obs, competence_vector, action, rng
         )
-        return raw_goal
+        return direction
 
     def _policy_goal_from_raw(raw_goal, obs_mean, obs_var):
-        if config["NORMALIZE_ENV"]:
-            return _normalize_xy(raw_goal, obs_mean, obs_var)
         return raw_goal
 
     render_sim_steps = int(config.get("EVAL_RENDER_STEPS", 1000))
@@ -1512,7 +1487,7 @@ def make_train(config):
             bootstrap_action = _sample_render_action(
                 params, state.obs, obs_mean, obs_var, policy_goal, goal_rng
             )
-            raw_goal = _sample_teacher_goals(
+            raw_goal = _sample_teacher_direction(
                 teacher_params,
                 norm_obs,
                 competence_vector,
@@ -1552,7 +1527,7 @@ def make_train(config):
                     bootstrap_goal,
                     action_rng,
                 )
-                new_raw_goal = _sample_teacher_goals(
+                new_raw_goal = _sample_teacher_direction(
                     teacher_params,
                     norm_obs,
                     competence_vector,
@@ -1709,12 +1684,12 @@ def make_train(config):
         )
 
         def sample_teacher_goals(obs, competence_vector, action, rng):
-            return _sample_teacher_goals(
+            return _sample_teacher_direction(
                 teacher_train_state.params, obs, competence_vector, action, rng
             )
 
         def teacher_act_and_carry(obs, competence_vector, action, rng):
-            raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs = (
+            direction, teacher_action, teacher_log_prob, teacher_value, teacher_obs = (
                 _teacher_act(
                     teacher_train_state.params,
                     obs,
@@ -1724,9 +1699,9 @@ def make_train(config):
                 )
             )
             carry = teacher_carry_from_act(
-                raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs
+                direction, teacher_action, teacher_log_prob, teacher_value, teacher_obs
             )
-            return raw_goal, carry
+            return direction, carry
 
         def compute_competence_vector(student_params, stats_state):
             return evaluate_multiple_goals(
@@ -1845,10 +1820,6 @@ def make_train(config):
         episode_buf_ptr = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.int32)
         goals = raw_goals
         if condition_on_goal:
-            if config["NORMALIZE_ENV"]:
-                mean_xy = env_state.mean[..., :2]
-                var_xy = env_state.var[..., :2]
-                goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
             obsv = jnp.concatenate([obsv, goals], axis=-1)
 
         if use_learning_progress_reward:
@@ -1878,59 +1849,46 @@ def make_train(config):
             title=None,
             save_path=None,
         ):
-            """Heatmap of normalized teacher goal selection frequency in [0, 1]."""
+            """Polar bar plot of normalized teacher direction selection frequency."""
             import matplotlib
 
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-            fig, ax = plt.subplots(figsize=(6.5, 6))
             goal_grid_xy = np.asarray(goal_grid_xy)
-            counts = np.asarray(counts).reshape(-1)
-            gx = goal_grid_xy[:, 0].reshape(num_points, num_points)
-            gy = goal_grid_xy[:, 1].reshape(num_points, num_points)
-            cgrid = counts.reshape(num_points, num_points).astype(np.float32)
-            max_count = float(np.max(cgrid)) if cgrid.size else 0.0
-            normalized_grid = np.zeros_like(cgrid, dtype=np.float32)
-            if max_count > 0.0:
-                normalized_grid = cgrid / max_count
-            mesh = ax.pcolormesh(
-                gx,
-                gy,
-                normalized_grid,
-                shading="nearest",
-                cmap="Blues",
-                vmin=0.0,
-                vmax=1.0,
+            counts = np.asarray(counts).reshape(-1).astype(np.float32)
+            angles = np.arctan2(goal_grid_xy[:, 1], goal_grid_xy[:, 0])
+            order = np.argsort(angles)
+            angles = angles[order]
+            counts = counts[order]
+            max_count = float(np.max(counts)) if counts.size else 0.0
+            normalized = (
+                counts / max_count if max_count > 0.0 else np.zeros_like(counts)
             )
-            fig.colorbar(mesh, ax=ax, label="Normalized goal selection frequency")
+            width = (2.0 * np.pi / max(len(angles), 1)) * 0.9
 
-            if start_xy is not None:
-                start_xy = np.asarray(start_xy).reshape(-1)
-                ax.scatter(
-                    start_xy[0],
-                    start_xy[1],
-                    s=200,
-                    marker="*",
-                    c="tab:red",
-                    edgecolors="black",
-                    linewidths=0.5,
-                    zorder=3,
-                    label="Agent start",
-                )
-                ax.legend(loc="best")
-
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
-            ax.set_aspect("equal", adjustable="datalim")
+            fig, ax = plt.subplots(subplot_kw={"projection": "polar"}, figsize=(6.5, 6))
+            ax.bar(
+                angles,
+                normalized,
+                width=width,
+                bottom=0.0,
+                color="tab:blue",
+                alpha=0.75,
+                edgecolor="black",
+                linewidth=0.3,
+            )
+            ax.set_theta_zero_location("E")
+            ax.set_theta_direction(1)
+            ax.set_ylim(0.0, 1.0)
             if title is not None:
-                ax.set_title(title)
+                ax.set_title(title, pad=16)
             if save_path is not None:
                 fig.savefig(save_path, dpi=150, bbox_inches="tight")
             return fig, ax
 
         def log_teacher_goal_selection_count_grid(goal_count_grid, step):
-            """Log a count heatmap showing teacher goal selections over time."""
+            """Log a polar count plot showing teacher direction selections over time."""
             try:
                 if config.get("WANDB_MODE", "disabled") != "online":
                     return
@@ -1952,7 +1910,7 @@ def make_train(config):
                     counts,
                     teacher_num_goal_points,
                     title=(
-                        f"Teacher goal selections @ step {int(step)} "
+                        f"Teacher direction selections @ step {int(step)} "
                         f"({config['ENV_NAME']})"
                     ),
                     save_path=save_path,
@@ -1969,7 +1927,7 @@ def make_train(config):
                 traceback.print_exc()
 
         def log_teacher_empowerment_grid(values, start_xy, step):
-            """Log a future-state-averaged empowerment heatmap to WandB."""
+            """Log a future-state-averaged empowerment polar plot to WandB."""
             try:
                 if config.get("WANDB_MODE", "disabled") != "online":
                     return
@@ -2026,6 +1984,8 @@ def make_train(config):
                     task_reward_sq_sum,
                     goal_reward_sum,
                     goal_reward_sq_sum,
+                    task_episode_return,
+                    goal_episode_return,
                     reward_count,
                     episode_success,
                     episode_goal_success_start,
@@ -2048,6 +2008,7 @@ def make_train(config):
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 current_state = last_obs[..., :base_obs_dim]
+                previous_xy = env_state.org_obs[..., :2]
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -2068,21 +2029,30 @@ def make_train(config):
                 goal_reward = jnp.zeros_like(task_reward) 
                 ## Calulcate the goal reaching reward for following the teacher instructive goals
                 if add_goal_reward:
-                    if config["NORMALIZE_ENV"]:
-                        dist = jnp.linalg.norm(
-                            env_state.org_obs[..., :2] - raw_goals, axis=-1
-                        )
-                    else:
-                        dist = jnp.linalg.norm(obsv[..., :2] - raw_goals, axis=-1)
-                    # jax.debug.print("dist_mean: {dist}", dist=dist.mean())
-                    goal_reward = (dist <= goal_reach_epsilon).astype(task_reward.dtype)
-                    # jax.debug.print("dist: {dist}", dist=dist)
-                    # jax.debug.print("goals: {goals}", goals=goals)
-                    # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
-                    # import pdb;pdb.set_trace()
+                    next_xy = env_state.org_obs[..., :2]
+                    displacement = next_xy - previous_xy
+                    displacement_norm = jnp.linalg.norm(
+                        displacement, axis=-1, keepdims=True
+                    )
+                    student_direction = jnp.where(
+                        displacement_norm > 1e-8,
+                        displacement / jnp.maximum(displacement_norm, 1e-8),
+                        jnp.zeros_like(displacement),
+                    )
+                    goal_reward = jnp.sum(
+                        raw_goals * student_direction, axis=-1
+                    ).astype(task_reward.dtype)
                     reward = task_reward + config["GOAL_REWARD_COEF"] * goal_reward
                     if config["INTERPOLATED_REWARD"]:
                         reward = (1-config["GOAL_REWARD_COEF"]) * task_reward + config["GOAL_REWARD_COEF"] * goal_reward
+                completed_task_return = task_episode_return + task_reward
+                completed_goal_return = goal_episode_return + goal_reward
+                task_episode_return = jnp.where(
+                    done, 0.0, completed_task_return
+                )
+                goal_episode_return = jnp.where(
+                    done, 0.0, completed_goal_return
+                )
                 ## Update the teacher's state input
                 if update_competence:
                     competence_vector = jax.lax.cond(
@@ -2150,12 +2120,7 @@ def make_train(config):
                         )
                         if config["ABSOLUTE_LEARNING_PROGRESS"]:
                             learning_progress = jnp.abs(learning_progress)
-                        new_cache = _scatter_goal_learning_progress(
-                            goal_learning_progress_cache,
-                            teacher_episode_carry.goal_idx,
-                            learning_progress,
-                            done,
-                        )
+                        new_cache = goal_learning_progress_cache
                         return (
                             jnp.where(done, learning_progress, 0.0),
                             new_cache,
@@ -2209,17 +2174,6 @@ def make_train(config):
                         cl_buffer.initial_competence[0],
                     )
                     teacher_emp_part = jnp.where(done, emp_reward, 0.0)
-                    goal_empowerment_reward_cache = jax.lax.cond(
-                        jnp.any(done),
-                        lambda _: _scatter_goal_empowerment_reward(
-                            goal_empowerment_reward_cache,
-                            teacher_episode_carry.goal_idx,
-                            emp_reward,
-                            done,
-                        ),
-                        lambda _: goal_empowerment_reward_cache,
-                        operand=None,
-                    )
 
                 # compute the final teacher's reward
                 teacher_reward = ( task_reward
@@ -2243,7 +2197,7 @@ def make_train(config):
                 # jax.debug.print("competence_vector: {competence_vector}", competence_vector=competence_vector)
                 (
                     new_raw_goals,
-                    goal_idx,
+                    teacher_action,
                     teacher_log_prob,
                     teacher_value,
                     teacher_obs,
@@ -2256,7 +2210,7 @@ def make_train(config):
                 )
                 fresh_carry = teacher_carry_from_act(
                     new_raw_goals,
-                    goal_idx,
+                    teacher_action,
                     teacher_log_prob,
                     teacher_value,
                     teacher_obs,
@@ -2266,9 +2220,12 @@ def make_train(config):
                     fresh_carry,
                     teacher_episode_carry,
                 )
-                teacher_goal_count_grid = teacher_goal_count_grid.at[goal_idx].add(
-                    jnp.ones_like(goal_idx, dtype=jnp.int32)
+                direction_bins = direction_bin_indices(
+                    new_raw_goals, num_teacher_goals
                 )
+                teacher_goal_count_grid = teacher_goal_count_grid.at[
+                    direction_bins
+                ].add(jnp.ones_like(direction_bins, dtype=jnp.int32))
                 raw_goals = jnp.where(done[:, None], new_raw_goals, raw_goals)
                 if use_learning_progress_reward:
 
@@ -2295,12 +2252,7 @@ def make_train(config):
                 #     lambda: None,
                 # )
                 def normalize_goals(raw_goals, env_state):
-                    if config["NORMALIZE_ENV"]:
-                        mean_xy = env_state.mean[..., :2]
-                        var_xy = env_state.var[..., :2]
-                        return (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
-                    else:
-                        return raw_goals
+                    return raw_goals
                 goals = normalize_goals(raw_goals, env_state)
                 if condition_on_goal:
                     obsv = jnp.concatenate([obsv, goals], axis=-1)
@@ -2329,6 +2281,8 @@ def make_train(config):
                     current_state,
                     action,
                     current_xy,
+                    jnp.where(done, completed_task_return, jnp.nan),
+                    jnp.where(done, completed_goal_return, jnp.nan),
                 )
                 runner_state = (
                     train_state,
@@ -2343,6 +2297,8 @@ def make_train(config):
                     task_reward_sq_sum,
                     goal_reward_sum,
                     goal_reward_sq_sum,
+                    task_episode_return,
+                    goal_episode_return,
                     reward_count,
                     episode_success,
                     episode_goal_success_start,
@@ -2376,6 +2332,8 @@ def make_train(config):
                 task_reward_sq_sum,
                 goal_reward_sum,
                 goal_reward_sq_sum,
+                task_episode_return,
+                goal_episode_return,
                 reward_count,
                 episode_success,
                 episode_goal_success_start,
@@ -2657,7 +2615,7 @@ def make_train(config):
                 )
                 if empowerment_grid_freq > 0:
                     should_log_empowerment_grid = (
-                        (update_idx + 1) % empowerment_grid_freq == 0
+                        (update_idx) % empowerment_grid_freq == 0
                     )
 
                     def _run_empowerment_grid_viz(_):
@@ -2711,7 +2669,7 @@ def make_train(config):
                             log_teacher_empowerment_grid,
                             values,
                             start_xy,
-                            (update_idx + 1) * config["NUM_STEPS"] * config["NUM_ENVS"],
+                            (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"],
                         )
                         return next_rng
 
@@ -2898,6 +2856,7 @@ def make_train(config):
                 if config["ANNEAL_LR"]
                 else config["TEACHER_LR"]
             )
+            jax.debug.print("teacher_current_lr: {teacher_lr}", teacher_lr=teacher_current_lr)
 
             task_reward_mean = traj_batch.task_reward.mean()
             task_reward_std = traj_batch.task_reward.std()
@@ -3225,10 +3184,10 @@ def make_train(config):
             if config.get("TEACHER_GOAL_COUNT_VIZ_LOG_WANDB", True):
                 freq = int(config.get("TEACHER_GOAL_COUNT_VIZ_FREQ", 0))
                 if freq > 0:
-                    should_log_goal_count_viz = (update_idx + 1) % freq == 0
+                    should_log_goal_count_viz = (update_idx) % freq == 0
 
                     def _run_goal_count_viz(_):
-                        step = (update_idx + 1) * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
                         jax.debug.callback(
                             log_teacher_goal_selection_count_grid,
                             teacher_goal_count_grid,
@@ -3249,7 +3208,7 @@ def make_train(config):
             # Agent positions saving (in-jit trigger calling host callback)
             freq_xy = int(config.get("AGENT_POSITIONS_LOG_FREQ", 0))
             if freq_xy > 0:
-                should_save_xy = (update_idx + 1) % freq_xy == 0
+                should_save_xy = (update_idx) % freq_xy == 0
 
                 def _run_save(_):
                     def _save_agent_xy_host(args):
@@ -3300,6 +3259,8 @@ def make_train(config):
                 task_reward_sq_sum,
                 goal_reward_sum,
                 goal_reward_sq_sum,
+                task_episode_return,
+                goal_episode_return,
                 reward_count,
                 episode_success,
                 episode_goal_success_start,
@@ -3332,6 +3293,8 @@ def make_train(config):
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
+            jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
+            jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             episode_goal_success_start,
@@ -3350,9 +3313,9 @@ def make_train(config):
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
-        final_teacher_rollout_buffer = runner_state[20]
-        final_cl_buffer = runner_state[22]
-        final_episode_buf_ptr = runner_state[23]
+        final_teacher_rollout_buffer = runner_state[22]
+        final_cl_buffer = runner_state[24]
+        final_episode_buf_ptr = runner_state[25]
         final_empowerment_train_state = runner_state[2]
         train_output = {
             "runner_state": runner_state,

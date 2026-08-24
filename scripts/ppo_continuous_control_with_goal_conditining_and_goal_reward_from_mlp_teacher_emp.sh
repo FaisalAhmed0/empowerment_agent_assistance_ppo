@@ -12,13 +12,13 @@ ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30)
-COMMENT="will_the_Student_learn_the_goals_proposed_by_the_teacher?"
+COMMENT="experiment_after_fixing_teacher_lr_bug"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(256)
 NUM_STEPS_=(64)
-STUDENT_ENTROPY_COFFS=(0)
+STUDENT_ENTROPY_COFFS=(0.01)
 GAE_LAMBDA=(0.8)
 CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)
@@ -26,12 +26,12 @@ UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(16)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
-GOAL_REWARD_COEF=(1)
+GOAL_REWARD_COEF=(1 0.5 0.1 0.01 0.05)
 ### Teacher hyperparameters
 TEACHER_ROLLOUT_BUFFER_SIZES=(1 10)
-EMPOWERMENT_SUBSAMPLE_SIZES=(1024 2048)
+EMPOWERMENT_SUBSAMPLE_SIZES=(2048)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
-USE_DISTANCE_IN_COMPETENCES=(--no-USE_DISTANCE_IN_COMPETENCE --USE_DISTANCE_IN_COMPETENCE)
+USE_DISTANCE_IN_COMPETENCES=(--no-USE_DISTANCE_IN_COMPETENCE)
 ENERGY_FUNCTIONS=(l2)
 CONTRASTIVE_LOSS_TYPES=(fwd_infonce bwd_infonce sym_infonce)
 run_count=0
@@ -64,7 +64,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for USE_DISTANCE_IN_COMPETENCE in "${USE_DISTANCE_IN_COMPETENCES[@]}"; do
                         for empowerment_subsample_size in "${EMPOWERMENT_SUBSAMPLE_SIZES[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
-                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
+                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward_dir.py \
                         --ENV_NAME=${ENV_NAME} \
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \
