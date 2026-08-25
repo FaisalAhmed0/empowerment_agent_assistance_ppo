@@ -7,7 +7,7 @@ CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--no-USE_LEARNING_PROGRESS_REWARD"
 USE_TEACHER_EMPOWERMENT_REWARD="--USE_TEACHER_EMPOWERMENT_REWARD"
 USE_SEPARATE_FUTURE_STATE_ENCODERS="--no-USE_SEPARATE_FUTURE_STATE_ENCODERS"
-INTERPOLATED_REWARD="--INTERPOLATED_REWARD"
+INTERPOLATED_REWARD="--no-INTERPOLATED_REWARD"
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
@@ -18,7 +18,7 @@ COMMENT="experiment_after_fixing_teacher_lr_bug"
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(256)
 NUM_STEPS_=(64)
-STUDENT_ENTROPY_COFFS=(0.01)
+STUDENT_ENTROPY_COFFS=(0.0)
 GAE_LAMBDA=(0.8)
 CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)
@@ -64,7 +64,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for USE_DISTANCE_IN_COMPETENCE in "${USE_DISTANCE_IN_COMPETENCES[@]}"; do
                         for empowerment_subsample_size in "${EMPOWERMENT_SUBSAMPLE_SIZES[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
-                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward_dir.py \
+                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
                         --ENV_NAME=${ENV_NAME} \
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \

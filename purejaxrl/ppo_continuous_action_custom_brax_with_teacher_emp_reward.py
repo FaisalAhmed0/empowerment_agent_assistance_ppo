@@ -51,7 +51,7 @@ class TrainConfig:
     CL_BUFFER_SIZE: int = 1000
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
-    ENT_COEF: float = 0.05
+    ENT_COEF: float = 0
     VF_COEF: float = 0.5
     HIDDEN_DIM: int = 256
     MAX_GRAD_NORM: float = 1.0
@@ -72,6 +72,8 @@ class TrainConfig:
     EVAL_RENDER_MAX_FRAMES: int = 1000
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
+    EVAL_FREQ: int = 10
+    EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = True
     CONDITION_ON_GOAL: bool = True
@@ -107,7 +109,7 @@ class TrainConfig:
     TEACHER_GAMMA: float = 0.99
     TEACHER_GAE_LAMBDA: float = 0.8
     TEACHER_CLIP_EPS: float = 0.2
-    TEACHER_ENT_COEF: float = 0.05
+    TEACHER_ENT_COEF: float = 0.001
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
     TEACHER_USE_ENCODERS: bool = True
@@ -292,6 +294,89 @@ def evaluate_multiple_goals(
     vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
     goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])
     return vmap_goals(goal_rngs, goals)
+
+
+def evaluate_student_env_goal(
+    env,
+    brax_env,
+    network,
+    params,
+    num_envs,
+    rng,
+    max_steps=1000,
+    warmup_env_state=None,
+    normalize_obs=False,
+    condition_on_goal=True,
+):
+    """Evaluate student on env goals (no teacher sampling).
+
+    Conditions the policy on each env's own maze goal from ``org_obs[..., -2:]``.
+    Returns ``(success_rate, episodic_return)`` averaged over ``num_envs``.
+    """
+    env_params = None
+    obs_dim = brax_env.observation_size
+    eval_stats = (
+        _collapse_obs_norm_stats(warmup_env_state, obs_dim)
+        if normalize_obs and warmup_env_state is not None
+        else warmup_env_state
+    )
+    norm_mean = eval_stats.mean if eval_stats is not None else None
+    norm_var = eval_stats.var if eval_stats is not None else None
+
+    reset_rngs = jax.random.split(rng, num_envs)
+    if eval_stats is not None:
+        obsv, env_state = env.reset_with_stats(reset_rngs, eval_stats, env_params)
+    else:
+        obsv, env_state = env.reset(reset_rngs, env_params)
+
+    brax_state = _inner_brax_state(env_state)
+    if normalize_obs:
+        org_obs = env_state.org_obs
+        obsv = (brax_state.obs - norm_mean) / jnp.sqrt(norm_var + 1e-8)
+    else:
+        org_obs = brax_state.obs
+        obsv = brax_state.obs
+
+    # Teacher/conditioning goal equals the environment goal (no teacher sampling).
+    env_goals = org_obs[..., -2:]
+    # jax.debug.print("env_goals is {x}", x=env_goals)
+    if condition_on_goal:
+        if normalize_obs:
+            goal_batch = _normalize_xy(env_goals, norm_mean, norm_var)
+        else:
+            goal_batch = env_goals
+    # jax.debug.print("goal_batch is {x}", x=goal_batch)
+
+    def step_fn(carry, _):
+        obsv, env_state, rng, ep_return, ep_success, ever_done = carry
+        rng, step_rng, action_rng = jax.random.split(rng, 3)
+        step_rngs = jax.random.split(step_rng, num_envs)
+        if condition_on_goal:
+            policy_obs = jnp.concatenate([obsv, goal_batch], axis=-1)
+        else:
+            policy_obs = obsv
+        pi, _ = network.apply(params, policy_obs)
+        action = pi.sample(seed=action_rng)
+        obsv, env_state, reward, done, info = env.step(
+            step_rngs, env_state, action, env_params
+        )
+        active = 1.0 - ever_done
+        step_success = _success_metric(env_state)
+        ep_success = jnp.maximum(ep_success, step_success * active)
+        ep_return = ep_return + reward * active
+        ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
+        return (obsv, env_state, rng, ep_return, ep_success, ever_done), None
+
+    init_return = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_success = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_ever_done = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    (_, _, _, ep_return, ep_success, _), _ = jax.lax.scan(
+        step_fn,
+        (obsv, env_state, rng, init_return, init_success, init_ever_done),
+        None,
+        length=max_steps,
+    )
+    return ep_success.mean(), ep_return.mean()
 
 
 def parse_config_from_cli() -> TrainConfig:
@@ -1756,6 +1841,20 @@ def make_train(config):
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
                 use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"]
+            )
+
+        def evaluate_student_on_env_goal(student_params, stats_state, rng):
+            return evaluate_student_env_goal(
+                env_2,
+                custom_env_2,
+                network,
+                student_params,
+                config["EVAL_NUM_ENVS"],
+                rng,
+                max_steps=config.get("EPISODE_LENGTH", 1000),
+                warmup_env_state=stats_state,
+                normalize_obs=config["NORMALIZE_ENV"],
+                condition_on_goal=condition_on_goal,
             )
 
         if config["NORMALIZE_ENV"]:
@@ -3245,6 +3344,52 @@ def make_train(config):
                         _skip_goal_count_viz,
                         operand=None,
                     )
+
+            # Periodic student eval on environment goals (no teacher sampling).
+            eval_freq = int(config.get("EVAL_FREQ", 0))
+            if eval_freq > 0:
+                should_eval = (update_idx + 1) % eval_freq == 0
+                rng, eval_rng = jax.random.split(rng)
+
+                def _run_student_eval(_):
+                    jax.debug.print("running student eval")
+                    success_rate, episodic_return = evaluate_student_on_env_goal(
+                        train_state.params, env_state, eval_rng
+                    )
+                    step = (update_idx + 1) * config["NUM_STEPS"] * config["NUM_ENVS"]
+
+                    def _log_eval(args):
+                        sr, er, st = args
+                        if config.get("WANDB_MODE", "disabled") == "online":
+                            wandb.log(
+                                {
+                                    "eval/success_rate": float(sr),
+                                    "eval/episodic_return": float(er),
+                                },
+                                step=int(st),
+                            )
+                        if config.get("DEBUG"):
+                            print(
+                                f"eval step={int(st)}, "
+                                f"success_rate={float(sr):.4f}, "
+                                f"episodic_return={float(er):.4f}"
+                            )
+                        return None
+
+                    jax.debug.callback(
+                        _log_eval, (success_rate, episodic_return, step)
+                    )
+                    return jnp.array(0, dtype=jnp.int32)
+
+                def _skip_student_eval(_):
+                    return jnp.array(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_eval,
+                    _run_student_eval,
+                    _skip_student_eval,
+                    operand=None,
+                )
 
             # Agent positions saving (in-jit trigger calling host callback)
             freq_xy = int(config.get("AGENT_POSITIONS_LOG_FREQ", 0))
