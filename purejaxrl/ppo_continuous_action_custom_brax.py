@@ -43,36 +43,38 @@ class TrainConfig:
     NUM_STEPS: int = 64
     TOTAL_TIMESTEPS: int = int(5e7)
     UPDATE_EPOCHS: int = 4
-    NUM_MINIBATCHES: int = 32
+    NUM_MINIBATCHES: int = 16
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
     ENT_COEF: float = 0.0
     VF_COEF: float = 0.5
-    HIDDEN_DIM: int = 64
+    HIDDEN_DIM: int = 256
     MAX_GRAD_NORM: float = 1.0
     ACTIVATION: str = "tanh"
-    ENV_NAME: str = "ant_u_maze"
+    ENV_NAME: str = "ant_u_maze_single_goal"
     ENV_BACKEND: str | None = None
     EPISODE_LENGTH: int = 1000
     ACTION_REPEAT: int = 1
     ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
     ANNEAL_LR: bool = True
-    NORMALIZE_ENV: bool = False
-    DEBUG: bool = True
+    NORMALIZE_ENV: bool = True
+    DEBUG: bool = False
     SEED: int = 30
     WANDB_MODE: str = "online"
     ENTITY: str = ""
     PROJECT: str = "purejaxrl"
     EVAL_RENDER_STEPS: int = 300
-    EVAL_RENDER_MAX_FRAMES: int = 100
+    EVAL_RENDER_MAX_FRAMES: int = 1000
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
+    EVAL_FREQ: int = 10
+    EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = False
     CONDITION_ON_GOAL: bool = False
     GOAL_REACH_EPSILON: float = 0.5
-    HIDDEN_DIM: int = 128
+    HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
 
@@ -162,6 +164,119 @@ def load_checkpoint(train_state, checkpoint_dir):
         checkpoint_dir,
         train_state,
     )
+
+
+def _inner_brax_state(state):
+    """Walk nested wrappers until the inner Brax ``State`` is reached."""
+    current = state
+    while hasattr(current, "env_state") and not hasattr(current, "pipeline_state"):
+        current = current.env_state
+    return current
+
+
+def _success_metric(wrapped_state):
+    return _inner_brax_state(wrapped_state).metrics["success"]
+
+
+def _normalize_xy(goal, mean, var):
+    mean_xy = mean[..., :2]
+    var_xy = var[..., :2]
+    return (goal - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+
+
+def _collapse_obs_norm_stats(stats_state, obs_dim):
+    """Reduce batched ``(NUM_ENVS, obs_dim)`` stats to global 1D for eval."""
+    if stats_state is None:
+        return None
+    mean = stats_state.mean
+    var = stats_state.var
+    if mean.ndim > 1 and mean.shape[-1] == obs_dim:
+        mean = mean[0]
+        var = var[0]
+    return stats_state.replace(mean=mean, var=var)
+
+
+def evaluate_student_env_goal(
+    env,
+    brax_env,
+    network,
+    params,
+    num_envs,
+    rng,
+    max_steps=1000,
+    warmup_env_state=None,
+    normalize_obs=False,
+    condition_on_goal=True,
+):
+    """Evaluate agent on env goals (no teacher sampling).
+
+    Conditions the policy on each env's own maze goal from ``org_obs[..., -2:]``
+    when ``condition_on_goal`` is True. Returns ``(success_rate, episodic_return)``
+    averaged over ``num_envs``.
+    """
+    env_params = None
+    obs_dim = brax_env.observation_size
+    eval_stats = (
+        _collapse_obs_norm_stats(warmup_env_state, obs_dim)
+        if normalize_obs and warmup_env_state is not None
+        else warmup_env_state
+    )
+    norm_mean = eval_stats.mean if eval_stats is not None else None
+    norm_var = eval_stats.var if eval_stats is not None else None
+
+    reset_rngs = jax.random.split(rng, num_envs)
+    if eval_stats is not None:
+        obsv, env_state = env.reset_with_stats(reset_rngs, eval_stats, env_params)
+    else:
+        obsv, env_state = env.reset(reset_rngs, env_params)
+
+    brax_state = _inner_brax_state(env_state)
+    if normalize_obs:
+        org_obs = env_state.org_obs
+        obsv = (brax_state.obs - norm_mean) / jnp.sqrt(norm_var + 1e-8)
+    else:
+        org_obs = brax_state.obs
+        obsv = brax_state.obs
+
+    # Conditioning goal equals the environment goal (no teacher sampling).
+    env_goals = org_obs[..., -2:]
+    if condition_on_goal:
+        if normalize_obs:
+            goal_batch = _normalize_xy(env_goals, norm_mean, norm_var)
+        else:
+            goal_batch = env_goals
+
+    def step_fn(carry, _):
+        obsv, env_state, rng, ep_return, ep_success, ever_done = carry
+        rng, step_rng, action_rng = jax.random.split(rng, 3)
+        step_rngs = jax.random.split(step_rng, num_envs)
+        if condition_on_goal:
+            policy_obs = jnp.concatenate([obsv, goal_batch], axis=-1)
+        else:
+            policy_obs = obsv
+        pi, _ = network.apply(params, policy_obs)
+        action = pi.sample(seed=action_rng)
+        obsv, env_state, reward, done, info = env.step(
+            step_rngs, env_state, action, env_params
+        )
+        active = 1.0 - ever_done
+        step_success = _success_metric(env_state)
+        ep_success = jnp.maximum(ep_success, step_success * active)
+        ep_return = ep_return + reward * active
+        ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
+        return (obsv, env_state, rng, ep_return, ep_success, ever_done), None
+
+    init_return = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_success = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_ever_done = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    (_, _, _, ep_return, ep_success, _), _ = jax.lax.scan(
+        step_fn,
+        (obsv, env_state, rng, init_return, init_success, init_ever_done),
+        None,
+        length=max_steps,
+    )
+    return ep_success.mean(), ep_return.mean()
+
 
 def make_train(config):
     config["NUM_UPDATES"] = (
@@ -370,6 +485,21 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
+
+        def evaluate_agent_on_env_goal(params, stats_state, rng):
+            return evaluate_student_env_goal(
+                env_2,
+                base_env_2,
+                network,
+                params,
+                config["EVAL_NUM_ENVS"],
+                rng,
+                max_steps=config.get("EPISODE_LENGTH", 1000),
+                warmup_env_state=stats_state,
+                normalize_obs=config["NORMALIZE_ENV"],
+                condition_on_goal=condition_on_goal,
+            )
+
         rng, goal_rng,  _rng = jax.random.split(rng, 3)
 
         if config["NORMALIZE_ENV"]:
@@ -775,6 +905,51 @@ def make_train(config):
                         obs_norm_mean,
                         obs_norm_var,
                     ),
+                )
+
+            # Periodic eval on environment goals.
+            eval_freq = int(config.get("EVAL_FREQ", 0))
+            if eval_freq > 0:
+                should_eval = (update_idx) % eval_freq == 0
+                rng, eval_rng = jax.random.split(rng)
+
+                def _run_eval(_):
+                    jax.debug.print("running env-goal eval")
+                    success_rate, episodic_return = evaluate_agent_on_env_goal(
+                        train_state.params, env_state, eval_rng
+                    )
+                    step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
+
+                    def _log_eval(args):
+                        sr, er, st = args
+                        if config.get("WANDB_MODE", "disabled") == "online":
+                            wandb.log(
+                                {
+                                    "eval/success_rate": float(sr),
+                                    "eval/episodic_return": float(er),
+                                },
+                            )
+                        if config.get("DEBUG"):
+                            print(
+                                f"eval step={int(st)}, "
+                                f"success_rate={float(sr):.4f}, "
+                                f"episodic_return={float(er):.4f}"
+                            )
+                        return None
+
+                    jax.debug.callback(
+                        _log_eval, (success_rate, episodic_return, step)
+                    )
+                    return jnp.array(0, dtype=jnp.int32)
+
+                def _skip_eval(_):
+                    return jnp.array(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_eval,
+                    _run_eval,
+                    _skip_eval,
+                    operand=None,
                 )
 
             runner_state = (

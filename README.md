@@ -7,23 +7,6 @@ The two main entry points differ in **how the teacher is rewarded**:
 - `[purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py](purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py)` — teacher trained with **learning progress (LP)** reward
 - `[purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py](purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py)` — teacher trained with **empowerment** reward
 
-```mermaid
-flowchart LR
-  subgraph student [Student PPO]
-    Agent[Agent policy]
-    Env[Brax ant maze]
-    Agent --> Env
-  end
-  subgraph teacher [Teacher PPO]
-    Teacher[MLP teacher]
-    GoalGrid[Discrete goal grid]
-    Teacher --> GoalGrid
-  end
-  GoalGrid -->|goal conditioning| Agent
-  Env -->|competence + success| Teacher
-  Env -->|LP or empowerment| Teacher
-```
-
 
 
 

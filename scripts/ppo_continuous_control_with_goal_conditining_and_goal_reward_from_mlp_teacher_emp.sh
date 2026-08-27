@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_emp_subsample_emp_batch_goal_reward_only"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_emp_subsample_emp_second_sweep"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--no-USE_LEARNING_PROGRESS_REWARD"
@@ -12,7 +12,7 @@ ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30)
-COMMENT="experiment_after_fixing_teacher_lr_bug"
+COMMENT="experiment_after_fixing_teacher_lr_bug_and_added_visualization_and_evals_second_sweep"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
@@ -26,17 +26,21 @@ UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(16)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
-GOAL_REWARD_COEF=(1 0.5 0.1 0.01 0.05)
+GOAL_REWARD_COEF=(1 0.5)
 ### Teacher hyperparameters
-TEACHER_ROLLOUT_BUFFER_SIZES=(1 10)
+TEACHER_ACTIVATIONS=(relu tanh)
+TEACHER_ROLLOUT_BUFFER_SIZES=(1 5)
 EMPOWERMENT_SUBSAMPLE_SIZES=(2048)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
 USE_DISTANCE_IN_COMPETENCES=(--no-USE_DISTANCE_IN_COMPETENCE)
+## Empowerment model hyperparameters
+EMPOWERMENT_HIDDEN_DIMS=(256 1024)
 ENERGY_FUNCTIONS=(l2)
+EMPOWERMENT_NUM_LAYERSS=(2 3)
 CONTRASTIVE_LOSS_TYPES=(fwd_infonce bwd_infonce sym_infonce)
 run_count=0
-EMPOWERMENT_NUM_MINIBATCHES=(2 4 8)
-GAMMA_CLS=(0.99 0.9)
+EMPOWERMENT_NUM_MINIBATCHES=(2 8)
+GAMMA_CLS=(0.99)
 EMPOWERMENT_UPDATE_EPOCHSS=(1 2 4)
 
 for ENV_NAME in "${ENV_NAMES[@]}"; do
@@ -63,6 +67,9 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for empowerment_update_epochs in "${EMPOWERMENT_UPDATE_EPOCHSS[@]}"; do
                         for USE_DISTANCE_IN_COMPETENCE in "${USE_DISTANCE_IN_COMPETENCES[@]}"; do
                         for empowerment_subsample_size in "${EMPOWERMENT_SUBSAMPLE_SIZES[@]}"; do
+                        for teacher_activation in "${TEACHER_ACTIVATIONS[@]}"; do
+                        for empowerment_hidden_dim in "${EMPOWERMENT_HIDDEN_DIMS[@]}"; do
+                        for empowerment_num_layers in "${EMPOWERMENT_NUM_LAYERSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -73,10 +80,13 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --EMPOWERMENT_SUBSAMPLE_SIZE=${empowerment_subsample_size} \
                         --GAMMA_CL=${gamma_cls} \
                         --EMPOWERMENT_UPDATE_EPOCHS=${empowerment_update_epochs} \
+                        --EMPOWERMENT_HIDDEN_DIM=${empowerment_hidden_dim} \
+                        --EMPOWERMENT_NUM_LAYERS=${empowerment_num_layers} \
                         ${USE_LEARNING_PROGRESS_REWARD} \
                         ${USE_TEACHER_EMPOWERMENT_REWARD} \
                         --EMPOWERMENT_ENERGY_FN=${energy_function} \
                         --EMPOWERMENT_CONTRASTIVE_LOSS=${contrastive_loss_type} \
+                        --TEACHER_ACTIVATION=${teacher_activation} \
                         --EMPOWERMENT_NUM_MINIBATCHES=${empowerment_num_minibatches} \
                         --SEED=${SEED} \
                         ${ADD_GOAL_REWARD} \
@@ -105,7 +115,10 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
             done
+            done
           done
+        done
+        done
         done
         done
         done
