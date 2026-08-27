@@ -109,7 +109,7 @@ class TrainConfig:
     TEACHER_GAMMA: float = 0.99
     TEACHER_GAE_LAMBDA: float = 0.8
     TEACHER_CLIP_EPS: float = 0.2
-    TEACHER_ENT_COEF: float = 0.0
+    TEACHER_ENT_COEF: float = 0.001
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
     TEACHER_USE_ENCODERS: bool = True

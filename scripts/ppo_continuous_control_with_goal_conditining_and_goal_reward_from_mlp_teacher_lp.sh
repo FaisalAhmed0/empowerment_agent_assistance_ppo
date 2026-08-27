@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_simple_reward_more_seeds_more_envs"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_rerun"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
@@ -9,7 +9,7 @@ TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTSS=(100)
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
-SEEDS=(30 0 8943)
+SEEDS=(30)
 COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_we_want_to_give_and_we_are_using_a_simple_reward_2"
 
 # PPO teacher-specific sweep args from
@@ -26,7 +26,7 @@ NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
 GOAL_REWARD_COEF=(1)
 ### Teacher hyperparameters
-TEACHER_ROLLOUT_BUFFER_SIZES=(2 10 30)
+TEACHER_ROLLOUT_BUFFER_SIZES=(1 10 30)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
 NUM_EVAL_ENVSS=(4 8)
 TEACHER_NUM_MINIBATCHESS=(4 8 16 32)
