@@ -481,6 +481,7 @@ class AntMaze(PipelineEnv):
     def _random_target(self, rng: jax.Array) -> jax.Array:
         """Returns a random target location chosen from possibilities specified in the maze layout."""
         idx = jax.random.randint(rng, (1,), 0, len(self.possible_goals))
+        # jax.debug.print("idx: {idx}", idx=idx)
         return jnp.array(self.possible_goals[idx])[0]
 
     def _random_start(self, rng: jax.Array) -> jax.Array:

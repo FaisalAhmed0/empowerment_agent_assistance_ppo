@@ -71,7 +71,6 @@ class TrainConfig:
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     TRAIN_RENDER_FREQ: int = 50
-    TRAIN_RENDER_REF_ENV_INDEX: int = 0
     EVAL_FREQ: int = 10
     EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
@@ -768,9 +767,12 @@ class TrainRenderBuffer(NamedTuple):
     completed_frames: Any
     completed_length: jnp.ndarray
     has_completed: jnp.ndarray
+    ref_env_index: jnp.ndarray
 
 
-def init_train_render_buffer(env_state, ref_env_index: int, max_len: int) -> TrainRenderBuffer:
+def init_train_render_buffer(
+    env_state, ref_env_index: jnp.ndarray, max_len: int
+) -> TrainRenderBuffer:
     """Allocate a fixed-length buffer from a template pipeline state."""
     brax_state = _inner_brax_state(env_state)
     ref_ps = jax.tree_util.tree_map(
@@ -785,6 +787,7 @@ def init_train_render_buffer(env_state, ref_env_index: int, max_len: int) -> Tra
         completed_frames=empty_frames,
         completed_length=jnp.array(0, dtype=jnp.int32),
         has_completed=jnp.array(False),
+        ref_env_index=jnp.asarray(ref_env_index, dtype=jnp.int32),
     )
 
 
@@ -793,7 +796,9 @@ def update_train_render_buffer(
     ref_pipeline_state,
     ref_done: jnp.ndarray,
     max_len: int,
-) -> TrainRenderBuffer:
+    rng,
+    num_envs: int,
+) -> tuple[TrainRenderBuffer, Any]:
     """Append one frame; on episode done, snapshot and start the next episode."""
 
     def _write(frames, length, frame):
@@ -808,31 +813,36 @@ def update_train_render_buffer(
 
     def _on_continue(_):
         frames, length = _write(buf.frames, buf.length, ref_pipeline_state)
-        return TrainRenderBuffer(
+        new_buf = TrainRenderBuffer(
             frames=frames,
             length=length,
             completed_frames=buf.completed_frames,
             completed_length=buf.completed_length,
             has_completed=buf.has_completed,
+            ref_env_index=buf.ref_env_index,
         )
+        return new_buf, rng
 
     def _on_done(_):
-        # Autoreset: current pipeline_state is the next episode start — do not
-        # include it in the completed episode snapshot.
         completed_frames = buf.frames
         completed_length = buf.length
-        frames, length = _write(
-            jax.tree_util.tree_map(jnp.zeros_like, buf.frames),
-            jnp.array(0, dtype=jnp.int32),
-            ref_pipeline_state,
+        rng_next, sample_rng = jax.random.split(rng)
+        # import pdb;pdb.set_trace()
+        jax.debug.print("ref_env_index: {ref_env_index}", ref_env_index=buf.ref_env_index)
+        goal_pos = buf.completed_frames.x.pos[buf.ref_env_index][-1][:2]
+        jax.debug.print("goal_pos: {goal_pos}", goal_pos=goal_pos)
+        new_ref_env_index = jax.random.randint(
+            sample_rng, (), 0, num_envs, dtype=jnp.int32
         )
-        return TrainRenderBuffer(
-            frames=frames,
-            length=length,
+        new_buf = TrainRenderBuffer(
+            frames=jax.tree_util.tree_map(jnp.zeros_like, buf.frames),
+            length=jnp.array(0, dtype=jnp.int32),
             completed_frames=completed_frames,
             completed_length=completed_length,
             has_completed=jnp.array(True),
+            ref_env_index=new_ref_env_index,
         )
+        return new_buf, rng_next
 
     return jax.lax.cond(ref_done, _on_done, _on_continue, operand=None)
 
@@ -1160,7 +1170,10 @@ def make_train(config):
     )
     gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
     goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
-    num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
+    final_goal = jnp.array([[12,8.]])
+    goal_grid = jnp.concatenate([goal_grid, final_goal], axis=0)
+    # import pdb;pdb.set_trace()
+    num_teacher_goals = (teacher_num_goal_points * teacher_num_goal_points) + 1
     all_goals = all_possible_goals()
     num_competence = int(all_goals.shape[0])
     condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
@@ -1782,21 +1795,26 @@ def make_train(config):
         )
         train_render_freq = int(config.get("TRAIN_RENDER_FREQ", 0))
         enable_train_render = train_render_freq > 0
-        train_render_ref_env = int(config.get("TRAIN_RENDER_REF_ENV_INDEX", 0))
         train_render_max_len = int(config["EPISODE_LENGTH"])
         if enable_train_render:
+            rng, train_render_rng = jax.random.split(rng)
+            ref_env_index = jax.random.randint(
+                train_render_rng, (), 0, config["NUM_ENVS"], dtype=jnp.int32
+            )
             train_render_buf = init_train_render_buffer(
-                env_state, train_render_ref_env, train_render_max_len
+                env_state, ref_env_index, train_render_max_len
             )
             ref_ps0 = jax.tree_util.tree_map(
-                lambda x: x[train_render_ref_env],
+                lambda x: x[ref_env_index],
                 _inner_brax_state(env_state).pipeline_state,
             )
-            train_render_buf = update_train_render_buffer(
+            train_render_buf, rng = update_train_render_buffer(
                 train_render_buf,
                 ref_ps0,
                 jnp.array(False),
                 train_render_max_len,
+                rng,
+                config["NUM_ENVS"],
             )
 
         def plot_teacher_goal_selection_counts(
@@ -2098,15 +2116,18 @@ def make_train(config):
                     obsv = jnp.concatenate([obsv, goals], axis=-1)
                 current_xy = env_state.org_obs[..., :2]
                 if enable_train_render:
+                    ref_idx = train_render_buf.ref_env_index
                     ref_ps = jax.tree_util.tree_map(
-                        lambda x: x[train_render_ref_env],
+                        lambda x: x[ref_idx],
                         _inner_brax_state(env_state).pipeline_state,
                     )
-                    train_render_buf = update_train_render_buffer(
+                    train_render_buf, rng = update_train_render_buffer(
                         train_render_buf,
                         ref_ps,
-                        done[train_render_ref_env],
+                        done[ref_idx],
                         train_render_max_len,
+                        rng,
+                        config["NUM_ENVS"],
                     )
                 transition = Transition(
                     done,
@@ -2313,6 +2334,8 @@ def make_train(config):
             teacher_should_update = (
                 teacher_rollout_buffer.count >= teacher_rollout_buffer_size
             ) & (use_average_competence_reward | use_learning_progress_reward)
+
+            jax.debug.print("teacher_should_update: {teacher_should_update}", teacher_should_update=teacher_should_update)
 
             def _teacher_calculate_gae(traj, last_val):
                 def _get_advantages(gae_and_next_value, transition):
