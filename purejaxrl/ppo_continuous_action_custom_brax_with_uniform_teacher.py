@@ -70,6 +70,8 @@ class TrainConfig:
     EVAL_RENDER_MAX_FRAMES: int = 100
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
+    EVAL_FREQ: int = 10
+    EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = True
     CONDITION_ON_GOAL: bool = True
@@ -246,6 +248,87 @@ def evaluate_multiple_goals(
     vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
     goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])
     return vmap_goals(goal_rngs, goals)
+
+
+def evaluate_student_env_goal(
+    env,
+    brax_env,
+    network,
+    params,
+    num_envs,
+    rng,
+    max_steps=1000,
+    warmup_env_state=None,
+    normalize_obs=False,
+    condition_on_goal=True,
+):
+    """Evaluate student on env goals (no teacher sampling).
+
+    Conditions the policy on each env's own maze goal from ``org_obs[..., -2:]``.
+    Returns ``(success_rate, episodic_return)`` averaged over ``num_envs``.
+    """
+    env_params = None
+    obs_dim = brax_env.observation_size
+    eval_stats = (
+        _collapse_obs_norm_stats(warmup_env_state, obs_dim)
+        if normalize_obs and warmup_env_state is not None
+        else warmup_env_state
+    )
+    norm_mean = eval_stats.mean if eval_stats is not None else None
+    norm_var = eval_stats.var if eval_stats is not None else None
+
+    reset_rngs = jax.random.split(rng, num_envs)
+    if eval_stats is not None:
+        obsv, env_state = env.reset_with_stats(reset_rngs, eval_stats, env_params)
+    else:
+        obsv, env_state = env.reset(reset_rngs, env_params)
+
+    brax_state = _inner_brax_state(env_state)
+    if normalize_obs:
+        org_obs = env_state.org_obs
+        obsv = (brax_state.obs - norm_mean) / jnp.sqrt(norm_var + 1e-8)
+    else:
+        org_obs = brax_state.obs
+        obsv = brax_state.obs
+
+    # Teacher/conditioning goal equals the environment goal (no teacher sampling).
+    env_goals = org_obs[..., -2:]
+    if condition_on_goal:
+        if normalize_obs:
+            goal_batch = _normalize_xy(env_goals, norm_mean, norm_var)
+        else:
+            goal_batch = env_goals
+
+    def step_fn(carry, _):
+        obsv, env_state, rng, ep_return, ep_success, ever_done = carry
+        rng, step_rng, action_rng = jax.random.split(rng, 3)
+        step_rngs = jax.random.split(step_rng, num_envs)
+        if condition_on_goal:
+            policy_obs = jnp.concatenate([obsv, goal_batch], axis=-1)
+        else:
+            policy_obs = obsv
+        pi, _ = network.apply(params, policy_obs)
+        action = pi.sample(seed=action_rng)
+        obsv, env_state, reward, done, info = env.step(
+            step_rngs, env_state, action, env_params
+        )
+        active = 1.0 - ever_done
+        step_success = _success_metric(env_state)
+        ep_success = jnp.maximum(ep_success, step_success * active)
+        ep_return = ep_return + reward * active
+        ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
+        return (obsv, env_state, rng, ep_return, ep_success, ever_done), None
+
+    init_return = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_success = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_ever_done = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    (_, _, _, ep_return, ep_success, _), _ = jax.lax.scan(
+        step_fn,
+        (obsv, env_state, rng, init_return, init_success, init_ever_done),
+        None,
+        length=max_steps,
+    )
+    return ep_success.mean(), ep_return.mean()
 
 
 def parse_config_from_cli() -> TrainConfig:
@@ -692,6 +775,9 @@ def make_train(config):
     )
     gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
     goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
+    final_goal = jnp.array([[12,8.]])
+    goal_grid = jnp.concatenate([goal_grid, final_goal], axis=0)
+    num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points + 1
     all_goals = all_possible_goals()
     num_competence = int(all_goals.shape[0])
     condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
@@ -704,7 +790,7 @@ def make_train(config):
         base_obs_dim + num_competence if condition_teacher_on_competence else base_obs_dim
     )
     teacher_network = TeacherActorCritic(
-        num_actions=teacher_num_goal_points * teacher_num_goal_points,
+        num_actions=num_teacher_goals,
         activation=config["ACTIVATION"],
         hidden_dim=config["TEACHER_HIDDEN_DIM"],
     )
@@ -1055,6 +1141,20 @@ def make_train(config):
                 student_params,
                 goals,
                 config["NUM_EVAL_ENVS"],
+                max_steps=config.get("EPISODE_LENGTH", 1000),
+                warmup_env_state=stats_state,
+                normalize_obs=config["NORMALIZE_ENV"],
+                condition_on_goal=condition_on_goal,
+            )
+
+        def evaluate_student_on_env_goal(student_params, stats_state, rng):
+            return evaluate_student_env_goal(
+                env_2,
+                custom_env_2,
+                network,
+                student_params,
+                config["EVAL_NUM_ENVS"],
+                rng,
                 max_steps=config.get("EPISODE_LENGTH", 1000),
                 warmup_env_state=stats_state,
                 normalize_obs=config["NORMALIZE_ENV"],
@@ -1898,6 +1998,51 @@ def make_train(config):
                         teacher_current_lr,
                         teacher_update_batch_size,
                     ),
+                )
+
+            # Periodic student eval on environment goals (no teacher sampling).
+            eval_freq = int(config.get("EVAL_FREQ", 0))
+            if eval_freq > 0:
+                should_eval = (update_idx) % eval_freq == 0
+                rng, eval_rng = jax.random.split(rng)
+
+                def _run_student_eval(_):
+                    jax.debug.print("running student eval")
+                    success_rate, episodic_return = evaluate_student_on_env_goal(
+                        train_state.params, env_state, eval_rng
+                    )
+                    step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
+
+                    def _log_eval(args):
+                        sr, er, st = args
+                        if config.get("WANDB_MODE", "disabled") == "online":
+                            wandb.log(
+                                {
+                                    "eval/success_rate": float(sr),
+                                    "eval/episodic_return": float(er),
+                                },
+                            )
+                        if config.get("DEBUG"):
+                            print(
+                                f"eval step={int(st)}, "
+                                f"success_rate={float(sr):.4f}, "
+                                f"episodic_return={float(er):.4f}"
+                            )
+                        return None
+
+                    jax.debug.callback(
+                        _log_eval, (success_rate, episodic_return, step)
+                    )
+                    return jnp.array(0, dtype=jnp.int32)
+
+                def _skip_student_eval(_):
+                    return jnp.array(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    should_eval,
+                    _run_student_eval,
+                    _skip_student_eval,
+                    operand=None,
                 )
 
             if (

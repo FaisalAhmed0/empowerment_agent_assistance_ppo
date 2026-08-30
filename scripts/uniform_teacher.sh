@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal"
+# This is ready for running I will just the other jobs to finish
+WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal_uniform_teacher_baseline"
 
 ENV_NAMES=("ant_u_maze_single_goal")
 SAVE_MODEL="--SAVE_MODEL"
@@ -21,7 +22,7 @@ MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4)
 HIDDEN_DIMS=(256)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
-NUM_MINIBATCHES=(8 16)
+NUM_MINIBATCHES=(8)
 
 
 run_count=0
