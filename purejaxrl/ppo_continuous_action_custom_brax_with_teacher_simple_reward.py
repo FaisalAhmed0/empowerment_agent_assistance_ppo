@@ -828,9 +828,9 @@ def update_train_render_buffer(
         completed_length = buf.length
         rng_next, sample_rng = jax.random.split(rng)
         # import pdb;pdb.set_trace()
-        jax.debug.print("ref_env_index: {ref_env_index}", ref_env_index=buf.ref_env_index)
+        # jax.debug.print("ref_env_index: {ref_env_index}", ref_env_index=buf.ref_env_index)
         goal_pos = buf.completed_frames.x.pos[buf.ref_env_index][-1][:2]
-        jax.debug.print("goal_pos: {goal_pos}", goal_pos=goal_pos)
+        # jax.debug.print("goal_pos: {goal_pos}", goal_pos=goal_pos)
         new_ref_env_index = jax.random.randint(
             sample_rng, (), 0, num_envs, dtype=jnp.int32
         )
@@ -2335,7 +2335,7 @@ def make_train(config):
                 teacher_rollout_buffer.count >= teacher_rollout_buffer_size
             ) & (use_average_competence_reward | use_learning_progress_reward)
 
-            jax.debug.print("teacher_should_update: {teacher_should_update}", teacher_should_update=teacher_should_update)
+            # jax.debug.print("teacher_should_update: {teacher_should_update}", teacher_should_update=teacher_should_update)
 
             def _teacher_calculate_gae(traj, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -2569,15 +2569,15 @@ def make_train(config):
                 teacher_rollout_buffer
             )
 
-            jax.lax.cond(
-                jnp.any(done_mask),
-                lambda: jax.debug.print(
-                    "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
-                    lp=teacher_average_learning_progress,
-                    u=average_ppo_updates_per_episode,
-                ),
-                lambda: None,
-            )
+            # jax.lax.cond(
+            #     jnp.any(done_mask),
+            #     lambda: jax.debug.print(
+            #         "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
+            #         lp=teacher_average_learning_progress,
+            #         u=average_ppo_updates_per_episode,
+            #     ),
+            #     lambda: None,
+            # )
 
             if config.get("DEBUG"):
 
@@ -2840,7 +2840,7 @@ def make_train(config):
                 rng, eval_rng = jax.random.split(rng)
 
                 def _run_student_eval(_):
-                    jax.debug.print("running student eval")
+                    # jax.debug.print("running student eval")
                     success_rate, episodic_return = evaluate_student_on_env_goal(
                         train_state.params, env_state, eval_rng
                     )

@@ -3500,7 +3500,7 @@ def make_train(config):
                 rng, eval_rng = jax.random.split(rng)
 
                 def _run_student_eval(_):
-                    jax.debug.print("running student eval")
+                    # jax.debug.print("running student eval")
                     success_rate, episodic_return = evaluate_student_on_env_goal(
                         train_state.params, env_state, eval_rng
                     )
@@ -3585,10 +3585,10 @@ def make_train(config):
                 should_log_train_render = jnp.logical_and(
                     should_render, train_render_buf.has_completed
                 )
-                jax.debug.print("update_idx is {x}", x=update_idx)
-                jax.debug.print("should_render is {x}", x=should_render)
-                jax.debug.print("train_render_buf.has_completed is {x}", x=train_render_buf.has_completed)
-                jax.debug.print("should_log_train_render is {x}", x=should_log_train_render)
+                # jax.debug.print("update_idx is {x}", x=update_idx)
+                # jax.debug.print("should_render is {x}", x=should_render)
+                # jax.debug.print("train_render_buf.has_completed is {x}", x=train_render_buf.has_completed)
+                # jax.debug.print("should_log_train_render is {x}", x=should_log_train_render)
 
                 def _run_train_render(_):
                     step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]

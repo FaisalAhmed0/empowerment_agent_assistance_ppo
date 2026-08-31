@@ -704,8 +704,8 @@ def make_train(config):
             warmup_env_state = run_policy(network_params, rng)
             obs_mean = warmup_env_state.mean
             obs_var = warmup_env_state.var
-            jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
-            jax.debug.print("obs_var: {obs_var}", obs_var=obs_var[0])
+            # jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
+            # jax.debug.print("obs_var: {obs_var}", obs_var=obs_var[0])
 
         # INIT ENV
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
@@ -713,12 +713,12 @@ def make_train(config):
             obsv, env_state = env.reset_with_stats(
                 reset_rng, warmup_env_state, env_params
             )
-            jax.debug.print(
-                "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
-            )
-            jax.debug.print(
-                "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
-            )
+            # jax.debug.print(
+            #     "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
+            # )
+            # jax.debug.print(
+            #     "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
+            # )
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
 

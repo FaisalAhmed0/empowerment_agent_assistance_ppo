@@ -1198,12 +1198,12 @@ def make_train(config):
             obsv, env_state = env.reset_with_stats(
                 reset_rng, warmup_env_state, env_params
             )
-            jax.debug.print(
-                "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
-            )
-            jax.debug.print(
-                "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
-            )
+            # jax.debug.print(
+            #     "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
+            # )
+            # jax.debug.print(
+            #     "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
+            # )
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
 
@@ -1823,15 +1823,15 @@ def make_train(config):
                 teacher_rollout_buffer
             )
 
-            jax.lax.cond(
-                jnp.any(done_mask),
-                lambda: jax.debug.print(
-                    "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
-                    lp=teacher_average_learning_progress,
-                    u=average_ppo_updates_per_episode,
-                ),
-                lambda: None,
-            )
+            # jax.lax.cond(
+            #     jnp.any(done_mask),
+            #     lambda: jax.debug.print(
+            #         "learning_progress_mean={lp}, ppo_updates_per_episode_mean={u}",
+            #         lp=teacher_average_learning_progress,
+            #         u=average_ppo_updates_per_episode,
+            #     ),
+            #     lambda: None,
+            # )
 
             if config.get("DEBUG"):
 
@@ -2008,7 +2008,7 @@ def make_train(config):
                 rng, eval_rng = jax.random.split(rng)
 
                 def _run_student_eval(_):
-                    jax.debug.print("running student eval")
+                    # jax.debug.print("running student eval")
                     success_rate, episodic_return = evaluate_student_on_env_goal(
                         train_state.params, env_state, eval_rng
                     )
