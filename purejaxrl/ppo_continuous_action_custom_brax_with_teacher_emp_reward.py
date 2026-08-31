@@ -1545,10 +1545,10 @@ def make_train(config):
     )
     gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
     goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
-    final_goal = jnp.array([[12,8.]])
-    goal_grid = jnp.concatenate([goal_grid, final_goal], axis=0)
-    # import pdb;pdb.set_trace() 
-    num_teacher_goals = (teacher_num_goal_points * teacher_num_goal_points) + 1
+    custom_goal = jnp.array([12.0, 8.0])
+    replace_idx = jnp.argmin(jnp.sum((goal_grid - custom_goal) ** 2, axis=-1))
+    goal_grid = goal_grid.at[replace_idx].set(custom_goal)
+    num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
     all_goals = all_possible_goals()
     num_competence = int(all_goals.shape[0])
     condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)

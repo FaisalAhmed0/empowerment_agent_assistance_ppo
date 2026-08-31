@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_rerun"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_more_ppo_envs"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
@@ -10,11 +10,11 @@ ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30)
-COMMENT="here_we_are_using_the_mlp_teacher_to_generate_the_goals_the_teacher_is_trained_with_different_goal_reward_coefficients_to_how_much_sensitivity_to_the_goal_reward_we_want_to_give_and_we_are_using_a_simple_reward_2"
+COMMENT="increasing_the_number_of_envs_to_improve_gpu_utilization"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(256)
+NUM_ENVSS=(256 1024 2048)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0)
 GAE_LAMBDA=(0.8)
@@ -26,11 +26,11 @@ NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
 GOAL_REWARD_COEF=(1)
 ### Teacher hyperparameters
-TEACHER_ROLLOUT_BUFFER_SIZES=(1 10)
+TEACHER_ROLLOUT_BUFFER_SIZES=(1)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
-NUM_EVAL_ENVSS=(4 8)
-TEACHER_NUM_MINIBATCHESS=(4 8 16)
-TEACHER_UPDATE_EPOCHSS=(2 4 8)
+NUM_EVAL_ENVSS=(8)
+TEACHER_NUM_MINIBATCHESS=(8 16)
+TEACHER_UPDATE_EPOCHSS=(2 4)
 TASK_REWARD_COEFSS=(1 2 5)
 
 run_count=0
