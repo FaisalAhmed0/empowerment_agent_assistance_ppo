@@ -70,7 +70,7 @@ class TrainConfig:
     EVAL_RENDER_MAX_FRAMES: int = 1000
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
-    TRAIN_RENDER_FREQ: int = 50
+    TRAIN_RENDER_FREQ: int = 500
     EVAL_FREQ: int = 10
     EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
@@ -83,7 +83,7 @@ class TrainConfig:
     TEACHER_GOAL_Y_MAX: float = 12.0
     TEACHER_NUM_GOAL_POINTS: int = 30
     TEACHER_GOAL_COUNT_VIZ_LOG_WANDB: bool = True
-    TEACHER_GOAL_COUNT_VIZ_FREQ: int = 100
+    TEACHER_GOAL_COUNT_VIZ_FREQ: int = 500
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
@@ -114,7 +114,7 @@ class TrainConfig:
     TEACHER_USE_ENCODERS: bool = True
     TEACHER_ACTIVATION: str = "tanh"
     # Agent XY logging
-    AGENT_POSITIONS_LOG_FREQ: int = 10
+    AGENT_POSITIONS_LOG_FREQ: int = 500
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
     AGENT_POSITIONS_INJIT_SUBSAMPLE_EVERY: int = 1
     AGENT_POSITIONS_SAVE_DIR: str | None = None

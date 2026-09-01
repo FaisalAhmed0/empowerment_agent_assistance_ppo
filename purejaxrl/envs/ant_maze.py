@@ -24,6 +24,9 @@ U_MAZE = [
     [1, 1, 1, 1, 1],
 ]
 
+# Sequential oracle waypoints for U-topology mazes (grid i, j indices).
+U_MAZE_ORACLE_WAYPOINTS = [(1, 3), (3, 3), (3, 1)]
+
 U_MAZE_ALL_STATES = [
     [1, 1, 1, 1, 1],
     [1, G, G, G, 1],
@@ -327,6 +330,8 @@ class AntMaze(PipelineEnv):
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
         dense_reward: bool = False,
+        use_oracle_reward: bool = False,
+        oracle_reward_coef: float = 1.0,
         **kwargs,
     ):
         xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
@@ -369,9 +374,19 @@ class AntMaze(PipelineEnv):
         self._reset_noise_scale = reset_noise_scale
         self._exclude_current_positions_from_observation = exclude_current_positions_from_observation
         self.dense_reward = dense_reward
+        self.use_oracle_reward = use_oracle_reward
+        self._oracle_reward_coef = oracle_reward_coef
+        self._oracle_waypoints = jnp.array(
+            [(i * maze_size_scaling, j * maze_size_scaling) for i, j in U_MAZE_ORACLE_WAYPOINTS]
+        )
         self.state_dim = 29
         self.goal_indices = jnp.array([0, 1])
         self.goal_reach_thresh = 0.5
+
+        if use_oracle_reward and not maze_layout_name.startswith("u_maze"):
+            raise ValueError(
+                f"use_oracle_reward is only supported for u_maze layouts, got {maze_layout_name!r}"
+            )
 
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
@@ -412,9 +427,20 @@ class AntMaze(PipelineEnv):
             "dist": zero,
             "success": zero,
             "success_easy": zero,
+            "oracle_stage": zero,
+            "oracle_subgoal_dist": zero,
+            "oracle_vel_reward": zero,
         }
         state = State(pipeline_state, obs, reward, done, metrics)
         return state
+
+    def _oracle_subgoal_for_stage(self, stage: jax.Array, goal_pos: jax.Array) -> jax.Array:
+        wp0, wp1, wp2 = self._oracle_waypoints[0], self._oracle_waypoints[1], self._oracle_waypoints[2]
+        return jnp.where(
+            stage == 0,
+            wp0,
+            jnp.where(stage == 1, wp1, jnp.where(stage == 2, wp2, goal_pos)),
+        )
 
     def step(self, state: State, action: jax.Array) -> State:
         """Run one timestep of the environment's dynamics."""
@@ -447,6 +473,23 @@ class AntMaze(PipelineEnv):
         else:
             reward = success
 
+        oracle_stage = state.metrics["oracle_stage"]
+        oracle_subgoal_dist = state.metrics["oracle_subgoal_dist"]
+        oracle_vel_reward = state.metrics["oracle_vel_reward"]
+        if self.use_oracle_reward:
+            prev_stage = oracle_stage.astype(jnp.int32)
+            current_wp = self._oracle_subgoal_for_stage(prev_stage, obs[-2:])
+            reached = jnp.linalg.norm(obs[:2] - current_wp) < self.goal_reach_thresh
+            oracle_stage = jnp.minimum(prev_stage + reached.astype(jnp.int32), 3).astype(jnp.float32)
+
+            shaping_subgoal = self._oracle_subgoal_for_stage(prev_stage, old_obs[-2:])
+            old_sub_dist = jnp.linalg.norm(old_obs[:2] - shaping_subgoal)
+            new_sub_dist = jnp.linalg.norm(obs[:2] - shaping_subgoal)
+            vel_to_subgoal = (old_sub_dist - new_sub_dist) / self.dt
+            oracle_vel_reward = self._oracle_reward_coef * vel_to_subgoal
+            oracle_subgoal_dist = new_sub_dist
+            reward = reward + oracle_vel_reward
+
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
         state.metrics.update(
@@ -463,6 +506,9 @@ class AntMaze(PipelineEnv):
             dist=dist,
             success=success,
             success_easy=success_easy,
+            oracle_stage=oracle_stage,
+            oracle_subgoal_dist=oracle_subgoal_dist,
+            oracle_vel_reward=oracle_vel_reward,
         )
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done)
 

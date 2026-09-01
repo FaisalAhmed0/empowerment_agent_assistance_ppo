@@ -72,6 +72,8 @@ class TrainConfig:
     EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = False
+    USE_ORACLE_REWARD: bool = False
+    ORACLE_REWARD_COEF: float = 1.0
     CONDITION_ON_GOAL: bool = False
     GOAL_REACH_EPSILON: float = 0.5
     HIDDEN_DIM: int = 256
@@ -136,6 +138,7 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
+    returned_goal_success: jnp.ndarray
 
 
 
@@ -285,7 +288,10 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-    env_kwargs = config.get("ENV_KWARGS", {})
+    env_kwargs = dict(config.get("ENV_KWARGS", {}))
+    if config.get("USE_ORACLE_REWARD", False):
+        env_kwargs["use_oracle_reward"] = True
+        env_kwargs["oracle_reward_coef"] = config["ORACLE_REWARD_COEF"]
     custom_env = make_custom_env(
         env_name=config["ENV_NAME"],
         backend=config.get("ENV_BACKEND"),
@@ -574,6 +580,8 @@ def make_train(config):
                     goal_reward_sum,
                     goal_reward_sq_sum,
                     reward_count,
+                    ep_goal_success,
+                    returned_ep_goal_success,
                     rng,
                 ) = runner_state
 
@@ -590,6 +598,12 @@ def make_train(config):
                 obsv, env_state, reward, done, info = env.step(
                     rng_step, env_state, action, env_params
                 )
+                step_goal_success = _success_metric(env_state)
+                ep_goal_success = jnp.maximum(ep_goal_success, step_goal_success)
+                returned_ep_goal_success = (
+                    returned_ep_goal_success * (1 - done) + ep_goal_success * done
+                )
+                ep_goal_success = ep_goal_success * (1 - done)
                 task_reward = reward
                 goal_reward = jnp.zeros_like(task_reward)
                 if add_goal_reward:
@@ -620,7 +634,16 @@ def make_train(config):
                 if condition_on_goal:
                     obsv = jnp.concatenate([obsv, goals], axis=-1)
                 transition = Transition(
-                    done, action, value, reward, task_reward, goal_reward, log_prob, last_obs, info
+                    done,
+                    action,
+                    value,
+                    reward,
+                    task_reward,
+                    goal_reward,
+                    log_prob,
+                    last_obs,
+                    info,
+                    returned_ep_goal_success,
                 )
                 runner_state = (
                     train_state,
@@ -633,6 +656,8 @@ def make_train(config):
                     goal_reward_sum,
                     goal_reward_sq_sum,
                     reward_count,
+                    ep_goal_success,
+                    returned_ep_goal_success,
                     rng,
                 )
                 return runner_state, transition
@@ -653,6 +678,8 @@ def make_train(config):
                 goal_reward_sum,
                 goal_reward_sq_sum,
                 reward_count,
+                ep_goal_success,
+                returned_ep_goal_success,
                 rng,
             ) = runner_state
             _, last_val = network.apply(train_state.params, last_obs)
@@ -834,6 +861,14 @@ def make_train(config):
                 jax.debug.callback(debug_callback, metric)
 
             if config.get("WANDB_MODE", "disabled") == "online":
+                returned_episode = metric["returned_episode"]
+                done_count = returned_episode.sum()
+                train_goal_success_rate = jnp.where(
+                    done_count > 0,
+                    (traj_batch.returned_goal_success * returned_episode).sum()
+                    / done_count,
+                    jnp.nan,
+                )
 
                 def wandb_callback(args):
                     (
@@ -853,6 +888,7 @@ def make_train(config):
                         current_lr,
                         obs_norm_mean,
                         obs_norm_var,
+                        train_goal_success_rate,
                     ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
@@ -860,12 +896,8 @@ def make_train(config):
                         info["returned_episode"]
                     ]
                     if len(return_values) > 0:
-                        wandb.log(
-                            {"episodic_return": float(return_values.mean())},
-                            step=step,
-                        )
-                        wandb.log(
-                        {
+                        log_payload = {
+                            "episodic_return": float(return_values.mean()),
                             "total_loss": float(total_loss),
                             "value_loss": float(value_loss),
                             "actor_loss": float(actor_loss),
@@ -881,9 +913,12 @@ def make_train(config):
                             "learning_rate": float(current_lr),
                             "obs_norm_mean": float(obs_norm_mean),
                             "obs_norm_var": float(obs_norm_var),
-                        },
-                        step=step,
-                    )
+                        }
+                        if not jnp.isnan(train_goal_success_rate):
+                            log_payload["train/goal_success_rate"] = float(
+                                train_goal_success_rate
+                            )
+                        wandb.log(log_payload, step=step)
 
                 jax.debug.callback(
                     wandb_callback,
@@ -904,6 +939,7 @@ def make_train(config):
                         current_lr,
                         obs_norm_mean,
                         obs_norm_var,
+                        train_goal_success_rate,
                     ),
                 )
 
@@ -963,6 +999,8 @@ def make_train(config):
                 goal_reward_sum,
                 goal_reward_sq_sum,
                 reward_count,
+                ep_goal_success,
+                returned_ep_goal_success,
                 rng,
             )
             return runner_state, metric
@@ -980,6 +1018,8 @@ def make_train(config):
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
+            jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
+            jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             _rng,
         )
         runner_state, metric = jax.lax.scan(
@@ -1012,8 +1052,8 @@ def main():
     train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
-    jax.block_until_ready(train_output["runner_state"][10])
-    final_train_state, final_env_state, _, _, _, _, _, _, _, _, final_rng = train_output[
+    jax.block_until_ready(train_output["runner_state"][12])
+    final_train_state, final_env_state, _, _, _, _, _, _, _, _, _, _, final_rng = train_output[
         "runner_state"
     ]
     if config["SAVE_MODEL"]:

@@ -2448,7 +2448,7 @@ def make_train(config):
                     )
 
                 # compute the final teacher's reward
-                teacher_reward = ( success_part
+                teacher_reward = ( config["TASK_REWARD_COEF"] * success_part
                     + teacher_empowerment_reward_coef * teacher_emp_part
                 )
                 # update the buffer pointer

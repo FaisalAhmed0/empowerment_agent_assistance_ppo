@@ -13,7 +13,7 @@ COMMENT="no_teacher_baseline"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(256)
+NUM_ENVSS=(256 1024 2048)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0)
 GAE_LAMBDA=(0.8)
@@ -68,8 +68,6 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
           done
-        done
-        done
         done
         done
         done
