@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_more_ppo_envs"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_more_seeds"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
@@ -9,19 +9,19 @@ TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTSS=(0)
 ENV_NAMES=("ant_u_maze_single_goal")
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
-SEEDS=(30)
-COMMENT="increasing_the_number_of_envs_to_improve_gpu_utilization"
+SEEDS=(30 0 8943)
+COMMENT="More_seeds"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(256 1024 2048)
+NUM_ENVSS=(256)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0)
 GAE_LAMBDA=(0.8)
-CLIP_EPS=(0.2 0.3)
+CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4)
-NUM_MINIBATCHES=(8 16)
+NUM_MINIBATCHES=(8)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
 GOAL_REWARD_COEF=(1)
