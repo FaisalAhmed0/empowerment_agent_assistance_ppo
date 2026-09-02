@@ -27,8 +27,10 @@ from wrappers import (
 )
 try:
     from purejaxrl.envs.factory import make_custom_env
+    from purejaxrl.rnd import RNDNetwork, init_rnd_state, rnd_step, train_predictor
 except ImportError:
     from envs.factory import make_custom_env
+    from rnd import RNDNetwork, init_rnd_state, rnd_step, train_predictor
 
 import orbax.checkpoint as ocp
 
@@ -68,6 +70,7 @@ class TrainConfig:
     EVAL_RENDER_MAX_FRAMES: int = 1000
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
+    TRAIN_RENDER_FREQ: int = 200
     EVAL_FREQ: int = 10
     EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
@@ -79,7 +82,12 @@ class TrainConfig:
     HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
-
+    USE_RND: bool = False
+    RND_COEF: float = 1.0
+    RND_LR: float = 1e-4
+    RND_HIDDEN_DIM: int = 256
+    RND_OUTPUT_DIM: int = 128
+    TASK_REWARD_COEF: float = 1.0
 
 def parse_config_from_cli() -> TrainConfig:
     return tyro.cli(TrainConfig)
@@ -135,6 +143,9 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     task_reward: jnp.ndarray
     goal_reward: jnp.ndarray
+    rnd_reward: jnp.ndarray
+    rnd_raw_intrinsic: jnp.ndarray
+    rnd_obs: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
@@ -179,6 +190,90 @@ def _inner_brax_state(state):
 
 def _success_metric(wrapped_state):
     return _inner_brax_state(wrapped_state).metrics["success"]
+
+
+class TrainRenderBuffer(NamedTuple):
+    """Accumulates pipeline states for one training env across updates."""
+
+    frames: Any
+    length: jnp.ndarray
+    completed_frames: Any
+    completed_length: jnp.ndarray
+    has_completed: jnp.ndarray
+    ref_env_index: jnp.ndarray
+
+
+def init_train_render_buffer(
+    env_state, ref_env_index: jnp.ndarray, max_len: int
+) -> TrainRenderBuffer:
+    """Allocate a fixed-length buffer from a template pipeline state."""
+    brax_state = _inner_brax_state(env_state)
+    ref_ps = jax.tree_util.tree_map(
+        lambda x: x[ref_env_index], brax_state.pipeline_state
+    )
+    empty_frames = jax.tree_util.tree_map(
+        lambda x: jnp.zeros((max_len,) + x.shape, dtype=x.dtype), ref_ps
+    )
+    return TrainRenderBuffer(
+        frames=empty_frames,
+        length=jnp.array(0, dtype=jnp.int32),
+        completed_frames=empty_frames,
+        completed_length=jnp.array(0, dtype=jnp.int32),
+        has_completed=jnp.array(False),
+        ref_env_index=jnp.asarray(ref_env_index, dtype=jnp.int32),
+    )
+
+
+def update_train_render_buffer(
+    buf: TrainRenderBuffer,
+    ref_pipeline_state,
+    ref_done: jnp.ndarray,
+    max_len: int,
+    rng,
+    num_envs: int,
+) -> tuple[TrainRenderBuffer, Any]:
+    """Append one frame; on episode done, snapshot and start the next episode."""
+
+    def _write(frames, length, frame):
+        write_idx = jnp.minimum(length, max_len - 1)
+
+        def _set_leaf(buf_leaf, frame_leaf):
+            return buf_leaf.at[write_idx].set(frame_leaf)
+
+        new_frames = jax.tree_util.tree_map(_set_leaf, frames, frame)
+        new_length = jnp.minimum(length + 1, max_len)
+        return new_frames, new_length
+
+    def _on_continue(_):
+        frames, length = _write(buf.frames, buf.length, ref_pipeline_state)
+        new_buf = TrainRenderBuffer(
+            frames=frames,
+            length=length,
+            completed_frames=buf.completed_frames,
+            completed_length=buf.completed_length,
+            has_completed=buf.has_completed,
+            ref_env_index=buf.ref_env_index,
+        )
+        return new_buf, rng
+
+    def _on_done(_):
+        completed_frames = buf.frames
+        completed_length = buf.length
+        rng_next, sample_rng = jax.random.split(rng)
+        new_ref_env_index = jax.random.randint(
+            sample_rng, (), 0, num_envs, dtype=jnp.int32
+        )
+        new_buf = TrainRenderBuffer(
+            frames=jax.tree_util.tree_map(jnp.zeros_like, buf.frames),
+            length=jnp.array(0, dtype=jnp.int32),
+            completed_frames=completed_frames,
+            completed_length=completed_length,
+            has_completed=jnp.array(True),
+            ref_env_index=new_ref_env_index,
+        )
+        return new_buf, rng_next
+
+    return jax.lax.cond(ref_done, _on_done, _on_continue, operand=None)
 
 
 def _normalize_xy(goal, mean, var):
@@ -305,6 +400,11 @@ def make_train(config):
     add_goal_reward = config.get("ADD_GOAL_REWARD", False)
     condition_on_goal = config.get("CONDITION_ON_GOAL", False)
     goal_reach_epsilon = config.get("GOAL_REACH_EPSILON", 0.5)
+    use_rnd = config.get("USE_RND", False)
+    rnd_network = RNDNetwork(
+        hidden_dim=config.get("RND_HIDDEN_DIM", 256),
+        output_dim=config.get("RND_OUTPUT_DIM", 128),
+    )
     if custom_env is not None:
         base_env = custom_env
         base_env_2 = custom_env_2
@@ -428,6 +528,39 @@ def make_train(config):
             for i in range(n)
         ]
 
+    def log_pipeline_html_to_wandb(pipeline_states, step, log_key="render"):
+        """Subsample pipeline states, render HTML, and log to wandb."""
+        if config.get("WANDB_MODE", "disabled") != "online":
+            return
+        try:
+            n = int(jax.tree_util.tree_leaves(pipeline_states)[0].shape[0])
+            if n <= 0:
+                return
+            pipeline_states = _subsample_pipeline_states(
+                pipeline_states, render_max_frames
+            )
+            rollout = _pipeline_states_to_list(jax.device_get(pipeline_states))
+            rendered_html = html.render(
+                base_env.sys.tree_replace({"opt.timestep": base_env.dt}),
+                rollout,
+                height=int(config.get("EVAL_RENDER_HEIGHT", 480)),
+            )
+            exp_dir = config["EXP_DIR"]
+            exp_name = f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+            html_path = os.path.join(
+                exp_dir, f"{exp_name}_{log_key.replace('/', '_')}_{int(step)}.html"
+            )
+            with open(html_path, "w", encoding="utf-8") as file:
+                file.write(rendered_html)
+            if config.get("EVAL_RENDER_LOG_WANDB_HTML", False):
+                wandb.log({log_key: wandb.Html(rendered_html)})
+            else:
+                wandb.save(html_path, base_path=exp_dir, policy="now")
+                wandb.log({f"{log_key}/html_path": html_path})
+        except Exception as err:
+            print(f"[log_pipeline_html_to_wandb] skipped video logging: {err}")
+            traceback.print_exc()
+
     def render_eval_episode(params, rng, final_env_state):
         """Runs one eval rollout and logs rendered HTML to wandb."""
         if config.get("WANDB_MODE", "disabled") != "online":
@@ -435,32 +568,15 @@ def make_train(config):
         try:
             obs_mean, obs_var = _obs_norm_stats_for_render(final_env_state)
             pipeline_states = _run_render_rollout(params, rng, obs_mean, obs_var)
+            num_steps = int(config["TOTAL_TIMESTEPS"])
+            log_pipeline_html_to_wandb(pipeline_states, num_steps, log_key="render")
+
             pipeline_states = _subsample_pipeline_states(
                 pipeline_states, render_max_frames
             )
             rollout = _pipeline_states_to_list(jax.device_get(pipeline_states))
-
-            rendered_html = html.render(
-                base_env.sys.tree_replace({"opt.timestep": base_env.dt}),
-                rollout,
-                height=int(config.get("EVAL_RENDER_HEIGHT", 480)),
-            )
-            exp_dir = wandb.run.dir if wandb.run is not None else os.getcwd()
-            exp_name = (
-                wandb.run.name
-                if wandb.run is not None and wandb.run.name
-                else f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
-            )
-            num_steps = int(config["TOTAL_TIMESTEPS"])
-            html_path = os.path.join(exp_dir, f"{exp_name}_{num_steps}.html")
-            with open(html_path, "w", encoding="utf-8") as file:
-                file.write(rendered_html)
-            if config.get("EVAL_RENDER_LOG_WANDB_HTML", False):
-                wandb.log({"render": wandb.Html(rendered_html)}, step=num_steps)
-            else:
-                wandb.save(html_path, base_path=exp_dir, policy="now")
-                wandb.log({"render/html_path": html_path}, step=num_steps)
-
+            exp_dir = config["EXP_DIR"]
+            exp_name = f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
             log_multi_ant_maze = globals().get("_log_multi_ant_maze_top_gif")
             if callable(log_multi_ant_maze):
                 log_multi_ant_maze(base_env, rollout, exp_dir, exp_name, num_steps)
@@ -490,6 +606,18 @@ def make_train(config):
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
+        )
+
+        obs_dim = int(env.observation_space(env_params).shape[0])
+        rng, rnd_rng = jax.random.split(rng)
+        rnd_state = init_rnd_state(
+            rnd_rng,
+            rnd_network,
+            obs_dim,
+            config["NUM_ENVS"],
+            config.get("RND_LR", 1e-4),
+            max_grad_norm=config["MAX_GRAD_NORM"],
+            dtype=init_x.dtype,
         )
 
         def evaluate_agent_on_env_goal(params, stats_state, rng):
@@ -535,8 +663,8 @@ def make_train(config):
             warmup_env_state = run_policy(network_params, rng)
             obs_mean = warmup_env_state.mean
             obs_var = warmup_env_state.var
-            jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
-            jax.debug.print("obs_var: {obs_var}", obs_var=obs_var[0])
+            # jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
+            # jax.debug.print("obs_var: {obs_var}", obs_var=obs_var[0])
 
         # INIT ENV
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
@@ -544,12 +672,12 @@ def make_train(config):
             obsv, env_state = env.reset_with_stats(
                 reset_rng, warmup_env_state, env_params
             )
-            jax.debug.print(
-                "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
-            )
-            jax.debug.print(
-                "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
-            )
+            # jax.debug.print(
+            #     "post_reset_obs_mean: {obs_mean}", obs_mean=env_state.mean[0]
+            # )
+            # jax.debug.print(
+            #     "post_reset_obs_var: {obs_var}", obs_var=env_state.var[0]
+            # )
         else:
             obsv, env_state = env.reset(reset_rng, env_params)
         
@@ -565,10 +693,38 @@ def make_train(config):
                 goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
             obsv = jnp.concatenate([obsv, goals], axis=-1)
             
+        train_render_freq = int(config.get("TRAIN_RENDER_FREQ", 0))
+        enable_train_render = train_render_freq > 0
+        train_render_max_len = int(config["EPISODE_LENGTH"])
+        if enable_train_render:
+            rng, train_render_rng = jax.random.split(rng)
+            ref_env_index = jax.random.randint(
+                train_render_rng, (), 0, config["NUM_ENVS"], dtype=jnp.int32
+            )
+            train_render_buf = init_train_render_buffer(
+                env_state, ref_env_index, train_render_max_len
+            )
+            ref_ps0 = jax.tree_util.tree_map(
+                lambda x: x[ref_env_index],
+                _inner_brax_state(env_state).pipeline_state,
+            )
+            train_render_buf, rng = update_train_render_buffer(
+                train_render_buf,
+                ref_ps0,
+                jnp.array(False),
+                train_render_max_len,
+                rng,
+                config["NUM_ENVS"],
+            )
+
         # TRAIN LOOP
         def _update_step(runner_state, update_idx):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
+                *body, rng = runner_state
+                if enable_train_render:
+                    train_render_buf = body[-1]
+                    body = body[:-1]
                 (
                     train_state,
                     env_state,
@@ -582,8 +738,8 @@ def make_train(config):
                     reward_count,
                     ep_goal_success,
                     returned_ep_goal_success,
-                    rng,
-                ) = runner_state
+                    rnd_state,
+                ) = body
 
                 # SELECT ACTION
                 rng, goal_rng,  _rng = jax.random.split(rng, 3)
@@ -613,12 +769,28 @@ def make_train(config):
                         )
                     else:
                         dist = jnp.linalg.norm(obsv[..., :2] - raw_goals, axis=-1)
-                    # jax.debug.print("dist_mean: {dist}", dist=dist.mean())
                     goal_reward = (dist <= goal_reach_epsilon).astype(task_reward.dtype)
-                    # jax.debug.print("dist: {dist}", dist=dist)
-                    # jax.debug.print("goals: {goals}", goals=goals)
-                    # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
                     reward = task_reward + goal_reward
+
+                if use_rnd:
+                    rnd_obs = (
+                        env_state.org_obs if config["NORMALIZE_ENV"] else obsv
+                    )
+                    rnd_state, rnd_reward, rnd_raw_intrinsic = rnd_step(
+                        rnd_state,
+                        rnd_network,
+                        rnd_obs,
+                        done,
+                        config["GAMMA"],
+                    )
+                    reward = config["TASK_REWARD_COEF"] * reward + config["RND_COEF"] * rnd_reward
+                else:
+                    rnd_obs = jnp.zeros(
+                        (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
+                    )
+                    rnd_reward = jnp.zeros_like(task_reward)
+                    rnd_raw_intrinsic = jnp.zeros_like(task_reward)
+
                 sampled_raw_goals = jax.vmap(sample_random_goal)(
                     jax.random.split(goal_rng, config["NUM_ENVS"])
                 )
@@ -633,6 +805,20 @@ def make_train(config):
                 goals = normalize_goals(raw_goals, env_state)
                 if condition_on_goal:
                     obsv = jnp.concatenate([obsv, goals], axis=-1)
+                if enable_train_render:
+                    ref_idx = train_render_buf.ref_env_index
+                    ref_ps = jax.tree_util.tree_map(
+                        lambda x: x[ref_idx],
+                        _inner_brax_state(env_state).pipeline_state,
+                    )
+                    train_render_buf, rng = update_train_render_buffer(
+                        train_render_buf,
+                        ref_ps,
+                        done[ref_idx],
+                        train_render_max_len,
+                        rng,
+                        config["NUM_ENVS"],
+                    )
                 transition = Transition(
                     done,
                     action,
@@ -640,6 +826,9 @@ def make_train(config):
                     reward,
                     task_reward,
                     goal_reward,
+                    rnd_reward,
+                    rnd_raw_intrinsic,
+                    rnd_obs,
                     log_prob,
                     last_obs,
                     info,
@@ -658,15 +847,22 @@ def make_train(config):
                     reward_count,
                     ep_goal_success,
                     returned_ep_goal_success,
-                    rng,
+                    rnd_state,
                 )
+                if enable_train_render:
+                    runner_state = runner_state + (train_render_buf, rng)
+                else:
+                    runner_state = runner_state + (rng,)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
-            # CALCULATE ADVANTAGE
+            *body, rng = runner_state
+            if enable_train_render:
+                train_render_buf = body[-1]
+                body = body[:-1]
             (
                 train_state,
                 env_state,
@@ -680,9 +876,20 @@ def make_train(config):
                 reward_count,
                 ep_goal_success,
                 returned_ep_goal_success,
-                rng,
-            ) = runner_state
+                rnd_state,
+            ) = body
             _, last_val = network.apply(train_state.params, last_obs)
+
+            if use_rnd:
+                batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
+                rnd_obs_batch = traj_batch.rnd_obs.reshape(
+                    (batch_size, obs_dim)
+                )
+                rnd_state, rnd_predictor_loss = train_predictor(
+                    rnd_state, rnd_network, rnd_obs_batch
+                )
+            else:
+                rnd_predictor_loss = jnp.array(0.0, dtype=last_val.dtype)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -802,6 +1009,10 @@ def make_train(config):
             task_reward_std = traj_batch.task_reward.std()
             goal_reward_mean = traj_batch.goal_reward.mean()
             goal_reward_std = traj_batch.goal_reward.std()
+            rnd_reward_mean = traj_batch.rnd_reward.mean()
+            rnd_reward_std = traj_batch.rnd_reward.std()
+            rnd_raw_intrinsic_mean = traj_batch.rnd_raw_intrinsic.mean()
+            rnd_rew_running_std = jnp.sqrt(rnd_state.rew_var + 1e-8)
             batch_count = jnp.asarray(
                 traj_batch.task_reward.size, dtype=traj_batch.task_reward.dtype
             )
@@ -889,6 +1100,11 @@ def make_train(config):
                         obs_norm_mean,
                         obs_norm_var,
                         train_goal_success_rate,
+                        rnd_reward_mean,
+                        rnd_reward_std,
+                        rnd_raw_intrinsic_mean,
+                        rnd_rew_running_std,
+                        rnd_predictor_loss,
                     ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
@@ -914,6 +1130,18 @@ def make_train(config):
                             "obs_norm_mean": float(obs_norm_mean),
                             "obs_norm_var": float(obs_norm_var),
                         }
+                        if use_rnd:
+                            log_payload.update(
+                                {
+                                    "rnd_reward_mean": float(rnd_reward_mean),
+                                    "rnd_reward_std": float(rnd_reward_std),
+                                    "rnd_raw_intrinsic_mean": float(
+                                        rnd_raw_intrinsic_mean
+                                    ),
+                                    "rnd_rew_running_std": float(rnd_rew_running_std),
+                                    "rnd_predictor_loss": float(rnd_predictor_loss),
+                                }
+                            )
                         if not jnp.isnan(train_goal_success_rate):
                             log_payload["train/goal_success_rate"] = float(
                                 train_goal_success_rate
@@ -940,6 +1168,11 @@ def make_train(config):
                         obs_norm_mean,
                         obs_norm_var,
                         train_goal_success_rate,
+                        rnd_reward_mean,
+                        rnd_reward_std,
+                        rnd_raw_intrinsic_mean,
+                        rnd_rew_running_std,
+                        rnd_predictor_loss,
                     ),
                 )
 
@@ -950,7 +1183,7 @@ def make_train(config):
                 rng, eval_rng = jax.random.split(rng)
 
                 def _run_eval(_):
-                    jax.debug.print("running env-goal eval")
+                    # jax.debug.print("running env-goal eval")
                     success_rate, episodic_return = evaluate_agent_on_env_goal(
                         train_state.params, env_state, eval_rng
                     )
@@ -988,6 +1221,57 @@ def make_train(config):
                     operand=None,
                 )
 
+            if enable_train_render:
+                should_render = (update_idx) % train_render_freq == 0
+                should_log_train_render = jnp.logical_and(
+                    should_render, train_render_buf.has_completed
+                )
+
+                def _run_train_render(_):
+                    step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
+
+                    def _log_train_render_host(args):
+                        frames, length, st = args
+                        try:
+                            length = int(jax.device_get(length))
+                            if length <= 0:
+                                return 0
+                            frames_np = jax.device_get(frames)
+                            sliced = jax.tree_util.tree_map(
+                                lambda x: jnp.asarray(x[:length]), frames_np
+                            )
+                            log_pipeline_html_to_wandb(
+                                sliced, st, log_key="train/render"
+                            )
+                        except Exception as err:
+                            print(
+                                f"[log_train_render_host] skipped train render: {err}"
+                            )
+                            traceback.print_exc()
+                        return 0
+
+                    jax.debug.callback(
+                        _log_train_render_host,
+                        (
+                            train_render_buf.completed_frames,
+                            train_render_buf.completed_length,
+                            step,
+                        ),
+                    )
+                    return train_render_buf._replace(
+                        has_completed=jnp.array(False)
+                    )
+
+                def _skip_train_render(_):
+                    return train_render_buf
+
+                train_render_buf = jax.lax.cond(
+                    should_log_train_render,
+                    _run_train_render,
+                    _skip_train_render,
+                    operand=None,
+                )
+
             runner_state = (
                 train_state,
                 env_state,
@@ -1001,8 +1285,12 @@ def make_train(config):
                 reward_count,
                 ep_goal_success,
                 returned_ep_goal_success,
-                rng,
+                rnd_state,
             )
+            if enable_train_render:
+                runner_state = runner_state + (train_render_buf, rng)
+            else:
+                runner_state = runner_state + (rng,)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
@@ -1020,8 +1308,12 @@ def make_train(config):
             jnp.array(0.0, dtype=reward_dtype),
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
-            _rng,
+            rnd_state,
         )
+        if enable_train_render:
+            runner_state = runner_state + (train_render_buf, _rng)
+        else:
+            runner_state = runner_state + (_rng,)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
@@ -1039,6 +1331,20 @@ def main():
     gpu_names = sorted({d.device_kind for d in jax.devices("gpu")})
     config["GPU_NAME"] = gpu_names[0]
 
+    scratch = os.environ.get("SCRATCH")
+    random_name = RandomWord().word()
+    random_id = np.random.randint(1000000000)
+    while os.path.exists(
+        os.path.join(scratch, "purejaxrl", f"{random_name}_{random_id}")
+    ):
+        random_name = RandomWord().word()
+        random_id = np.random.randint(1000000000)
+
+    config["EXP_DIR"] = os.path.join(scratch, "purejaxrl", f"{random_name}_{random_id}")
+
+    print(f"Experiment directory: {config['EXP_DIR']}")
+    os.makedirs(config["EXP_DIR"], exist_ok=True)
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -1052,10 +1358,11 @@ def main():
     train_fn, render_eval_episode = make_train(config)
     train_jit = jax.jit(train_fn)
     train_output = train_jit(rng)
-    jax.block_until_ready(train_output["runner_state"][12])
-    final_train_state, final_env_state, _, _, _, _, _, _, _, _, _, _, final_rng = train_output[
-        "runner_state"
-    ]
+    rs = train_output["runner_state"]
+    jax.block_until_ready(rs[-1])
+    final_train_state = rs[0]
+    final_env_state = rs[1]
+    final_rng = rs[-1]
     if config["SAVE_MODEL"]:
         scratch = os.environ.get("SCRATCH")   
         random_name = RandomWord().word()
