@@ -6,6 +6,9 @@ job
 artifacts
 submit_job
 wandb
+agent_positions
+teacher_goal_visuals
+.DS_Store
 ./*/wandb
 *.pyc
 *.pyo
