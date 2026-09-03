@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_emp_subsample_emp_task_rewards_cofficients"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_emp_subsample_emp_emp_rewards_cofficients"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--no-USE_LEARNING_PROGRESS_REWARD"
@@ -23,7 +23,7 @@ GAE_LAMBDA=(0.8)
 CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4)
-NUM_MINIBATCHES=(16)
+NUM_MINIBATCHES=(8)
 NORMALIZE_ENVS=(--NORMALIZE_ENV)
 HIDDEN_DIMS=(256)
 GOAL_REWARD_COEF=(1)
@@ -42,7 +42,8 @@ run_count=0
 EMPOWERMENT_NUM_MINIBATCHES=(8)
 GAMMA_CLS=(0.99)
 EMPOWERMENT_UPDATE_EPOCHSS=(1 2 4)
-TASK_REWARD_COEFSS=(1 2 5)
+TASK_REWARD_COEFSS=(1 5)
+EMP_REWARD_COEFSS=(0.01 0.1 1)
 
 for ENV_NAME in "${ENV_NAMES[@]}"; do
   for TOTAL_TIMESTEPS in "${TOTAL_TIMESTEPS_[@]}"; do
@@ -72,6 +73,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for empowerment_hidden_dim in "${EMPOWERMENT_HIDDEN_DIMS[@]}"; do
                         for empowerment_num_layers in "${EMPOWERMENT_NUM_LAYERSS[@]}"; do
                         for task_reward_coef in "${TASK_REWARD_COEFSS[@]}"; do
+                        for emp_reward_coef in "${EMP_REWARD_COEFSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_emp_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -81,6 +83,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --NUM_MINIBATCHES=${num_minibatches} \
                         --EMPOWERMENT_SUBSAMPLE_SIZE=${empowerment_subsample_size} \
                         --GAMMA_CL=${gamma_cls} \
+                        --EMP_REWARD_COEF=${emp_reward_coef} \
                         --EMPOWERMENT_UPDATE_EPOCHS=${empowerment_update_epochs} \
                         --EMPOWERMENT_HIDDEN_DIM=${empowerment_hidden_dim} \
                         --EMPOWERMENT_NUM_LAYERS=${empowerment_num_layers} \
@@ -116,6 +119,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                   done
                 done
               done
+            done
             done
             done
             done

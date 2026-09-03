@@ -1,16 +1,17 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_more_seeds"
+WANDB_PROJECT_NAME="purejaxrl_continuous_control_with_goals_from_mlp_teacher_lp_reward_use_max_in_lp_reward"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
 TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTSS=(0)
 ENV_NAMES=("ant_u_maze_single_goal")
+USE_MAX_IN_LP_REWARD="--USE_MAX_IN_LP_REWARD"
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 SEEDS=(30 0 8943)
-COMMENT="More_seeds"
+COMMENT="Use_max_in_lp_reward"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
@@ -29,8 +30,9 @@ GOAL_REWARD_COEF=(1)
 TEACHER_ROLLOUT_BUFFER_SIZES=(1)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
 NUM_EVAL_ENVSS=(8)
+TEACHER_ENTROPY_COEFSS=(0.0 0.001)
 TEACHER_NUM_MINIBATCHESS=(8 16)
-TEACHER_UPDATE_EPOCHSS=(2 4)
+TEACHER_UPDATE_EPOCHSS=(2 4 8)
 TASK_REWARD_COEFSS=(1 2 5)
 
 run_count=0
@@ -57,6 +59,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for teacher_num_minibatches in "${TEACHER_NUM_MINIBATCHESS[@]}"; do
                         for teacher_update_epochs in "${TEACHER_UPDATE_EPOCHSS[@]}"; do
                         for task_reward_coef in "${TASK_REWARD_COEFSS[@]}"; do
+                        for teacher_entropy_coef in "${TEACHER_ENTROPY_COEFSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -65,6 +68,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --HIDDEN_DIM=${hidden_dim} \
                         --NUM_MINIBATCHES=${num_minibatches} \
                         ${USE_LEARNING_PROGRESS_REWARD} \
+                        ${USE_MAX_IN_LP_REWARD} \
                         --SEED=${SEED} \
                         ${ADD_GOAL_REWARD} \
                         ${CONDITION_ON_GOAL} \
@@ -74,6 +78,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
                         --TASK_REWARD_COEF=${task_reward_coef} \
+                        --TEACHER_ENT_COEF=${teacher_entropy_coef} \
                         --MAX_GRAD_NORM=${max_grad_norm} \
                         --UPDATE_EPOCHS=${update_epochs} \
                         --TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS=${teacher_softmax_viz_num_snapshots} \
@@ -94,6 +99,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
           done
+        done
         done
         done
         done

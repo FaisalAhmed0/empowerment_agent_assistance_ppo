@@ -102,7 +102,7 @@ class TrainConfig:
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = False
     USE_TEACHER_EMPOWERMENT_REWARD: bool = True
-    TEACHER_EMPOWERMENT_REWARD_COEF: float = 1.0
+    # TEACHER_EMPOWERMENT_REWARD_COEF: float = 1.0
     ABSOLUTE_LEARNING_PROGRESS: bool = False
     TEACHER_ROLLOUT_BUFFER_SIZE: int = 4
     TEACHER_NUM_MINIBATCHES: int = 8
@@ -128,6 +128,7 @@ class TrainConfig:
     EMPOWERMENT_ENERGY_FN: str = "l2"
     EMPOWERMENT_CONTRASTIVE_LOSS: str = "fwd_infonce"
     USE_SEPARATE_FUTURE_STATE_ENCODERS: bool = False
+    EMP_REWARD_COEF: float = 1.0
     # Agent XY logging
     AGENT_POSITIONS_LOG_FREQ: int = 10
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
@@ -135,6 +136,7 @@ class TrainConfig:
     AGENT_POSITIONS_SAVE_DIR: str | None = None
     AGENT_POSITIONS_MAX_POINTS: int = 10000
     AGENT_POSITIONS_ONLY_REF_ENV: bool = False
+
 
 
 def _inner_brax_state(state):
@@ -1555,7 +1557,7 @@ def make_train(config):
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     use_teacher_empowerment_reward = config.get("USE_TEACHER_EMPOWERMENT_REWARD", False)
-    teacher_empowerment_reward_coef = config.get("TEACHER_EMPOWERMENT_REWARD_COEF", 1.0)
+    # teacher_empowerment_reward_coef = config.get("TEACHER_EMPOWERMENT_REWARD_COEF", 1.0)
     update_competence = (
         condition_teacher_on_competence or use_average_competence_reward
     )
@@ -2449,8 +2451,10 @@ def make_train(config):
 
                 # compute the final teacher's reward
                 teacher_reward = ( config["TASK_REWARD_COEF"] * success_part
-                    + teacher_empowerment_reward_coef * teacher_emp_part
+                    + config["EMP_REWARD_COEF"] * teacher_emp_part
                 )
+                # c = config["EMP_REWARD_COEF"]
+                # print(f"EMP_REWARD_COEF: {c}")
                 # update the buffer pointer
                 episode_buf_ptr = jnp.where(
                     done,

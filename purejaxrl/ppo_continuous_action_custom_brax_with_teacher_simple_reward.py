@@ -120,6 +120,7 @@ class TrainConfig:
     AGENT_POSITIONS_SAVE_DIR: str | None = None
     AGENT_POSITIONS_MAX_POINTS: int = 10000
     AGENT_POSITIONS_ONLY_REF_ENV: bool = False
+    USE_MAX_IN_LP_REWARD: bool = False
 
 
 def _inner_brax_state(state):
@@ -257,6 +258,7 @@ def evaluate_multiple_goals(
     normalize_obs=False,
     condition_on_goal=True,
     use_distance_in_competence=False,
+    config=None,
 ):
     """Evaluate success rate for each goal over multiple random starts.
 
@@ -321,7 +323,12 @@ def evaluate_multiple_goals(
                 step_rngs, env_state, action, env_params
             )
             current_xy = env_state.org_obs[..., :2]
-            dist_success = jnp.linalg.norm(current_xy - raw_goal_batch)
+            if config["USE_MAX_IN_LP_REWARD"]:
+                # print
+                dist_success = jnp.linalg.norm(current_xy - raw_goal_batch, axis=-1)
+            else:
+                dist_success = jnp.linalg.norm(current_xy - raw_goal_batch)
+            # import pdb; pdb.set_trace()
             success = (
                 dist_success
                 if use_distance_in_competence
@@ -332,8 +339,11 @@ def evaluate_multiple_goals(
         _, successes = jax.lax.scan(
             step_fn, (obsv, env_state, rng), None, length=max_steps
         )
-
-        return successes.mean(axis=0).mean()
+        if config["USE_MAX_IN_LP_REWARD"]:
+            # print("Using max in LP reward")
+            return successes.max(axis=0).mean()
+        else:
+            return successes.mean(axis=0).mean()
 
     vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
     goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])
@@ -1681,6 +1691,7 @@ def make_train(config):
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
                 use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"],
+                config=config,
             )
 
         def evaluate_teacher_goal_success_rates(student_params, stats_state, goals):
@@ -1696,6 +1707,7 @@ def make_train(config):
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
                 use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"],
+                config=config,
             )
 
         def evaluate_student_on_env_goal(student_params, stats_state, rng):
@@ -1710,6 +1722,7 @@ def make_train(config):
                 warmup_env_state=stats_state,
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
+                config=config,
             )
 
         if config["NORMALIZE_ENV"]:
