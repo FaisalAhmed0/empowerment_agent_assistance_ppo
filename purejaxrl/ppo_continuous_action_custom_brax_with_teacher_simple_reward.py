@@ -60,6 +60,7 @@ class TrainConfig:
     ACTION_REPEAT: int = 1
     ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
     ANNEAL_LR: bool = True
+    USE_OPTAX_LR_SCHEDULE: bool = False
     NORMALIZE_ENV: bool = True
     DEBUG: bool = True
     SEED: int = 30
@@ -114,7 +115,7 @@ class TrainConfig:
     TEACHER_USE_ENCODERS: bool = True
     TEACHER_ACTIVATION: str = "tanh"
     # Agent XY logging
-    AGENT_POSITIONS_LOG_FREQ: int = 500
+    AGENT_POSITIONS_LOG_FREQ: int = 10
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
     AGENT_POSITIONS_INJIT_SUBSAMPLE_EVERY: int = 1
     AGENT_POSITIONS_SAVE_DIR: str | None = None
@@ -324,7 +325,7 @@ def evaluate_multiple_goals(
             )
             current_xy = env_state.org_obs[..., :2]
             if config["USE_MAX_IN_LP_REWARD"]:
-                # print
+                # print("Using max in LP reward")
                 dist_success = jnp.linalg.norm(current_xy - raw_goal_batch, axis=-1)
             else:
                 dist_success = jnp.linalg.norm(current_xy - raw_goal_batch)
@@ -1162,6 +1163,33 @@ def make_train(config):
         frac = jnp.maximum(frac, 0.000000001)
         return config["TEACHER_LR"] * frac
 
+    agent_total_opt_steps = (
+        config["NUM_UPDATES"]
+        * config["NUM_MINIBATCHES"]
+        * config["UPDATE_EPOCHS"]
+    )
+    teacher_total_opt_steps = (
+        teacher_num_updates
+        * teacher_num_minibatches
+        * teacher_update_epochs
+    )
+
+    if config.get("USE_OPTAX_LR_SCHEDULE", False):
+        print("Using optax linear schedule")
+        agent_lr_schedule = optax.linear_schedule(
+            init_value=config["LR"],
+            end_value=0.0,
+            transition_steps=max(int(agent_total_opt_steps), 1),
+        )
+        teacher_lr_schedule = optax.linear_schedule(
+            init_value=config["TEACHER_LR"],
+            end_value=0.0,
+            transition_steps=max(int(teacher_total_opt_steps), 1),
+        )
+    else:
+        agent_lr_schedule = linear_schedule
+        teacher_lr_schedule = teacher_linear_schedule
+
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
     )
@@ -1626,7 +1654,7 @@ def make_train(config):
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                optax.adam(learning_rate=agent_lr_schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
@@ -1645,7 +1673,7 @@ def make_train(config):
         if config["ANNEAL_LR"]:
             teacher_tx = optax.chain(
                 optax.clip_by_global_norm(config["TEACHER_MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=teacher_linear_schedule, eps=1e-5),
+                optax.adam(learning_rate=teacher_lr_schedule, eps=1e-5),
             )
         else:
             teacher_tx = optax.chain(
@@ -1722,7 +1750,6 @@ def make_train(config):
                 warmup_env_state=stats_state,
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
-                config=config,
             )
 
         if config["NORMALIZE_ENV"]:
@@ -2498,7 +2525,7 @@ def make_train(config):
             teacher_did_update = teacher_metrics[4]
             teacher_update_batch_size = teacher_metrics[5]
             teacher_current_lr = (
-                teacher_linear_schedule(
+                teacher_lr_schedule(
                     update_idx
                     * teacher_num_minibatches
                     * teacher_update_epochs
@@ -2540,7 +2567,7 @@ def make_train(config):
             )
             goal_reward_running_std = jnp.sqrt(goal_reward_running_var)
             current_lr = (
-                linear_schedule(
+                agent_lr_schedule(
                     update_idx
                     * config["NUM_MINIBATCHES"]
                     * config["UPDATE_EPOCHS"]
