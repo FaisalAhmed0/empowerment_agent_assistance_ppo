@@ -72,7 +72,7 @@ class TrainConfig:
     EVAL_RENDER_MAX_FRAMES: int = 1000
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
-    TRAIN_RENDER_FREQ: int = 50
+    TRAIN_RENDER_FREQ: int = 200
     EVAL_FREQ: int = 10
     EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
@@ -130,7 +130,7 @@ class TrainConfig:
     USE_SEPARATE_FUTURE_STATE_ENCODERS: bool = False
     EMP_REWARD_COEF: float = 1.0
     # Agent XY logging
-    AGENT_POSITIONS_LOG_FREQ: int = 10
+    AGENT_POSITIONS_LOG_FREQ: int = 100
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
     AGENT_POSITIONS_INJIT_SUBSAMPLE_EVERY: int = 1
     AGENT_POSITIONS_SAVE_DIR: str | None = None

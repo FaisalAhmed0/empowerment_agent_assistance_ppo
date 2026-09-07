@@ -115,7 +115,7 @@ class TrainConfig:
     TEACHER_USE_ENCODERS: bool = True
     TEACHER_ACTIVATION: str = "tanh"
     # Agent XY logging
-    AGENT_POSITIONS_LOG_FREQ: int = 10
+    AGENT_POSITIONS_LOG_FREQ: int = 100
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
     AGENT_POSITIONS_INJIT_SUBSAMPLE_EVERY: int = 1
     AGENT_POSITIONS_SAVE_DIR: str | None = None
