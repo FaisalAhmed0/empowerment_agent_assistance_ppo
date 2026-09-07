@@ -2082,7 +2082,7 @@ def make_train(config):
                     )
 
                 teacher_reward = (
-                    competence_part +  success_part + learning_progress_part
+                    competence_part + config["TASK_REWARD_COEF"] * success_part + learning_progress_part
                 )
                 episode_success = jnp.where(done, 0.0, episode_success)
                 teacher_rollout_buffer = push_teacher_rollout_on_done(
