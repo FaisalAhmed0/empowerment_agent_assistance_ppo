@@ -24,8 +24,9 @@ U_MAZE = [
     [1, 1, 1, 1, 1],
 ]
 
-# Sequential oracle waypoints for U-topology mazes (grid i, j indices).
-U_MAZE_ORACLE_WAYPOINTS = [(1, 3), (3, 3), (3, 1)]
+# Ordered free-cell centers along the U-corridor (grid i, j indices).
+U_MAZE_PATH_CELLS = [(1, 1), (1, 2), (1, 3), (2, 3), (3, 3), (3, 2), (3, 1)]
+ORACLE_PATH_PASS_MARGIN = 2.0
 
 U_MAZE_ALL_STATES = [
     [1, 1, 1, 1, 1],
@@ -376,10 +377,16 @@ class AntMaze(PipelineEnv):
         self.dense_reward = dense_reward
         self.use_oracle_reward = use_oracle_reward
         self._oracle_reward_coef = oracle_reward_coef
-        self._oracle_waypoints = jnp.array(
-            [(i * maze_size_scaling, j * maze_size_scaling) for i, j in U_MAZE_ORACLE_WAYPOINTS]
+        self._oracle_path = jnp.array(
+            [(i * maze_size_scaling, j * maze_size_scaling) for i, j in U_MAZE_PATH_CELLS],
+            dtype=jnp.float32,
         )
-        self.state_dim = 29
+        path_seg_len = jnp.linalg.norm(self._oracle_path[1:] - self._oracle_path[:-1], axis=-1)
+        self._oracle_path_s = jnp.concatenate(
+            [jnp.zeros((1,), dtype=path_seg_len.dtype), jnp.cumsum(path_seg_len)]
+        )
+        self._oracle_pass_margin = ORACLE_PATH_PASS_MARGIN
+        self.state_dim = 31 if use_oracle_reward else 29
         self.goal_indices = jnp.array([0, 1])
         self.goal_reach_thresh = 0.5
 
@@ -427,20 +434,42 @@ class AntMaze(PipelineEnv):
             "dist": zero,
             "success": zero,
             "success_easy": zero,
-            "oracle_stage": zero,
             "oracle_subgoal_dist": zero,
             "oracle_vel_reward": zero,
         }
         state = State(pipeline_state, obs, reward, done, metrics)
         return state
 
-    def _oracle_subgoal_for_stage(self, stage: jax.Array, goal_pos: jax.Array) -> jax.Array:
-        wp0, wp1, wp2 = self._oracle_waypoints[0], self._oracle_waypoints[1], self._oracle_waypoints[2]
-        return jnp.where(
-            stage == 0,
-            wp0,
-            jnp.where(stage == 1, wp1, jnp.where(stage == 2, wp2, goal_pos)),
-        )
+    def _project_to_path(self, pos: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Project `pos` onto the U-corridor polyline.
+
+        Returns ``(nearest_point, arc_length, dist_to_path)``.
+        """
+        starts = self._oracle_path[:-1]
+        ends = self._oracle_path[1:]
+        seg = ends - starts
+        seg_len_sq = jnp.maximum(jnp.sum(seg * seg, axis=-1), 1e-8)
+        t = jnp.clip(jnp.sum((pos - starts) * seg, axis=-1) / seg_len_sq, 0.0, 1.0)
+        proj = starts + t[:, None] * seg
+        dist = jnp.linalg.norm(pos - proj, axis=-1)
+        seg_len = jnp.sqrt(seg_len_sq)
+        s = self._oracle_path_s[:-1] + t * seg_len
+        idx = jnp.argmin(dist)
+        return proj[idx], s[idx], dist[idx]
+
+    def _maze_distance(self, pos: jax.Array, goal: jax.Array) -> jax.Array:
+        _, s_pos, dist_to_path = self._project_to_path(pos)
+        _, s_goal, _ = self._project_to_path(goal)
+        return dist_to_path + jnp.abs(s_pos - s_goal)
+
+    def _oracle_subgoal(self, pos: jax.Array, goal: jax.Array) -> jax.Array:
+        """Next unpassed path cell at or before the goal, else the true goal."""
+        _, s_pos, _ = self._project_to_path(pos)
+        _, s_goal, _ = self._project_to_path(goal)
+        unpassed = s_pos < (self._oracle_path_s - self._oracle_pass_margin)
+        valid = unpassed & (self._oracle_path_s <= s_goal + 1e-3)
+        idx = jnp.argmax(valid)
+        return jnp.where(jnp.any(valid), self._oracle_path[idx], goal)
 
     def step(self, state: State, action: jax.Array) -> State:
         """Run one timestep of the environment's dynamics."""
@@ -473,21 +502,14 @@ class AntMaze(PipelineEnv):
         else:
             reward = success
 
-        oracle_stage = state.metrics["oracle_stage"]
         oracle_subgoal_dist = state.metrics["oracle_subgoal_dist"]
         oracle_vel_reward = state.metrics["oracle_vel_reward"]
         if self.use_oracle_reward:
-            prev_stage = oracle_stage.astype(jnp.int32)
-            current_wp = self._oracle_subgoal_for_stage(prev_stage, obs[-2:])
-            reached = jnp.linalg.norm(obs[:2] - current_wp) < self.goal_reach_thresh
-            oracle_stage = jnp.minimum(prev_stage + reached.astype(jnp.int32), 3).astype(jnp.float32)
-
-            shaping_subgoal = self._oracle_subgoal_for_stage(prev_stage, old_obs[-2:])
-            old_sub_dist = jnp.linalg.norm(old_obs[:2] - shaping_subgoal)
-            new_sub_dist = jnp.linalg.norm(obs[:2] - shaping_subgoal)
-            vel_to_subgoal = (old_sub_dist - new_sub_dist) / self.dt
-            oracle_vel_reward = self._oracle_reward_coef * vel_to_subgoal
-            oracle_subgoal_dist = new_sub_dist
+            goal_pos = obs[-2:]
+            old_maze_dist = self._maze_distance(old_obs[:2], goal_pos)
+            new_maze_dist = self._maze_distance(obs[:2], goal_pos)
+            oracle_vel_reward = self._oracle_reward_coef * (old_maze_dist - new_maze_dist) / self.dt
+            oracle_subgoal_dist = new_maze_dist
             reward = reward + oracle_vel_reward
 
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
@@ -506,7 +528,6 @@ class AntMaze(PipelineEnv):
             dist=dist,
             success=success,
             success_easy=success_easy,
-            oracle_stage=oracle_stage,
             oracle_subgoal_dist=oracle_subgoal_dist,
             oracle_vel_reward=oracle_vel_reward,
         )
@@ -522,7 +543,12 @@ class AntMaze(PipelineEnv):
         if self._exclude_current_positions_from_observation:
             qpos = qpos[2:]
 
-        return jnp.concatenate([qpos] + [qvel] + [target_pos])
+        if self.use_oracle_reward:
+            xy = pipeline_state.q[:2]
+            subgoal = self._oracle_subgoal(xy, target_pos)
+            return jnp.concatenate([qpos, qvel, subgoal, target_pos])
+
+        return jnp.concatenate([qpos, qvel, target_pos])
 
     def _random_target(self, rng: jax.Array) -> jax.Array:
         """Returns a random target location chosen from possibilities specified in the maze layout."""
