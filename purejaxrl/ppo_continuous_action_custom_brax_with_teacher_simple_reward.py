@@ -62,7 +62,7 @@ class TrainConfig:
     ANNEAL_LR: bool = True
     USE_OPTAX_LR_SCHEDULE: bool = False
     NORMALIZE_ENV: bool = True
-    DEBUG: bool = True
+    DEBUG: bool = False
     SEED: int = 30
     WANDB_MODE: str = "online"
     ENTITY: str = ""
