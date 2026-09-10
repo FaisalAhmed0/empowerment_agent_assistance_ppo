@@ -72,7 +72,7 @@ class TrainConfig:
     EVAL_RENDER_HEIGHT: int = 360
     EVAL_RENDER_LOG_WANDB_HTML: bool = True
     TRAIN_RENDER_FREQ: int = 500
-    EVAL_FREQ: int = 10
+    EVAL_FREQ: int = 100
     EVAL_NUM_ENVS: int = 50
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = True
@@ -97,12 +97,14 @@ class TrainConfig:
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = True
     ABSOLUTE_LEARNING_PROGRESS: bool = False
+    USE_RAW_LP_TABLE: bool = False
+    LP_EMA_ALPHA: float = 0.1
     TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS: int = 0  # in-training softmax visuals (evenly spaced); 0 disables
     TEACHER_SOFTMAX_VIZ_LOG_WANDB: bool = True
     TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX: int = 0
     SAVE_AGENT_TRAJECTORY_XY: bool = True
     AGENT_TRAJECTORY_REF_ENV_INDEX: int = 0
-    TEACHER_ROLLOUT_BUFFER_SIZE: int = 4
+    TEACHER_ROLLOUT_BUFFER_SIZE: int = 1
     TEACHER_NUM_MINIBATCHES: int = 8
     TEACHER_UPDATE_EPOCHS: int = 4
     TEACHER_LR: float = 3e-4
@@ -474,6 +476,24 @@ def _scatter_goal_learning_progress(cache, goal_idx, lp_values, done):
         cache[goal_idx],
     )
     return cache.at[goal_idx].set(updated)
+
+
+def _update_goal_competence_table(
+    table, goal_idx, success, done, *, use_raw, ema_alpha
+):
+    """Update per-goal competence from training-episode success.
+
+    Returns ``(new_table, lp)`` where ``lp = C_new - C_old`` for every env.
+    Non-done envs do not change the table (masked scatter-add).
+    """
+    c_old = table[goal_idx]
+    if use_raw:
+        c_new = success
+    else:
+        c_new = (1.0 - ema_alpha) * c_old + ema_alpha * success
+    delta = jnp.where(done, c_new - c_old, jnp.zeros_like(c_new))
+    new_table = table.at[goal_idx].add(delta)
+    return new_table, c_new - c_old
 
 
 def plot_teacher_goal_grid_heatmap(
@@ -1722,22 +1742,6 @@ def make_train(config):
                 config=config,
             )
 
-        def evaluate_teacher_goal_success_rates(student_params, stats_state, goals):
-            return evaluate_multiple_goals(
-                env_2,
-                custom_env_2,
-                network,
-                student_params,
-                goals,
-                config["NUM_EVAL_ENVS"],
-                max_steps=config.get("EPISODE_LENGTH", 1000),
-                warmup_env_state=stats_state,
-                normalize_obs=config["NORMALIZE_ENV"],
-                condition_on_goal=condition_on_goal,
-                use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"],
-                config=config,
-            )
-
         def evaluate_student_on_env_goal(student_params, stats_state, rng):
             return evaluate_student_env_goal(
                 env_2,
@@ -1818,14 +1822,12 @@ def make_train(config):
                 goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
             obsv = jnp.concatenate([obsv, goals], axis=-1)
 
-        if use_learning_progress_reward:
-            episode_goal_success_start = evaluate_teacher_goal_success_rates(
-                train_state.params, env_state, raw_goals
-            )
-        else:
-            episode_goal_success_start = jnp.zeros(
-                (config["NUM_ENVS"],), dtype=obsv.dtype
-            )
+        goal_competence_table = jnp.zeros(
+            (num_teacher_goals,), dtype=obsv.dtype
+        )
+        episode_teacher_goal_success = jnp.zeros(
+            (config["NUM_ENVS"],), dtype=obsv.dtype
+        )
         episode_step_count = jnp.zeros((config["NUM_ENVS"],), dtype=obsv.dtype)
         goal_learning_progress_cache = jnp.zeros(
             (num_teacher_goals,), dtype=obsv.dtype
@@ -1974,7 +1976,8 @@ def make_train(config):
                     goal_reward_sq_sum,
                     reward_count,
                     episode_success,
-                    episode_goal_success_start,
+                    goal_competence_table,
+                    episode_teacher_goal_success,
                     episode_step_count,
                     episode_initial_base_obs,
                     goal_learning_progress_cache,
@@ -2006,15 +2009,20 @@ def make_train(config):
                 # jax.debug.print("done: {done}", done=done)
                 task_reward = reward
                 goal_reward = jnp.zeros_like(task_reward)
-                if add_goal_reward:
+                teacher_goal_reach = jnp.zeros_like(task_reward)
+                if add_goal_reward or use_learning_progress_reward:
                     if config["NORMALIZE_ENV"]:
                         dist = jnp.linalg.norm(
                             env_state.org_obs[..., :2] - raw_goals, axis=-1
                         )
                     else:
                         dist = jnp.linalg.norm(obsv[..., :2] - raw_goals, axis=-1)
+                    teacher_goal_reach = (
+                        dist <= goal_reach_epsilon
+                    ).astype(task_reward.dtype)
+                if add_goal_reward:
+                    goal_reward = teacher_goal_reach
                     # jax.debug.print("dist_mean: {dist}", dist=dist.mean())
-                    goal_reward = (dist <= goal_reach_epsilon).astype(task_reward.dtype)
                     # jax.debug.print("dist: {dist}", dist=dist)
                     # jax.debug.print("goals: {goals}", goals=goals)
                     # jax.debug.print("goal_reward_mean: {goal_reward}", goal_reward=goal_reward.mean())
@@ -2046,45 +2054,40 @@ def make_train(config):
 
                 learning_progress_part = jnp.zeros_like(task_reward)
                 if use_learning_progress_reward:
-
-                    def _compute_and_cache_learning_progress(_):
-                        end_rates = evaluate_teacher_goal_success_rates(
-                            train_state.params,
-                            env_state,
-                            teacher_episode_carry.raw_goal,
-                        )
-                        learning_progress = (
-                            end_rates - episode_goal_success_start
-                        )
-                        if config["ABSOLUTE_LEARNING_PROGRESS"]:
-                            learning_progress = jnp.abs(learning_progress)
-                        new_cache = _scatter_goal_learning_progress(
-                            goal_learning_progress_cache,
+                    episode_teacher_goal_success = jnp.maximum(
+                        episode_teacher_goal_success, teacher_goal_reach
+                    )
+                    # jax.debug.print("goal_index: {goal_index}", goal_index=teacher_episode_carry.goal_idx)
+                    goal_competence_table, learning_progress = (
+                        _update_goal_competence_table(
+                            goal_competence_table,
                             teacher_episode_carry.goal_idx,
-                            learning_progress,
+                            episode_teacher_goal_success,
                             done,
+                            use_raw=config["USE_RAW_LP_TABLE"],
+                            ema_alpha=float(config["LP_EMA_ALPHA"]),
                         )
-                        return (
-                            jnp.where(done, learning_progress, 0.0),
-                            new_cache,
-                        )
-
-                    learning_progress_part, goal_learning_progress_cache = (
-                        jax.lax.cond(
-                            jnp.any(done),
-                            _compute_and_cache_learning_progress,
-                            lambda _: (
-                                learning_progress_part,
-                                goal_learning_progress_cache,
-                            ),
-                            operand=None,
-                        )
+                    )
+                    if config["ABSOLUTE_LEARNING_PROGRESS"]:
+                        learning_progress = jnp.abs(learning_progress)
+                    goal_learning_progress_cache = _scatter_goal_learning_progress(
+                        goal_learning_progress_cache,
+                        teacher_episode_carry.goal_idx,
+                        learning_progress,
+                        done,
+                    )
+                    learning_progress_part = jnp.where(
+                        done, learning_progress, 0.0
                     )
 
                 teacher_reward = (
                     competence_part + config["TASK_REWARD_COEF"] * success_part + learning_progress_part
                 )
                 episode_success = jnp.where(done, 0.0, episode_success)
+                if use_learning_progress_reward:
+                    episode_teacher_goal_success = jnp.where(
+                        done, 0.0, episode_teacher_goal_success
+                    )
                 teacher_rollout_buffer = push_teacher_rollout_on_done(
                     teacher_rollout_buffer,
                     teacher_episode_carry,
@@ -2121,22 +2124,6 @@ def make_train(config):
                     jnp.ones_like(goal_idx, dtype=jnp.int32)
                 )
                 raw_goals = jnp.where(done[:, None], new_raw_goals, raw_goals)
-                if use_learning_progress_reward:
-
-                    def _update_episode_start_rates(_):
-                        new_start_rates = evaluate_teacher_goal_success_rates(
-                            train_state.params, env_state, new_raw_goals
-                        )
-                        return jnp.where(
-                            done, new_start_rates, episode_goal_success_start
-                        )
-
-                    episode_goal_success_start = jax.lax.cond(
-                        jnp.any(done),
-                        _update_episode_start_rates,
-                        lambda _: episode_goal_success_start,
-                        operand=None,
-                    )
                 episode_step_count = jnp.where(done, 0.0, episode_step_count)
                 # jax.debug.print("done: {done}", done=jnp.any(done))
                 # jax.lax.cond(
@@ -2199,7 +2186,8 @@ def make_train(config):
                     goal_reward_sq_sum,
                     reward_count,
                     episode_success,
-                    episode_goal_success_start,
+                    goal_competence_table,
+                    episode_teacher_goal_success,
                     episode_step_count,
                     episode_initial_base_obs,
                     goal_learning_progress_cache,
@@ -2250,7 +2238,8 @@ def make_train(config):
                 goal_reward_sq_sum,
                 reward_count,
                 episode_success,
-                episode_goal_success_start,
+                goal_competence_table,
+                episode_teacher_goal_success,
                 episode_step_count,
                 episode_initial_base_obs,
                 goal_learning_progress_cache,
@@ -3023,7 +3012,8 @@ def make_train(config):
                 goal_reward_sq_sum,
                 reward_count,
                 episode_success,
-                episode_goal_success_start,
+                goal_competence_table,
+                episode_teacher_goal_success,
                 episode_step_count,
                 episode_initial_base_obs,
                 goal_learning_progress_cache,
@@ -3055,7 +3045,8 @@ def make_train(config):
             jnp.array(0.0, dtype=reward_dtype),
             jnp.array(0.0, dtype=reward_dtype),
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
-            episode_goal_success_start,
+            goal_competence_table,
+            episode_teacher_goal_success,
             episode_step_count,
             episode_initial_base_obs,
             goal_learning_progress_cache,
@@ -3146,11 +3137,10 @@ def main():
         _,
         _,
         _,
+        _,
         final_episode_initial_base_obs,
         final_goal_learning_progress_cache,
-        _,
-        _,
-        final_rng,
+        *_,
     ) = train_output["runner_state"]
     teacher_params = train_output["teacher_params"]
     exp_dir = config["EXP_DIR"]

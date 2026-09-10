@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr"
+WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_2"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
@@ -12,16 +12,16 @@ TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 TEACHER_LRS=(0.0003 0.00003)
 SEEDS=(30 0 8943)
-COMMENT="granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr"
+COMMENT="granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(256)
 NUM_STEPS_=(64)
-STUDENT_ENTROPY_COFFS=(0.0 0.1 0.01 0.001)
+STUDENT_ENTROPY_COFFS=(0.0 0.001)
 GAE_LAMBDA=(0.8)
 CLIP_EPSS=(0.2) 
-TEACHER_CLIP_EPSS=(0.1 0.2 0.3)
+TEACHER_CLIP_EPSS=(0.1 0.2)
 MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(8)
@@ -36,13 +36,13 @@ TEACHER_ENTROPY_COEFSS=(0.0 0.1 0.01 0.001)
 TEACHER_NUM_MINIBATCHESS=(8)
 TEACHER_UPDATE_EPOCHSS=(8)
 TASK_REWARD_COEFSS=(1 2 5)
+LP_EMA_ALPHAS=(0.1 0.9 1.0)
 
 run_count=0
 
 for ENV_NAME in "${ENV_NAMES[@]}"; do
   for TOTAL_TIMESTEPS in "${TOTAL_TIMESTEPS_[@]}"; do
     for LR in "${LRS[@]}"; do
-                    for SEED in "${SEEDS[@]}"; do
                         for num_steps in "${NUM_STEPS_[@]}"; do
                         for student_entropy_coef in "${STUDENT_ENTROPY_COFFS[@]}"; do
                         for num_envs in "${NUM_ENVSS[@]}"; do
@@ -64,6 +64,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for teacher_entropy_coef in "${TEACHER_ENTROPY_COEFSS[@]}"; do
                         for teacher_clip_eps in "${TEACHER_CLIP_EPSS[@]}"; do
                         for teacher_lr in "${TEACHER_LRS[@]}"; do
+                        for lp_ema_alpha in "${LP_EMA_ALPHAS[@]}"; do
+                        for SEED in "${SEEDS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -77,6 +79,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${ADD_GOAL_REWARD} \
                         ${CONDITION_ON_GOAL} \
                         --NUM_STEPS=${num_steps} \
+                        --LP_EMA_ALPHA=${lp_ema_alpha} \
                         --GAE_LAMBDA=${gae_lambda} \
                         --TEACHER_ROLLOUT_BUFFER_SIZE=${teacher_rollout_buffer_size} \
                         --TEACHER_CLIP_EPS=${teacher_clip_eps} \
@@ -105,6 +108,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
               done
             done
           done
+        done
         done
         done
         done

@@ -138,7 +138,12 @@ Teacher reward at episode end is composed of:
 
 **Script:** `[purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py](purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py)`
 
-At episode end, the teacher receives **learning progress** reward: the change in per-goal success rate since the episode started (`end_rates - episode_goal_success_start`). Set `ABSOLUTE_LEARNING_PROGRESS` to take the absolute value.
+At episode end, the teacher receives **learning progress** reward from a per-goal competence table `C[g]` over the discrete teacher grid. Competence is the training episode’s teacher-goal reach (`dist <= GOAL_REACH_EPSILON`, max over the episode). On a finished episode with goal `g`:
+
+- default (EMA): `C[g] ← (1 - LP_EMA_ALPHA) * C[g] + LP_EMA_ALPHA * success`, then `LP = C_new - C_old`
+- `USE_RAW_LP_TABLE`: `C[g] ← success`, then `LP = C_new - C_old`
+
+Unplayed goals keep their last `C[g]`. Set `ABSOLUTE_LEARNING_PROGRESS` to take the absolute value.
 
 ### Reward-Specific Defaults
 
@@ -148,6 +153,8 @@ At episode end, the teacher receives **learning progress** reward: the change in
 | `USE_LEARNING_PROGRESS_REWARD`      | `True`  | Enable LP teacher reward                                      |
 | `TASK_REWARD_COEF`                  | `1.0`   | Scales Brax task reward for student (**only in this script**) |
 | `ABSOLUTE_LEARNING_PROGRESS`        | `False` | Use absolute LP values                                        |
+| `USE_RAW_LP_TABLE`                  | `False` | If true, `C[g]` is last success instead of EMA                |
+| `LP_EMA_ALPHA`                      | `0.1`   | EMA rate for `C[g]` (ignored when `USE_RAW_LP_TABLE`)         |
 | `NUM_EVAL_ENVS`                     | `4`     | Envs used for competence evaluation                           |
 | `TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTS` | `0`     | In-training teacher softmax visuals (0 = disabled)            |
 
