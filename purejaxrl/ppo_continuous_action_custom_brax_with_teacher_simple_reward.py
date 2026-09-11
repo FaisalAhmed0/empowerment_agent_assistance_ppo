@@ -85,6 +85,9 @@ class TrainConfig:
     TEACHER_NUM_GOAL_POINTS: int = 30
     TEACHER_GOAL_COUNT_VIZ_LOG_WANDB: bool = True
     TEACHER_GOAL_COUNT_VIZ_FREQ: int = 500
+    TEACHER_LP_VIZ_LOG_WANDB: bool = True
+    TEACHER_LP_VIZ_FREQ: int = 500
+    TEACHER_HEATMAP_CMAP: str = "jet"
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
@@ -483,17 +486,32 @@ def _update_goal_competence_table(
 ):
     """Update per-goal competence from training-episode success.
 
-    Returns ``(new_table, lp)`` where ``lp = C_new - C_old`` for every env.
-    Non-done envs do not change the table (masked scatter-add).
+    Aggregates success by unique ``goal_idx`` (mean over done envs), then
+    applies one EMA/raw update per goal. Returns ``(new_table, lp)`` where
+    ``lp = C_new[g] - C_old[g]`` is looked up per env. Non-done envs do not
+    contribute to the mean or change the table.
     """
-    c_old = table[goal_idx]
+    num_goals = table.shape[0]
+    done_f = done.astype(success.dtype)
+    success_sum = jnp.zeros(num_goals, dtype=success.dtype).at[goal_idx].add(
+        success * done_f
+    )
+    count = jnp.zeros(num_goals, dtype=success.dtype).at[goal_idx].add(done_f)
+    has_update = count > 0
+    mean_success = jnp.where(
+        has_update, success_sum / jnp.maximum(count, 1.0), table
+    )
+    # jax.debug.print("mean_success: {x}", x=mean_success)
     if use_raw:
-        c_new = success
+        c_new = jnp.where(has_update, mean_success, table)
     else:
-        c_new = (1.0 - ema_alpha) * c_old + ema_alpha * success
-    delta = jnp.where(done, c_new - c_old, jnp.zeros_like(c_new))
-    new_table = table.at[goal_idx].add(delta)
-    return new_table, c_new - c_old
+        c_new = jnp.where(
+            has_update,
+            (1.0 - ema_alpha) * table + ema_alpha * mean_success,
+            table,
+        )
+    lp_per_goal = c_new - table
+    return c_new, lp_per_goal[goal_idx]
 
 
 def plot_teacher_goal_grid_heatmap(
@@ -502,7 +520,7 @@ def plot_teacher_goal_grid_heatmap(
     num_points,
     *,
     colorbar_label="Value",
-    cmap="viridis",
+    cmap="jet",
     vmin=None,
     vmax=None,
     start_xy=None,
@@ -556,7 +574,14 @@ def plot_teacher_goal_grid_heatmap(
 
 
 def plot_teacher_softmax(
-    goal_grid_xy, probs, num_points, *, start_xy=None, title=None, save_path=None
+    goal_grid_xy,
+    probs,
+    num_points,
+    *,
+    start_xy=None,
+    title=None,
+    save_path=None,
+    cmap="jet",
 ):
     """Heatmap of the teacher's categorical distribution over its goal grid."""
     return plot_teacher_goal_grid_heatmap(
@@ -564,7 +589,7 @@ def plot_teacher_softmax(
         probs,
         num_points,
         colorbar_label="P(goal)",
-        cmap="viridis",
+        cmap=cmap,
         start_xy=start_xy,
         title=title,
         save_path=save_path,
@@ -572,7 +597,14 @@ def plot_teacher_softmax(
 
 
 def plot_teacher_learning_progress_heatmap(
-    goal_grid_xy, values, num_points, *, start_xy=None, title=None, save_path=None
+    goal_grid_xy,
+    values,
+    num_points,
+    *,
+    start_xy=None,
+    title=None,
+    save_path=None,
+    cmap="jet",
 ):
     """Heatmap of cached learning-progress reward per teacher goal."""
     values = np.asarray(values).reshape(-1)
@@ -584,7 +616,7 @@ def plot_teacher_learning_progress_heatmap(
         values,
         num_points,
         colorbar_label="Learning progress reward",
-        cmap="RdBu_r",
+        cmap=cmap,
         vmin=vmin,
         vmax=vmax,
         start_xy=start_xy,
@@ -1536,6 +1568,7 @@ def make_train(config):
             save_path = os.path.join(
                 viz_dir, f"{exp_name}_teacher_softmax_{step}.png"
             )
+            heatmap_cmap = config.get("TEACHER_HEATMAP_CMAP", "jet")
             fig, _ = plot_teacher_softmax(
                 goal_grid_xy,
                 probs,
@@ -1543,6 +1576,7 @@ def make_train(config):
                 start_xy=start_xy,
                 title=f'Teacher softmax @ step {step} ({config["ENV_NAME"]})',
                 save_path=save_path,
+                cmap=heatmap_cmap,
             )
             bar_save_path = os.path.join(
                 viz_dir, f"{exp_name}_teacher_softmax_bar_{step}.png"
@@ -1579,6 +1613,7 @@ def make_train(config):
                         f'({config["ENV_NAME"]})'
                     ),
                     save_path=lp_save_path,
+                    cmap=heatmap_cmap,
                 )
             if (
                 teacher_softmax_viz_log_wandb
@@ -1867,6 +1902,7 @@ def make_train(config):
             start_xy=None,
             title=None,
             save_path=None,
+            cmap="jet",
         ):
             """Heatmap of normalized teacher goal selection frequency in [0, 1]."""
             import matplotlib
@@ -1889,7 +1925,7 @@ def make_train(config):
                 gy,
                 normalized_grid,
                 shading="nearest",
-                cmap="Blues",
+                cmap=cmap,
                 vmin=0.0,
                 vmax=1.0,
             )
@@ -1943,6 +1979,7 @@ def make_train(config):
                         f"({config['ENV_NAME']})"
                     ),
                     save_path=save_path,
+                    cmap=config.get("TEACHER_HEATMAP_CMAP", "jet"),
                 )
                 wandb.log(
                     {"teacher/goal_selection_counts": wandb.Image(fig)},
@@ -1951,6 +1988,46 @@ def make_train(config):
             except Exception as err:
                 print(
                     f"[log_teacher_goal_selection_count_grid] skipped count-grid visual: {err}"
+                )
+                traceback.print_exc()
+
+        def log_teacher_learning_progress_grid(lp_cache, step):
+            """Log learning-progress heatmap over the teacher goal grid."""
+            try:
+                if config.get("WANDB_MODE", "disabled") != "online":
+                    return
+                if not use_learning_progress_reward:
+                    return
+                import matplotlib.pyplot as plt
+
+                lp_values = np.asarray(jax.device_get(lp_cache)).reshape(-1)
+                goal_grid_xy = np.asarray(jax.device_get(goal_grid))
+                exp_dir = config["EXP_DIR"]
+                exp_name = f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+                save_path = os.path.join(
+                    exp_dir,
+                    "teacher_goal_visuals",
+                    f"{exp_name}_teacher_learning_progress_{int(step)}.png",
+                )
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                fig, _ = plot_teacher_learning_progress_heatmap(
+                    goal_grid_xy,
+                    lp_values,
+                    teacher_num_goal_points,
+                    title=(
+                        f"Learning progress reward @ step {int(step)} "
+                        f"({config['ENV_NAME']})"
+                    ),
+                    save_path=save_path,
+                    cmap=config.get("TEACHER_HEATMAP_CMAP", "jet"),
+                )
+                wandb.log(
+                    {"teacher/learning_progress_heatmap": wandb.Image(fig)},
+                )
+                plt.close(fig)
+            except Exception as err:
+                print(
+                    f"[log_teacher_learning_progress_grid] skipped LP-grid visual: {err}"
                 )
                 traceback.print_exc()
 
@@ -2081,7 +2158,7 @@ def make_train(config):
                     )
 
                 teacher_reward = (
-                    competence_part + config["TASK_REWARD_COEF"] * success_part + learning_progress_part
+                    config["TASK_REWARD_COEF"] * success_part + learning_progress_part
                 )
                 episode_success = jnp.where(done, 0.0, episode_success)
                 if use_learning_progress_reward:
@@ -2859,6 +2936,33 @@ def make_train(config):
                         should_log_goal_count_viz,
                         _run_goal_count_viz,
                         _skip_goal_count_viz,
+                        operand=None,
+                    )
+
+            if (
+                use_learning_progress_reward
+                and config.get("TEACHER_LP_VIZ_LOG_WANDB", True)
+            ):
+                lp_viz_freq = int(config.get("TEACHER_LP_VIZ_FREQ", 0))
+                if lp_viz_freq > 0:
+                    should_log_lp_viz = (update_idx) % lp_viz_freq == 0
+
+                    def _run_lp_viz(_):
+                        step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        jax.debug.callback(
+                            log_teacher_learning_progress_grid,
+                            goal_learning_progress_cache,
+                            step,
+                        )
+                        return jnp.array(0, dtype=jnp.int32)
+
+                    def _skip_lp_viz(_):
+                        return jnp.array(0, dtype=jnp.int32)
+
+                    jax.lax.cond(
+                        should_log_lp_viz,
+                        _run_lp_viz,
+                        _skip_lp_viz,
                         operand=None,
                     )
 

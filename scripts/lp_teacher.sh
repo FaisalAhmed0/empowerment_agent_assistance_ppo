@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_2"
+WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_5"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
@@ -11,14 +11,14 @@ USE_MAX_IN_LP_REWARD="--USE_MAX_IN_LP_REWARD"
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 TEACHER_LRS=(0.0003 0.00003)
-SEEDS=(30 0 8943)
+SEEDS=(30)
 COMMENT="granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(256)
 NUM_STEPS_=(64)
-STUDENT_ENTROPY_COFFS=(0.0 0.001)
+STUDENT_ENTROPY_COFFS=(0.0)
 GAE_LAMBDA=(0.8)
 CLIP_EPSS=(0.2) 
 TEACHER_CLIP_EPSS=(0.1 0.2)
@@ -32,11 +32,11 @@ GOAL_REWARD_COEF=(1)
 TEACHER_ROLLOUT_BUFFER_SIZES=(1)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
 NUM_EVAL_ENVSS=(8)
-TEACHER_ENTROPY_COEFSS=(0.0 0.1 0.01 0.001)
+TEACHER_ENTROPY_COEFSS=(0.0 0.001 0.0001)
 TEACHER_NUM_MINIBATCHESS=(8)
-TEACHER_UPDATE_EPOCHSS=(8)
-TASK_REWARD_COEFSS=(1 2 5)
-LP_EMA_ALPHAS=(0.1 0.9 1.0)
+TEACHER_UPDATE_EPOCHSS=(4 8)
+TASK_REWARD_COEFSS=(1 2 5 10)
+LP_EMA_ALPHAS=(0.8 0.9 0.999 1)
 
 run_count=0
 
