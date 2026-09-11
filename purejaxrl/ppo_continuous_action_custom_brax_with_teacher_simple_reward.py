@@ -87,7 +87,7 @@ class TrainConfig:
     TEACHER_GOAL_COUNT_VIZ_FREQ: int = 500
     TEACHER_LP_VIZ_LOG_WANDB: bool = True
     TEACHER_LP_VIZ_FREQ: int = 500
-    TEACHER_HEATMAP_CMAP: str = "jet"
+    TEACHER_HEATMAP_CMAP: str = "Blues"
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
@@ -606,19 +606,24 @@ def plot_teacher_learning_progress_heatmap(
     save_path=None,
     cmap="jet",
 ):
-    """Heatmap of cached learning-progress reward per teacher goal."""
-    values = np.asarray(values).reshape(-1)
+    """Heatmap of cached learning-progress reward per teacher goal.
+
+    Values are normalized by max abs so the color scale is fixed in [-1, 1].
+    """
+    values = np.asarray(values).reshape(-1).astype(np.float32)
     abs_max = float(np.max(np.abs(values))) if values.size else 0.0
-    vmin = -abs_max if abs_max > 0.0 else None
-    vmax = abs_max if abs_max > 0.0 else None
+    if abs_max > 0.0:
+        values = values / abs_max
+    else:
+        values = np.zeros_like(values)
     return plot_teacher_goal_grid_heatmap(
         goal_grid_xy,
         values,
         num_points,
-        colorbar_label="Learning progress reward",
+        colorbar_label="Normalized learning progress",
         cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
+        vmin=-1.0,
+        vmax=1.0,
         start_xy=start_xy,
         title=title,
         save_path=save_path,
