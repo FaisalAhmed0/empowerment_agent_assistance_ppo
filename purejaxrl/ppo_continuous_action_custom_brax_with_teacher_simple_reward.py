@@ -1999,8 +1999,6 @@ def make_train(config):
         def log_teacher_learning_progress_grid(lp_cache, step):
             """Log learning-progress heatmap over the teacher goal grid."""
             try:
-                if config.get("WANDB_MODE", "disabled") != "online":
-                    return
                 if not use_learning_progress_reward:
                     return
                 import matplotlib.pyplot as plt
@@ -2009,12 +2007,12 @@ def make_train(config):
                 goal_grid_xy = np.asarray(jax.device_get(goal_grid))
                 exp_dir = config["EXP_DIR"]
                 exp_name = f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+                viz_dir = os.path.join(exp_dir, "lp_reward_visual")
+                os.makedirs(viz_dir, exist_ok=True)
                 save_path = os.path.join(
-                    exp_dir,
-                    "teacher_goal_visuals",
+                    viz_dir,
                     f"{exp_name}_teacher_learning_progress_{int(step)}.png",
                 )
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 fig, _ = plot_teacher_learning_progress_heatmap(
                     goal_grid_xy,
                     lp_values,
@@ -2026,9 +2024,10 @@ def make_train(config):
                     save_path=save_path,
                     cmap=config.get("TEACHER_HEATMAP_CMAP", "jet"),
                 )
-                wandb.log(
-                    {"teacher/learning_progress_heatmap": wandb.Image(fig)},
-                )
+                if config.get("WANDB_MODE", "disabled") == "online":
+                    wandb.log(
+                        {"teacher/learning_progress_heatmap": wandb.Image(fig)},
+                    )
                 plt.close(fig)
             except Exception as err:
                 print(
