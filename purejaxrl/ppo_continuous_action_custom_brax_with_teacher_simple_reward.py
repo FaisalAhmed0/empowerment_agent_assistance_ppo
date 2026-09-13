@@ -288,7 +288,8 @@ def evaluate_multiple_goals(
     norm_var = eval_stats.var if eval_stats is not None else None
 
     def eval_one_goal(rng, specific_goal):
-        reset_rngs = jax.random.split(rng, num_envs_per_goal)
+        rng, reset_rng = jax.random.split(rng)
+        reset_rngs = jax.random.split(reset_rng, num_envs_per_goal)
         if eval_stats is not None:
             obsv, env_state = env.reset_with_stats(
                 reset_rngs, eval_stats, env_params
@@ -384,7 +385,8 @@ def evaluate_student_env_goal(
     norm_mean = eval_stats.mean if eval_stats is not None else None
     norm_var = eval_stats.var if eval_stats is not None else None
 
-    reset_rngs = jax.random.split(rng, num_envs)
+    rng, reset_rng = jax.random.split(rng)
+    reset_rngs = jax.random.split(reset_rng, num_envs)
     if eval_stats is not None:
         obsv, env_state = env.reset_with_stats(reset_rngs, eval_stats, env_params)
     else:
@@ -1401,17 +1403,17 @@ def make_train(config):
         raw_goal = jnp.zeros((2,), dtype=jnp.float32)
         policy_goal = jnp.zeros((2,), dtype=jnp.float32)
         if condition_on_goal:
-            rng, goal_rng = jax.random.split(rng)
+            rng, action_rng, teacher_rng = jax.random.split(rng, 3)
             norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
             bootstrap_action = _sample_render_action(
-                params, state.obs, obs_mean, obs_var, policy_goal, goal_rng
+                params, state.obs, obs_mean, obs_var, policy_goal, action_rng
             )
             raw_goal = _sample_teacher_goals(
                 teacher_params,
                 norm_obs,
                 competence_vector,
                 bootstrap_action,
-                goal_rng,
+                teacher_rng,
             )
             if raw_goal.ndim > 1:
                 raw_goal = raw_goal[0]
@@ -1419,7 +1421,7 @@ def make_train(config):
 
         def step_fn(carry, _):
             state, raw_goal, policy_goal, rng = carry
-            rng, action_rng, goal_rng = jax.random.split(rng, 3)
+            rng, action_rng, bootstrap_rng, goal_rng = jax.random.split(rng, 4)
             if condition_on_goal:
                 action = _sample_render_action(
                     params, state.obs, obs_mean, obs_var, policy_goal, action_rng
@@ -1444,7 +1446,7 @@ def make_train(config):
                     obs_mean,
                     obs_var,
                     bootstrap_goal,
-                    action_rng,
+                    bootstrap_rng,
                 )
                 new_raw_goal = _sample_teacher_goals(
                     teacher_params,
@@ -1821,7 +1823,8 @@ def make_train(config):
                     step_fn, (obsv, env_state, rng), None, length=5000
                 )
                 return env_state
-            warmup_env_state = run_policy(network_params, rng)
+            rng, warmup_rng = jax.random.split(rng)
+            warmup_env_state = run_policy(network_params, warmup_rng)
             obs_mean = warmup_env_state.mean
             obs_var = warmup_env_state.var
             # jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
@@ -1845,9 +1848,10 @@ def make_train(config):
                 axis=-1,
             )
         bootstrap_pi, _ = network.apply(train_state.params, bootstrap_policy_obs)
-        bootstrap_action = bootstrap_pi.sample(seed=goal_rng)
+        bootstrap_rng, teacher_rng = jax.random.split(goal_rng)
+        bootstrap_action = bootstrap_pi.sample(seed=bootstrap_rng)
         raw_goals, teacher_episode_carry = teacher_act_and_carry(
-            obsv[..., :base_obs_dim], competence_vector, bootstrap_action, goal_rng
+            obsv[..., :base_obs_dim], competence_vector, bootstrap_action, teacher_rng
         )
         teacher_rollout_buffer = init_teacher_rollout_buffer(
             teacher_rollout_buffer_size,
@@ -2871,7 +2875,7 @@ def make_train(config):
                         config.get("TEACHER_SOFTMAX_VIZ_REF_ENV_INDEX", 0)
                     )
                     ref_base_obs = episode_initial_base_obs[ref_env_index]
-                    rng, action_rng = jax.random.split(rng)
+                    _, action_rng = jax.random.split(rng)
                     bootstrap_action = _bootstrap_teacher_action(
                         train_state.params, ref_base_obs, action_rng
                     )
