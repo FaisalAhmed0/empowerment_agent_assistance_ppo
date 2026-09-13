@@ -1,27 +1,28 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_5"
+WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_more_seeds_no_normalize_advantages"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
 TEACHER_SOFTMAX_VIZ_NUM_SNAPSHOTSS=(0)
 ENV_NAMES=("ant_u_maze_single_goal")
 USE_MAX_IN_LP_REWARD="--USE_MAX_IN_LP_REWARD"
+TEACHER_NORMALIZE_ADVANTAGES="--no-TEACHER_NORMALIZE_ADVANTAGES"
 TOTAL_TIMESTEPS_=(300000000)
 LRS=(0.0003)
 TEACHER_LRS=(0.0003 0.00003)
-SEEDS=(30)
+SEEDS=(30 75937 123)
 COMMENT="granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
 NUM_ENVSS=(256)
 NUM_STEPS_=(64)
-STUDENT_ENTROPY_COFFS=(0.0)
+STUDENT_ENTROPY_COFFS=(0.001 0.0001)
 GAE_LAMBDA=(0.8)
 CLIP_EPSS=(0.2) 
-TEACHER_CLIP_EPSS=(0.1 0.2)
+TEACHER_CLIP_EPSS=(0.2 0.3)
 MAX_GRAD_NORM=(1.0)
 UPDATE_EPOCHSS=(4)
 NUM_MINIBATCHES=(8)
@@ -32,11 +33,11 @@ GOAL_REWARD_COEF=(1)
 TEACHER_ROLLOUT_BUFFER_SIZES=(1)
 ABSOLUTE_LEARNING_PROGRESSS=(--no-ABSOLUTE_LEARNING_PROGRESS)
 NUM_EVAL_ENVSS=(8)
-TEACHER_ENTROPY_COEFSS=(0.0 0.001 0.0001)
+TEACHER_ENTROPY_COEFSS=(0.01 0.001 0.0)
 TEACHER_NUM_MINIBATCHESS=(8)
-TEACHER_UPDATE_EPOCHSS=(4 8)
-TASK_REWARD_COEFSS=(1 2 5 10)
-LP_EMA_ALPHAS=(0.8 0.9 0.999 1)
+TEACHER_UPDATE_EPOCHSS=(8)
+TASK_REWARD_COEFSS=(1 2)
+LP_EMA_ALPHAS=(0.1 0.5 0.9 0.999 1)
 
 run_count=0
 
@@ -79,6 +80,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${ADD_GOAL_REWARD} \
                         ${CONDITION_ON_GOAL} \
                         --NUM_STEPS=${num_steps} \
+                        ${TEACHER_NORMALIZE_ADVANTAGES} \
                         --LP_EMA_ALPHA=${lp_ema_alpha} \
                         --GAE_LAMBDA=${gae_lambda} \
                         --TEACHER_ROLLOUT_BUFFER_SIZE=${teacher_rollout_buffer_size} \

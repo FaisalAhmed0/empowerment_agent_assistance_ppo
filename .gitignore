@@ -20,3 +20,4 @@ teacher_goal_visuals
 *.pywzz
 *.pyzzz
 *.pywzzz
+slurm*

@@ -119,6 +119,7 @@ class TrainConfig:
     TEACHER_MAX_GRAD_NORM: float = 1.0
     TEACHER_USE_ENCODERS: bool = True
     TEACHER_ACTIVATION: str = "tanh"
+    TEACHER_NORMALIZE_ADVANTAGES: bool = True
     # Agent XY logging
     AGENT_POSITIONS_LOG_FREQ: int = 100
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
@@ -2497,7 +2498,9 @@ def make_train(config):
                                 value_losses, value_losses_clipped
                             ).mean()
                             ratio = jnp.exp(log_prob - traj_b.log_prob)
-                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                            if config["TEACHER_NORMALIZE_ADVANTAGES"]:
+                                print("Normalizing advantages")
+                                gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                             loss_actor1 = ratio * gae
                             loss_actor2 = (
                                 jnp.clip(
