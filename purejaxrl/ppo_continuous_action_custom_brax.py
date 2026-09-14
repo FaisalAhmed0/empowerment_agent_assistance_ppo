@@ -28,9 +28,11 @@ from wrappers import (
 try:
     from purejaxrl.envs.factory import make_custom_env
     from purejaxrl.rnd import RNDNetwork, init_rnd_state, rnd_step, train_predictor
+    from purejaxrl.icm import ICMNetwork, init_icm_state, icm_step, train_icm
 except ImportError:
     from envs.factory import make_custom_env
     from rnd import RNDNetwork, init_rnd_state, rnd_step, train_predictor
+    from icm import ICMNetwork, init_icm_state, icm_step, train_icm
 
 import orbax.checkpoint as ocp
 
@@ -87,6 +89,12 @@ class TrainConfig:
     RND_LR: float = 1e-4
     RND_HIDDEN_DIM: int = 256
     RND_OUTPUT_DIM: int = 128
+    USE_ICM: bool = False
+    ICM_COEF: float = 1.0
+    ICM_LR: float = 1e-4
+    ICM_HIDDEN_DIM: int = 256
+    ICM_FEATURE_DIM: int = 128
+    ICM_BETA: float = 0.2
     TASK_REWARD_COEF: float = 1.0
 
 def parse_config_from_cli() -> TrainConfig:
@@ -146,6 +154,10 @@ class Transition(NamedTuple):
     rnd_reward: jnp.ndarray
     rnd_raw_intrinsic: jnp.ndarray
     rnd_obs: jnp.ndarray
+    icm_reward: jnp.ndarray
+    icm_raw_intrinsic: jnp.ndarray
+    icm_obs: jnp.ndarray
+    icm_next_obs: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
@@ -405,6 +417,7 @@ def make_train(config):
         hidden_dim=config.get("RND_HIDDEN_DIM", 256),
         output_dim=config.get("RND_OUTPUT_DIM", 128),
     )
+    use_icm = config.get("USE_ICM", False)
     if custom_env is not None:
         base_env = custom_env
         base_env_2 = custom_env_2
@@ -448,6 +461,12 @@ def make_train(config):
 
     network = ActorCritic(
         env.action_space(env_params).shape[0], activation=config["ACTIVATION"], hidden_dim=config["HIDDEN_DIM"]
+    )
+    action_dim = int(env.action_space(env_params).shape[0])
+    icm_network = ICMNetwork(
+        action_dim=action_dim,
+        hidden_dim=config.get("ICM_HIDDEN_DIM", 256),
+        feature_dim=config.get("ICM_FEATURE_DIM", 128),
     )
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
@@ -619,6 +638,17 @@ def make_train(config):
             max_grad_norm=config["MAX_GRAD_NORM"],
             dtype=init_x.dtype,
         )
+        rng, icm_rng = jax.random.split(rng)
+        icm_state = init_icm_state(
+            icm_rng,
+            icm_network,
+            obs_dim,
+            action_dim,
+            config["NUM_ENVS"],
+            config.get("ICM_LR", 1e-4),
+            max_grad_norm=config["MAX_GRAD_NORM"],
+            dtype=init_x.dtype,
+        )
 
         def evaluate_agent_on_env_goal(params, stats_state, rng):
             return evaluate_student_env_goal(
@@ -739,6 +769,7 @@ def make_train(config):
                     ep_goal_success,
                     returned_ep_goal_success,
                     rnd_state,
+                    icm_state,
                 ) = body
 
                 # SELECT ACTION
@@ -746,6 +777,12 @@ def make_train(config):
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
+
+                # Raw obs before step for ICM (s_t)
+                if config["NORMALIZE_ENV"]:
+                    icm_obs_t = env_state.org_obs
+                else:
+                    icm_obs_t = last_obs[..., :obs_dim]
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -783,13 +820,42 @@ def make_train(config):
                         done,
                         config["GAMMA"],
                     )
-                    reward = config["TASK_REWARD_COEF"] * reward + config["RND_COEF"] * rnd_reward
                 else:
                     rnd_obs = jnp.zeros(
                         (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
                     )
                     rnd_reward = jnp.zeros_like(task_reward)
                     rnd_raw_intrinsic = jnp.zeros_like(task_reward)
+
+                if use_icm:
+                    icm_next_obs = (
+                        env_state.org_obs if config["NORMALIZE_ENV"] else obsv
+                    )
+                    icm_state, icm_reward, icm_raw_intrinsic = icm_step(
+                        icm_state,
+                        icm_network,
+                        icm_obs_t,
+                        icm_next_obs,
+                        action,
+                        done,
+                        config["GAMMA"],
+                    )
+                else:
+                    icm_next_obs = jnp.zeros(
+                        (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
+                    )
+                    icm_obs_t = jnp.zeros(
+                        (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
+                    )
+                    icm_reward = jnp.zeros_like(task_reward)
+                    icm_raw_intrinsic = jnp.zeros_like(task_reward)
+
+                if use_rnd or use_icm:
+                    reward = config["TASK_REWARD_COEF"] * reward
+                    if use_rnd:
+                        reward = reward + config["RND_COEF"] * rnd_reward
+                    if use_icm:
+                        reward = reward + config["ICM_COEF"] * icm_reward
 
                 sampled_raw_goals = jax.vmap(sample_random_goal)(
                     jax.random.split(goal_rng, config["NUM_ENVS"])
@@ -829,6 +895,10 @@ def make_train(config):
                     rnd_reward,
                     rnd_raw_intrinsic,
                     rnd_obs,
+                    icm_reward,
+                    icm_raw_intrinsic,
+                    icm_obs_t,
+                    icm_next_obs,
                     log_prob,
                     last_obs,
                     info,
@@ -848,6 +918,7 @@ def make_train(config):
                     ep_goal_success,
                     returned_ep_goal_success,
                     rnd_state,
+                    icm_state,
                 )
                 if enable_train_render:
                     runner_state = runner_state + (train_render_buf, rng)
@@ -877,6 +948,7 @@ def make_train(config):
                 ep_goal_success,
                 returned_ep_goal_success,
                 rnd_state,
+                icm_state,
             ) = body
             _, last_val = network.apply(train_state.params, last_obs)
 
@@ -890,6 +962,26 @@ def make_train(config):
                 )
             else:
                 rnd_predictor_loss = jnp.array(0.0, dtype=last_val.dtype)
+
+            if use_icm:
+                batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
+                icm_obs_batch = traj_batch.icm_obs.reshape((batch_size, obs_dim))
+                icm_next_obs_batch = traj_batch.icm_next_obs.reshape(
+                    (batch_size, obs_dim)
+                )
+                icm_action_batch = traj_batch.action.reshape(
+                    (batch_size, action_dim)
+                )
+                icm_state, icm_loss = train_icm(
+                    icm_state,
+                    icm_network,
+                    icm_obs_batch,
+                    icm_next_obs_batch,
+                    icm_action_batch,
+                    beta=config.get("ICM_BETA", 0.2),
+                )
+            else:
+                icm_loss = jnp.array(0.0, dtype=last_val.dtype)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -1013,6 +1105,10 @@ def make_train(config):
             rnd_reward_std = traj_batch.rnd_reward.std()
             rnd_raw_intrinsic_mean = traj_batch.rnd_raw_intrinsic.mean()
             rnd_rew_running_std = jnp.sqrt(rnd_state.rew_var + 1e-8)
+            icm_reward_mean = traj_batch.icm_reward.mean()
+            icm_reward_std = traj_batch.icm_reward.std()
+            icm_raw_intrinsic_mean = traj_batch.icm_raw_intrinsic.mean()
+            icm_rew_running_std = jnp.sqrt(icm_state.rew_var + 1e-8)
             batch_count = jnp.asarray(
                 traj_batch.task_reward.size, dtype=traj_batch.task_reward.dtype
             )
@@ -1105,6 +1201,11 @@ def make_train(config):
                         rnd_raw_intrinsic_mean,
                         rnd_rew_running_std,
                         rnd_predictor_loss,
+                        icm_reward_mean,
+                        icm_reward_std,
+                        icm_raw_intrinsic_mean,
+                        icm_rew_running_std,
+                        icm_loss,
                     ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
@@ -1133,13 +1234,25 @@ def make_train(config):
                         if use_rnd:
                             log_payload.update(
                                 {
-                                    "rnd_reward_mean": float(rnd_reward_mean),
-                                    "rnd_reward_std": float(rnd_reward_std),
-                                    "rnd_raw_intrinsic_mean": float(
+                                    "rnd/reward_mean": float(rnd_reward_mean),
+                                    "rnd/reward_std": float(rnd_reward_std),
+                                    "rnd/raw_intrinsic_mean": float(
                                         rnd_raw_intrinsic_mean
                                     ),
-                                    "rnd_rew_running_std": float(rnd_rew_running_std),
-                                    "rnd_predictor_loss": float(rnd_predictor_loss),
+                                    "rnd/rew_running_std": float(rnd_rew_running_std),
+                                    "rnd/predictor_loss": float(rnd_predictor_loss),
+                                }
+                            )
+                        if use_icm:
+                            log_payload.update(
+                                {
+                                    "icm/reward_mean": float(icm_reward_mean),
+                                    "icm/reward_std": float(icm_reward_std),
+                                    "icm/raw_intrinsic_mean": float(
+                                        icm_raw_intrinsic_mean
+                                    ),
+                                    "icm/rew_running_std": float(icm_rew_running_std),
+                                    "icm/loss": float(icm_loss),
                                 }
                             )
                         if not jnp.isnan(train_goal_success_rate):
@@ -1173,6 +1286,11 @@ def make_train(config):
                         rnd_raw_intrinsic_mean,
                         rnd_rew_running_std,
                         rnd_predictor_loss,
+                        icm_reward_mean,
+                        icm_reward_std,
+                        icm_raw_intrinsic_mean,
+                        icm_rew_running_std,
+                        icm_loss,
                     ),
                 )
 
@@ -1286,6 +1404,7 @@ def make_train(config):
                 ep_goal_success,
                 returned_ep_goal_success,
                 rnd_state,
+                icm_state,
             )
             if enable_train_render:
                 runner_state = runner_state + (train_render_buf, rng)
@@ -1309,6 +1428,7 @@ def make_train(config):
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             rnd_state,
+            icm_state,
         )
         if enable_train_render:
             runner_state = runner_state + (train_render_buf, _rng)
