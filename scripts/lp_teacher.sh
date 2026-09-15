@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define common parameters (fixed values)
-WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_more_seeds_350M_repeaeted"
+WANDB_PROJECT_NAME="mlp_teacher_lp_reward_granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha_more_seeds_350M_repeaeted_2"
 ADD_GOAL_REWARD="--ADD_GOAL_REWARD"
 CONDITION_ON_GOAL="--CONDITION_ON_GOAL"
 USE_LEARNING_PROGRESS_REWARD="--USE_LEARNING_PROGRESS_REWARD"
@@ -17,7 +17,7 @@ COMMENT="granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(1024)
+NUM_ENVSS=(256 1024)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0.001)
 GAE_LAMBDA=(0.8)
