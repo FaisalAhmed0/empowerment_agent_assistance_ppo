@@ -12,12 +12,12 @@ TEACHER_NORMALIZE_ADVANTAGES="--TEACHER_NORMALIZE_ADVANTAGES"
 TOTAL_TIMESTEPS_=(350000000)
 LRS=(0.0003)
 TEACHER_LRS=(0.0003)
-SEEDS=(75937 123)
+SEEDS=(30 75937 123)
 COMMENT="granular_sweep_over_teacher_eps_both_ent_coeff_teacher_lr_lp_ema_alpha"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(256)
+NUM_ENVSS=(1024)
 NUM_STEPS_=(64)
 STUDENT_ENTROPY_COFFS=(0.001)
 GAE_LAMBDA=(0.8)
@@ -38,6 +38,8 @@ TEACHER_NUM_MINIBATCHESS=(8)
 TEACHER_UPDATE_EPOCHSS=(8)
 TASK_REWARD_COEFSS=(1)
 LP_EMA_ALPHAS=(0.1)
+OBS_NORM_WARMUP_STEPSS=(5000)
+GOAL_REACH_EPSILONSS=(0.8 1.0)
 
 run_count=0
 
@@ -67,6 +69,8 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for teacher_lr in "${TEACHER_LRS[@]}"; do
                         for lp_ema_alpha in "${LP_EMA_ALPHAS[@]}"; do
                         for SEED in "${SEEDS[@]}"; do
+                        for obs_norm_warmup_steps in "${OBS_NORM_WARMUP_STEPSS[@]}"; do
+                        for goal_reach_epsilon in "${GOAL_REACH_EPSILONSS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
                       CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py \
                         --ENV_NAME=${ENV_NAME} \
@@ -80,6 +84,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         ${ADD_GOAL_REWARD} \
                         ${CONDITION_ON_GOAL} \
                         --NUM_STEPS=${num_steps} \
+                        --GOAL_REACH_EPSILON=${goal_reach_epsilon} \
                         ${TEACHER_NORMALIZE_ADVANTAGES} \
                         --LP_EMA_ALPHA=${lp_ema_alpha} \
                         --GAE_LAMBDA=${gae_lambda} \
@@ -87,6 +92,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --TEACHER_CLIP_EPS=${teacher_clip_eps} \
                         --TEACHER_NUM_MINIBATCHES=${teacher_num_minibatches} \
                         --TEACHER_LR=${teacher_lr} \
+                        --OBS_NORM_WARMUP_STEPS=${obs_norm_warmup_steps} \
                         --TEACHER_UPDATE_EPOCHS=${teacher_update_epochs} \
                         --TASK_REWARD_COEF=${task_reward_coef} \
                         --TEACHER_ENT_COEF=${teacher_entropy_coef} \
@@ -108,8 +114,10 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                   done
                 done
               done
+              done
             done
           done
+        done
         done
         done
         done

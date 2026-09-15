@@ -62,6 +62,7 @@ class TrainConfig:
     ANNEAL_LR: bool = True
     USE_OPTAX_LR_SCHEDULE: bool = False
     NORMALIZE_ENV: bool = True
+    OBS_NORM_WARMUP_STEPS: int = 5000
     DEBUG: bool = False
     SEED: int = 30
     WANDB_MODE: str = "online"
@@ -1820,7 +1821,10 @@ def make_train(config):
                         obsv = jnp.concatenate([obsv, jnp.zeros((config["NUM_ENVS"], goal_dim))], axis=-1)
                     return (obsv, env_state, rng), None
                 _, pipeline_states = jax.lax.scan(
-                    step_fn, (obsv, env_state, rng), None, length=5000
+                    step_fn,
+                    (obsv, env_state, rng),
+                    None,
+                    length=config["OBS_NORM_WARMUP_STEPS"],
                 )
                 return env_state
             rng, warmup_rng = jax.random.split(rng)
@@ -3213,8 +3217,9 @@ def main():
         random_name = RandomWord().word()
         random_id = np.random.randint(1000000000)
 
+    experiment_name = f"{random_name}_{random_id}"
     config["EXP_DIR"] = os.path.join(
-        scratch, "purejaxrl_simple_teachers", f"{random_name}_{random_id}"
+        scratch, "purejaxrl_simple_teachers", experiment_name
     )
     config["AGENT_POSITIONS_SAVE_DIR"] = os.path.join(
         config["EXP_DIR"], "agent_positions"
@@ -3224,7 +3229,7 @@ def main():
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["PPO", "BRAX", config["ENV_NAME"], f"jax_{jax.__version__}"],
-        name=f'purejaxrl_ppo_brax_{config["ENV_NAME"]}',
+        name=experiment_name,
         config=config,
         mode=config["WANDB_MODE"],
     )
