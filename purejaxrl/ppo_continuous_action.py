@@ -4,6 +4,7 @@ import flax.linen as nn
 import numpy as np
 import optax
 import wandb
+import os
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
@@ -16,6 +17,11 @@ from wrappers import (
     NormalizeVecReward,
     ClipAction,
 )
+
+try:
+    from purejaxrl.csv_logger import append_metrics_row, init_run_csvs, should_log_csv
+except ImportError:
+    from csv_logger import append_metrics_row, init_run_csvs, should_log_csv
 
 
 class ActorCritic(nn.Module):
@@ -124,7 +130,7 @@ def make_train(config):
         obsv, env_state = env.reset(reset_rng, env_params)
 
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, update_idx):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, rng = runner_state
@@ -280,21 +286,36 @@ def make_train(config):
 
                 jax.debug.callback(callback, metric)
 
-            if config.get("WANDB_MODE", "disabled") != "disabled":
+            log_wandb = config.get("WANDB_MODE", "disabled") != "disabled"
+            log_csv = bool(config.get("LOG_CSV", True)) and config.get("EXP_DIR")
 
-                def wandb_callback(args):
-                    info = args
+            if log_wandb or log_csv:
+
+                def metrics_callback(args):
+                    info, update_i = args
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
+                    update = int(update_i)
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
                     ]
-                    if len(return_values) > 0:
-                        wandb.log(
-                            {"episodic_return": float(return_values.mean())},
-                            step=step,
+                    if len(return_values) == 0:
+                        return None
+                    episodic_return = float(return_values.mean())
+                    if log_csv and should_log_csv(config, update):
+                        append_metrics_row(
+                            config["EXP_DIR"],
+                            {
+                                "update": update,
+                                "env_steps": step,
+                                "episodic_return": episodic_return,
+                            },
+                            hparams=config.get("CSV_HPARAMS"),
                         )
+                    if log_wandb:
+                        wandb.log({"episodic_return": episodic_return}, step=step)
+                    return None
 
-                jax.debug.callback(wandb_callback, metric)
+                jax.debug.callback(metrics_callback, (metric, update_idx))
 
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
@@ -302,7 +323,7 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, _rng)
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
         return {"runner_state": runner_state, "metrics": metric}
 
@@ -332,9 +353,23 @@ if __name__ == "__main__":
         "WANDB_MODE": "online",
         "ENTITY": "",
         "PROJECT": "purejaxrl",
+        "SEED": 30,
+        "LOG_CSV": True,
+        "CSV_LOG_FREQ": 1,
     }
     gpu_names = sorted({d.device_kind for d in jax.devices("gpu")})
     config["GPU_NAME"] = gpu_names[0]
+
+    scratch = os.environ.get("SCRATCH", os.getcwd())
+    run_id = f'{config["ENV_NAME"]}_seed{config["SEED"]}_{np.random.randint(1_000_000_000)}'
+    config["EXP_DIR"] = os.path.join(scratch, "purejaxrl", run_id)
+    os.makedirs(config["EXP_DIR"], exist_ok=True)
+    print(f"Experiment directory: {config['EXP_DIR']}")
+    if config.get("LOG_CSV", True):
+        config["CSV_HPARAMS"] = init_run_csvs(config["EXP_DIR"], config)
+    else:
+        config["CSV_HPARAMS"] = None
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -343,7 +378,7 @@ if __name__ == "__main__":
         config=config,
         mode=config["WANDB_MODE"],
     )
-    rng = jax.random.PRNGKey(30)
+    rng = jax.random.PRNGKey(config["SEED"])
     train_jit = jax.jit(make_train(config))
     out = train_jit(rng)
     wandb.finish()

@@ -6,9 +6,9 @@ WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal_no_teacher_icm_baseline"
 
 ENV_NAMES=("ant_u_maze_single_goal")
 SAVE_MODEL="--SAVE_MODEL"
-TOTAL_TIMESTEPS_=(300000000)
+TOTAL_TIMESTEPS_=(350000000)
 LRS=(0.0003)
-SEEDS=(30 0 8943)
+SEEDS=(30 75937 123)
 COMMENT="no_teacher_icm_baseline"
 USE_ICM="--USE_ICM"
 

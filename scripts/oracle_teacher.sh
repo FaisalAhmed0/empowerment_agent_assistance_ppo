@@ -2,14 +2,14 @@
 
 # Define common parameters (fixed values)
 # This is also reading for running.
-WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal_oracle_teacher_baseline_final"
+WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal_oracle_teacher_baseline_final_2"
 
 ENV_NAMES=("ant_u_maze_single_goal")
 SAVE_MODEL="--SAVE_MODEL"
 USE_ORACLE_REWARD="--USE_ORACLE_REWARD"
-TOTAL_TIMESTEPS_=(300000000)
+TOTAL_TIMESTEPS_=(350000000)
 LRS=(0.0003)
-SEEDS=(30 0 8943)
+SEEDS=(30 75937 123)
 COMMENT="oracle_teacher_baseline"
 
 # PPO teacher-specific sweep args from

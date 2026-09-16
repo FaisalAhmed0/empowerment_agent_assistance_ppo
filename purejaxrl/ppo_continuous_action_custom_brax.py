@@ -29,10 +29,12 @@ try:
     from purejaxrl.envs.factory import make_custom_env
     from purejaxrl.rnd import RNDNetwork, init_rnd_state, rnd_step, train_predictor
     from purejaxrl.icm import ICMNetwork, init_icm_state, icm_step, train_icm
+    from purejaxrl.csv_logger import append_metrics_row, init_run_csvs, should_log_csv
 except ImportError:
     from envs.factory import make_custom_env
     from rnd import RNDNetwork, init_rnd_state, rnd_step, train_predictor
     from icm import ICMNetwork, init_icm_state, icm_step, train_icm
+    from csv_logger import append_metrics_row, init_run_csvs, should_log_csv
 
 import orbax.checkpoint as ocp
 
@@ -96,6 +98,8 @@ class TrainConfig:
     ICM_FEATURE_DIM: int = 128
     ICM_BETA: float = 0.2
     TASK_REWARD_COEF: float = 1.0
+    LOG_CSV: bool = True
+    CSV_LOG_FREQ: int = 1
 
 def parse_config_from_cli() -> TrainConfig:
     return tyro.cli(TrainConfig)
@@ -317,12 +321,15 @@ def evaluate_student_env_goal(
     warmup_env_state=None,
     normalize_obs=False,
     condition_on_goal=True,
+    exclude_oracle_reward=True,
 ):
     """Evaluate agent on env goals (no teacher sampling).
 
     Conditions the policy on each env's own maze goal from ``org_obs[..., -2:]``
-    when ``condition_on_goal`` is True. Returns ``(success_rate, episodic_return)``
-    averaged over ``num_envs``.
+    when ``condition_on_goal`` is True. Returns
+    ``(success_rate, episodic_return, oracle_return)`` averaged over ``num_envs``.
+    When ``exclude_oracle_reward`` is True, ``episodic_return`` is task-only
+    (oracle shaping subtracted via the ``oracle_vel_reward`` metric).
     """
     env_params = None
     obs_dim = brax_env.observation_size
@@ -357,7 +364,7 @@ def evaluate_student_env_goal(
             goal_batch = env_goals
 
     def step_fn(carry, _):
-        obsv, env_state, rng, ep_return, ep_success, ever_done = carry
+        obsv, env_state, rng, ep_return, ep_oracle_return, ep_success, ever_done = carry
         rng, step_rng, action_rng = jax.random.split(rng, 3)
         step_rngs = jax.random.split(step_rng, num_envs)
         if condition_on_goal:
@@ -372,20 +379,41 @@ def evaluate_student_env_goal(
         active = 1.0 - ever_done
         step_success = _success_metric(env_state)
         ep_success = jnp.maximum(ep_success, step_success * active)
-        ep_return = ep_return + reward * active
+        metrics = _inner_brax_state(env_state).metrics
+        oracle_reward = metrics.get("oracle_vel_reward", jnp.zeros_like(reward))
+        task_reward = reward - oracle_reward if exclude_oracle_reward else reward
+        ep_return = ep_return + task_reward * active
+        ep_oracle_return = ep_oracle_return + oracle_reward * active
         ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
-        return (obsv, env_state, rng, ep_return, ep_success, ever_done), None
+        return (
+            obsv,
+            env_state,
+            rng,
+            ep_return,
+            ep_oracle_return,
+            ep_success,
+            ever_done,
+        ), None
 
     init_return = jnp.zeros((num_envs,), dtype=obsv.dtype)
+    init_oracle_return = jnp.zeros((num_envs,), dtype=obsv.dtype)
     init_success = jnp.zeros((num_envs,), dtype=obsv.dtype)
     init_ever_done = jnp.zeros((num_envs,), dtype=obsv.dtype)
-    (_, _, _, ep_return, ep_success, _), _ = jax.lax.scan(
+    (_, _, _, ep_return, ep_oracle_return, ep_success, _), _ = jax.lax.scan(
         step_fn,
-        (obsv, env_state, rng, init_return, init_success, init_ever_done),
+        (
+            obsv,
+            env_state,
+            rng,
+            init_return,
+            init_oracle_return,
+            init_success,
+            init_ever_done,
+        ),
         None,
         length=max_steps,
     )
-    return ep_success.mean(), ep_return.mean()
+    return ep_success.mean(), ep_return.mean(), ep_oracle_return.mean()
 
 
 def make_train(config):
@@ -662,6 +690,7 @@ def make_train(config):
                 warmup_env_state=stats_state,
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
+                exclude_oracle_reward=config.get("USE_ORACLE_REWARD", False),
             )
 
         rng, goal_rng,  _rng = jax.random.split(rng, 3)
@@ -1167,7 +1196,9 @@ def make_train(config):
 
                 jax.debug.callback(debug_callback, metric)
 
-            if config.get("WANDB_MODE", "disabled") == "online":
+            log_wandb = config.get("WANDB_MODE", "disabled") == "online"
+            log_csv = bool(config.get("LOG_CSV", True))
+            if log_wandb or log_csv:
                 returned_episode = metric["returned_episode"]
                 done_count = returned_episode.sum()
                 train_goal_success_rate = jnp.where(
@@ -1177,7 +1208,7 @@ def make_train(config):
                     jnp.nan,
                 )
 
-                def wandb_callback(args):
+                def metrics_callback(args):
                     (
                         info,
                         total_loss,
@@ -1206,13 +1237,73 @@ def make_train(config):
                         icm_raw_intrinsic_mean,
                         icm_rew_running_std,
                         icm_loss,
+                        update_i,
                     ) = args
                     # Keep all metrics on a consistent global step for stable wandb curves.
                     step = int(info["timestep"].max() * config["NUM_ENVS"])
+                    update = int(update_i)
                     return_values = info["returned_episode_returns"][
                         info["returned_episode"]
                     ]
-                    if len(return_values) > 0:
+                    if len(return_values) == 0:
+                        return None
+
+                    if log_csv and should_log_csv(config, update):
+                        csv_row = {
+                            "update": update,
+                            "env_steps": step,
+                            "episodic_return": float(return_values.mean()),
+                            "total_loss": float(total_loss),
+                            "value_loss": float(value_loss),
+                            "actor_loss": float(actor_loss),
+                            "entropy": float(entropy),
+                            "task_reward_mean": float(task_reward_mean),
+                            "task_reward_std": float(task_reward_std),
+                            "goal_reward_mean": float(goal_reward_mean),
+                            "goal_reward_std": float(goal_reward_std),
+                            "task_reward_running_mean": float(task_reward_running_mean),
+                            "task_reward_running_std": float(task_reward_running_std),
+                            "goal_reward_running_mean": float(goal_reward_running_mean),
+                            "goal_reward_running_std": float(goal_reward_running_std),
+                            "learning_rate": float(current_lr),
+                            "obs_norm_mean": float(obs_norm_mean),
+                            "obs_norm_var": float(obs_norm_var),
+                        }
+                        if use_rnd:
+                            csv_row.update(
+                                {
+                                    "rnd_reward_mean": float(rnd_reward_mean),
+                                    "rnd_reward_std": float(rnd_reward_std),
+                                    "rnd_raw_intrinsic_mean": float(
+                                        rnd_raw_intrinsic_mean
+                                    ),
+                                    "rnd_rew_running_std": float(rnd_rew_running_std),
+                                    "rnd_predictor_loss": float(rnd_predictor_loss),
+                                }
+                            )
+                        if use_icm:
+                            csv_row.update(
+                                {
+                                    "icm_reward_mean": float(icm_reward_mean),
+                                    "icm_reward_std": float(icm_reward_std),
+                                    "icm_raw_intrinsic_mean": float(
+                                        icm_raw_intrinsic_mean
+                                    ),
+                                    "icm_rew_running_std": float(icm_rew_running_std),
+                                    "icm_loss": float(icm_loss),
+                                }
+                            )
+                        if not jnp.isnan(train_goal_success_rate):
+                            csv_row["train_goal_success_rate"] = float(
+                                train_goal_success_rate
+                            )
+                        append_metrics_row(
+                            config["EXP_DIR"],
+                            csv_row,
+                            hparams=config.get("CSV_HPARAMS"),
+                        )
+
+                    if log_wandb:
                         log_payload = {
                             "episodic_return": float(return_values.mean()),
                             "total_loss": float(total_loss),
@@ -1260,9 +1351,10 @@ def make_train(config):
                                 train_goal_success_rate
                             )
                         wandb.log(log_payload, step=step)
+                    return None
 
                 jax.debug.callback(
-                    wandb_callback,
+                    metrics_callback,
                     (
                         metric,
                         total_loss,
@@ -1291,6 +1383,7 @@ def make_train(config):
                         icm_raw_intrinsic_mean,
                         icm_rew_running_std,
                         icm_loss,
+                        update_idx,
                     ),
                 )
 
@@ -1302,30 +1395,53 @@ def make_train(config):
 
                 def _run_eval(_):
                     # jax.debug.print("running env-goal eval")
-                    success_rate, episodic_return = evaluate_agent_on_env_goal(
-                        train_state.params, env_state, eval_rng
+                    success_rate, episodic_return, oracle_return = (
+                        evaluate_agent_on_env_goal(
+                            train_state.params, env_state, eval_rng
+                        )
                     )
                     step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
 
                     def _log_eval(args):
-                        sr, er, st = args
+                        sr, er, or_, st, update_i = args
                         if config.get("WANDB_MODE", "disabled") == "online":
-                            wandb.log(
-                                {
-                                    "eval/success_rate": float(sr),
-                                    "eval/episodic_return": float(er),
-                                },
+                            log_payload = {
+                                "eval/success_rate": float(sr),
+                                "eval/episodic_return": float(er),
+                            }
+                            if config.get("USE_ORACLE_REWARD", False):
+                                log_payload["eval/oracle_return"] = float(or_)
+                            wandb.log(log_payload, step=int(st))
+                        if bool(config.get("LOG_CSV", True)) and should_log_csv(
+                            config, int(update_i)
+                        ):
+                            csv_row = {
+                                "update": int(update_i),
+                                "env_steps": int(st),
+                                "eval_success_rate": float(sr),
+                                "eval_episodic_return": float(er),
+                            }
+                            if config.get("USE_ORACLE_REWARD", False):
+                                csv_row["eval_oracle_return"] = float(or_)
+                            append_metrics_row(
+                                config["EXP_DIR"],
+                                csv_row,
+                                hparams=config.get("CSV_HPARAMS"),
                             )
                         if config.get("DEBUG"):
-                            print(
+                            msg = (
                                 f"eval step={int(st)}, "
                                 f"success_rate={float(sr):.4f}, "
                                 f"episodic_return={float(er):.4f}"
                             )
+                            if config.get("USE_ORACLE_REWARD", False):
+                                msg += f", oracle_return={float(or_):.4f}"
+                            print(msg)
                         return None
 
                     jax.debug.callback(
-                        _log_eval, (success_rate, episodic_return, step)
+                        _log_eval,
+                        (success_rate, episodic_return, oracle_return, step, update_idx),
                     )
                     return jnp.array(0, dtype=jnp.int32)
 
@@ -1464,6 +1580,11 @@ def main():
 
     print(f"Experiment directory: {config['EXP_DIR']}")
     os.makedirs(config["EXP_DIR"], exist_ok=True)
+
+    if config.get("LOG_CSV", True):
+        config["CSV_HPARAMS"] = init_run_csvs(config["EXP_DIR"], config)
+    else:
+        config["CSV_HPARAMS"] = None
 
     wandb.init(
         entity=config["ENTITY"],
