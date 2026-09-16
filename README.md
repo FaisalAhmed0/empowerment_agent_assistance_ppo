@@ -29,6 +29,25 @@ For GPU acceleration, follow the [JAX installation guide](https://github.com/goo
 
 **Working directory:** run all commands from the repository root so imports like `envs.factory` resolve. The scripts set `MUJOCO_GL=osmesa` internally for headless rendering.
 
+## Installation on Clusters
+
+Install on the **login node**. On the GPU node, only load modules and run — do not train on login, and do not `uv sync` on compute (no internet). Use cluster Python 3.10 (not uv’s CPython) and cache uv on scratch.
+
+**Login node:**
+
+```bash
+bash scripts/setup_login.sh
+```
+
+**GPU node:**
+
+```bash
+salloc --account=rrg-gberseth_gpu --gres=gpu:h100:1 --cpus-per-task=8 --mem=64G --time=7:59:00
+source scripts/setup_compute.sh
+uv run python <script_name.py>
+```
+
+
 ## Configuration
 
 To list all available options:
