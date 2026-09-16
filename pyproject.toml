@@ -1,0 +1,45 @@
+[project]
+name = "empowerment-agent-assistance-ppo"
+version = "0.1.0"
+description = "Teacher-assisted goal-conditioned PPO for Brax ant-maze environments"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy>=1.26,<2",
+    "orbax-checkpoint>=0.9,<0.10",
+    "gymnax",
+    "evosax",
+    "distrax",
+    "optax",
+    "flax",
+    "brax",
+    "wandb",
+    "flashbax",
+    "navix",
+    "matplotlib",
+    "tyro",
+    "wonderwords",
+    "jax==0.4.28",
+    "jaxlib",
+    "mujoco==3.1.6",
+    "mujoco-mjx==3.1.6",
+]
+
+[tool.uv]
+package = false
+# Cluster numpy/flexiblas wheels are GCC-built and need Compute Canada Python.
+# Do not let uv download its own CPython (Clang); that fails with libcpupower.so.0.
+python-preference = "only-system"
+# Cluster orbax 0.9.1+computecanada requires jax>=0.4.34 (CPU-only here).
+override-dependencies = [
+    "jax==0.4.28",
+    "mujoco==3.1.6",
+    "mujoco-mjx==3.1.6",
+]
+find-links = [
+    "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic",
+    "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic",
+]
+
+[tool.uv.sources]
+jaxlib = { path = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic/jaxlib-0.4.28+cuda12.cudnn89.computecanada-cp310-cp310-linux_x86_64.whl" }
