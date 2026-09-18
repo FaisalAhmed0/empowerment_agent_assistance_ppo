@@ -600,10 +600,10 @@ def make_train(config):
             with open(html_path, "w", encoding="utf-8") as file:
                 file.write(rendered_html)
             if config.get("EVAL_RENDER_LOG_WANDB_HTML", False):
-                wandb.log({log_key: wandb.Html(rendered_html)})
+                wandb.log({log_key: wandb.Html(rendered_html)}, step=int(step))
             else:
                 wandb.save(html_path, base_path=exp_dir, policy="now")
-                wandb.log({f"{log_key}/html_path": html_path})
+                wandb.log({f"{log_key}/html_path": html_path}, step=int(step))
         except Exception as err:
             print(f"[log_pipeline_html_to_wandb] skipped video logging: {err}")
             traceback.print_exc()
@@ -1387,6 +1387,9 @@ def make_train(config):
                     ),
                 )
 
+            # Align eval / train-render with metrics on the post-rollout global step.
+            global_step = metric["timestep"].max() * config["NUM_ENVS"]
+
             # Periodic eval on environment goals.
             eval_freq = int(config.get("EVAL_FREQ", 0))
             if eval_freq > 0:
@@ -1400,7 +1403,6 @@ def make_train(config):
                             train_state.params, env_state, eval_rng
                         )
                     )
-                    step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
 
                     def _log_eval(args):
                         sr, er, or_, st, update_i = args
@@ -1441,7 +1443,13 @@ def make_train(config):
 
                     jax.debug.callback(
                         _log_eval,
-                        (success_rate, episodic_return, oracle_return, step, update_idx),
+                        (
+                            success_rate,
+                            episodic_return,
+                            oracle_return,
+                            global_step,
+                            update_idx,
+                        ),
                     )
                     return jnp.array(0, dtype=jnp.int32)
 
@@ -1462,8 +1470,6 @@ def make_train(config):
                 )
 
                 def _run_train_render(_):
-                    step = (update_idx) * config["NUM_STEPS"] * config["NUM_ENVS"]
-
                     def _log_train_render_host(args):
                         frames, length, st = args
                         try:
@@ -1489,7 +1495,7 @@ def make_train(config):
                         (
                             train_render_buf.completed_frames,
                             train_render_buf.completed_length,
-                            step,
+                            global_step,
                         ),
                     )
                     return train_render_buf._replace(

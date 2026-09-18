@@ -134,10 +134,21 @@ BIG_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+BIG_MAZE_ALL_GOALS = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, G, G, 1, 1, G, G, 1],
+    [1, G, G, 1, G, G, G, 1],
+    [1, 1, G, G, G, 1, 1, 1],
+    [1, G, G, 1, G, G, G, 1],
+    [1, G, 1, G, G, 1, G, 1],
+    [1, G, G, G, 1, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 BIG_MAZE_SINGLE_GOAL = [
     [1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 0, 0, 1, 1, 0, G, 1],
-    [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 0, 0, 1, 1, G, G, 1],
+    [1, 0, 0, 1, 0, 0, G, 1],
     [1, 1, 0, 0, 0, 1, 1, 1],
     [1, 0, 0, 1, 0, 0, 0, 1],
     [1, 0, 1, 0, 0, 1, 0, 1],
@@ -257,6 +268,23 @@ def find_goals(structure, size_scaling):
     return jnp.array(goals)
 
 
+def get_maze_xy_bounds(structure, size_scaling=4.0):
+    """Return (min_x, max_x, min_y, max_y) over free-cell centers.
+
+    Free cells are non-wall entries (0, RESET, GOAL). Coordinates use the
+    same mapping as find_starts/find_goals: (i * s, j * s).
+    """
+    xs, ys = [], []
+    for i in range(len(structure)):
+        for j in range(len(structure[0])):
+            if structure[i][j] != 1:
+                xs.append(i * size_scaling)
+                ys.append(j * size_scaling)
+    if not xs:
+        raise ValueError("Maze layout has no free cells")
+    return float(min(xs)), float(max(xs)), float(min(ys)), float(max(ys))
+
+
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling):
     if maze_layout_name == "u_maze":
@@ -267,6 +295,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = U_MAZE_EVAL
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
+    elif maze_layout_name == "big_maze_single_goal":
+        maze_layout = BIG_MAZE_SINGLE_GOAL
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":

@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import traceback
@@ -49,7 +50,7 @@ class TrainConfig:
     GAMMA: float = 0.99
     GAE_LAMBDA: float = 0.8
     CLIP_EPS: float = 0.2
-    ENT_COEF: float = 0.0
+    ENT_COEF: float = 0.001
     VF_COEF: float = 0.5
     HIDDEN_DIM: int = 256
     MAX_GRAD_NORM: float = 1.0
@@ -78,7 +79,7 @@ class TrainConfig:
     COMMENT: str = ""
     ADD_GOAL_REWARD: bool = True
     CONDITION_ON_GOAL: bool = True
-    GOAL_REACH_EPSILON: float = 0.5
+    GOAL_REACH_EPSILON: float = 1.0
     TEACHER_GOAL_X_MIN: float = 4.0
     TEACHER_GOAL_X_MAX: float = 12.0
     TEACHER_GOAL_Y_MIN: float = 4.0
@@ -95,8 +96,10 @@ class TrainConfig:
     GOAL_REWARD_COEF: float = 1.0
     TASK_REWARD_COEF: float = 1.0
     INTERPOLATED_REWARD: bool = False
-    NUM_EVAL_ENVS: int = 4
+    NUM_EVAL_ENVS: int = 8
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
+    TEACHER_CONDITION_ONLY_ON_COMPETENCE: bool = False
+    TEACHER_EMA_COEFF: float = 0.999
     USE_DISTANCE_IN_COMPETENCE: bool = False
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = True
@@ -110,12 +113,12 @@ class TrainConfig:
     AGENT_TRAJECTORY_REF_ENV_INDEX: int = 0
     TEACHER_ROLLOUT_BUFFER_SIZE: int = 1
     TEACHER_NUM_MINIBATCHES: int = 8
-    TEACHER_UPDATE_EPOCHS: int = 4
+    TEACHER_UPDATE_EPOCHS: int = 8
     TEACHER_LR: float = 3e-4
     TEACHER_GAMMA: float = 0.99
     TEACHER_GAE_LAMBDA: float = 0.8
-    TEACHER_CLIP_EPS: float = 0.2
-    TEACHER_ENT_COEF: float = 0.001
+    TEACHER_CLIP_EPS: float = 0.3
+    TEACHER_ENT_COEF: float = 0.01
     TEACHER_VF_COEF: float = 0.5
     TEACHER_MAX_GRAD_NORM: float = 1.0
     TEACHER_USE_ENCODERS: bool = True
@@ -744,6 +747,12 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
+class TeacherTrainState(TrainState):
+    """TrainState that also tracks an exponential moving average of params."""
+
+    ema_params: Any
+
+
 class TeacherActorCritic(nn.Module):
     num_actions: int
     obs_dim: int
@@ -757,25 +766,35 @@ class TeacherActorCritic(nn.Module):
     def __call__(self, x):
         act = nn.relu if self.activation == "relu" else nn.tanh
         if self.use_encoders:
-            obs = x[..., :self.obs_dim]
-            competence = x[..., self.obs_dim:self.obs_dim+self.competence_dim]
-            student_action = x[..., self.obs_dim+self.competence_dim:self.obs_dim+self.competence_dim+self.student_action_dim]
-            obs = nn.Dense(
-                            32,
-                            kernel_init=orthogonal(np.sqrt(2)),
-                            bias_init=constant(0.0),
-                        )(obs)
-            competence = nn.Dense(
-                            32,
-                            kernel_init=orthogonal(np.sqrt(2)),
-                            bias_init=constant(0.0),
-                        )(competence)
-            student_action = nn.Dense(
-                        32,
-                        kernel_init=orthogonal(np.sqrt(2)),
-                        bias_init=constant(0.0),
-                    )(student_action)
-            x = jnp.concatenate([obs, competence, student_action], axis=-1)
+            encoded = []
+            offset = 0
+            if self.obs_dim > 0:
+                obs = x[..., offset : offset + self.obs_dim]
+                offset += self.obs_dim
+                obs = nn.Dense(
+                    32,
+                    kernel_init=orthogonal(np.sqrt(2)),
+                    bias_init=constant(0.0),
+                )(obs)
+                encoded.append(obs)
+            if self.competence_dim > 0:
+                competence = x[..., offset : offset + self.competence_dim]
+                offset += self.competence_dim
+                competence = nn.Dense(
+                    32,
+                    kernel_init=orthogonal(np.sqrt(2)),
+                    bias_init=constant(0.0),
+                )(competence)
+                encoded.append(competence)
+            if self.student_action_dim > 0:
+                student_action = x[..., offset : offset + self.student_action_dim]
+                student_action = nn.Dense(
+                    32,
+                    kernel_init=orthogonal(np.sqrt(2)),
+                    bias_init=constant(0.0),
+                )(student_action)
+                encoded.append(student_action)
+            x = jnp.concatenate(encoded, axis=-1) if encoded else x
         else:
             x = x
         actor_mean = act(
@@ -1069,6 +1088,29 @@ def reset_teacher_rollout_buffer(buffer):
     )
 
 
+def extract_obs_norm_stats(env_state, expected_obs_dim):
+    """Find observation normalization stats in nested wrapped env state.
+
+    Returns ``(mean, var, count)``. ``mean`` / ``var`` are flattened to shape
+    ``(expected_obs_dim,)`` when present; ``count`` may be ``None``.
+    """
+    current = env_state
+    while True:
+        if hasattr(current, "mean") and hasattr(current, "var"):
+            mean = current.mean
+            if jnp.ndim(mean) > 0 and mean.shape[-1] == expected_obs_dim:
+                count = getattr(current, "count", None)
+                if mean.ndim > 1:
+                    flat_mean = mean.reshape((-1, expected_obs_dim))
+                    flat_var = current.var.reshape((-1, expected_obs_dim))
+                    return flat_mean[0], flat_var[0], count
+                return mean, current.var, count
+        if not hasattr(current, "env_state"):
+            break
+        current = current.env_state
+    return None, None, None
+
+
 def save_checkpoint(train_state, checkpoint_dir):
     """Save a Flax TrainState."""
     checkpointer = ocp.StandardCheckpointer()
@@ -1109,6 +1151,59 @@ def load_agent_positions(save_dir: str, index: int):
         agent_xy = data["agent_xy"].copy()
         update_idx = int(data["update_idx"]) if "update_idx" in data else int(index)
     return {"agent_xy": agent_xy, "update_idx": update_idx}
+
+
+def make_teacher_goal_set(config):
+    from envs.ant_maze import all_possible_goals, get_maze_xy_bounds
+    from envs.ant_maze import  U_MAZE, BIG_MAZE, BIG_MAZE_ALL_GOALS, U_MAZE_ALL_STATES
+    # import pdb;pdb.set_trace()
+    if "u_maze" in config["ENV_NAME"]:
+        maze_layout = U_MAZE
+        all_goals_layout = U_MAZE_ALL_STATES
+    elif "big_maze" in config["ENV_NAME"]:
+        maze_layout = BIG_MAZE
+        all_goals_layout = BIG_MAZE_ALL_GOALS
+    else:
+        raise ValueError(f"Unknown maze layout: {config['ENV_NAME']}")
+    min_x, max_x, min_y, max_y = get_maze_xy_bounds(maze_layout)
+    # import pdb;pdb.set_trace()
+    env_name = config["ENV_NAME"]
+    teacher_num_goal_points = int(config["TEACHER_NUM_GOAL_POINTS"])
+    xs = jnp.linspace(
+        min_x,
+        max_x,
+        teacher_num_goal_points,
+    )
+    ys = jnp.linspace(
+        min_y,
+        max_y,
+        teacher_num_goal_points,
+    )
+    if "ant" in env_name:
+        gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
+        goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
+        custom_goal = jnp.array([12.0, 8.0])
+        replace_idx = jnp.argmin(jnp.sum((goal_grid - custom_goal) ** 2, axis=-1))
+        goal_grid = goal_grid.at[replace_idx].set(custom_goal)
+        num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
+        all_goals = all_possible_goals(all_goals_layout)
+        num_competence = int(all_goals.shape[0])
+        # import pdb;pdb.set_trace()
+    elif "humanoid" in env_name:
+        gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
+        goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
+        custom_goal = jnp.array([12.0, 8.0])
+        replace_idx = jnp.argmin(jnp.sum((goal_grid - custom_goal) ** 2, axis=-1))
+        goal_grid = goal_grid.at[replace_idx].set(custom_goal)
+        num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
+        all_goals = all_possible_goals(all_goals_layout)
+    return (
+        goal_grid,
+        teacher_num_goal_points,
+        num_teacher_goals,
+        all_goals,
+        num_competence,
+    )
 
 
 def make_train(config):
@@ -1256,41 +1351,45 @@ def make_train(config):
     )
     base_obs_dim = int(env.observation_space(env_params).shape[0])
     action_dim = int(env.action_space(env_params).shape[0])
-    teacher_num_goal_points = int(config["TEACHER_NUM_GOAL_POINTS"])
-    xs = jnp.linspace(
-        config["TEACHER_GOAL_X_MIN"],
-        config["TEACHER_GOAL_X_MAX"],
+    (
+        goal_grid,
         teacher_num_goal_points,
+        num_teacher_goals,
+        all_goals,
+        num_competence,
+    ) = make_teacher_goal_set(config)
+    condition_teacher_only_on_competence = bool(
+        config.get("TEACHER_CONDITION_ONLY_ON_COMPETENCE", False)
     )
-    ys = jnp.linspace(
-        config["TEACHER_GOAL_Y_MIN"],
-        config["TEACHER_GOAL_Y_MAX"],
-        teacher_num_goal_points,
-    )
-    gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
-    goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
-    custom_goal = jnp.array([12.0, 8.0])
-    replace_idx = jnp.argmin(jnp.sum((goal_grid - custom_goal) ** 2, axis=-1))
-    goal_grid = goal_grid.at[replace_idx].set(custom_goal)
-    num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
-    all_goals = all_possible_goals()
-    num_competence = int(all_goals.shape[0])
-    condition_teacher_on_competence = config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
+    condition_teacher_on_competence = bool(
+        config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
+    ) or condition_teacher_only_on_competence
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     update_competence = (
         condition_teacher_on_competence or use_average_competence_reward
     )
-    teacher_obs_dim = (
-        base_obs_dim
-        + (num_competence if condition_teacher_on_competence else 0)
-        + action_dim
-    )
+    if condition_teacher_only_on_competence:
+        teacher_obs_dim = num_competence
+        teacher_net_obs_dim = 0
+        teacher_net_competence_dim = num_competence
+        teacher_net_action_dim = 0
+    else:
+        teacher_obs_dim = (
+            base_obs_dim
+            + (num_competence if condition_teacher_on_competence else 0)
+            + action_dim
+        )
+        teacher_net_obs_dim = base_obs_dim
+        teacher_net_competence_dim = (
+            num_competence if condition_teacher_on_competence else 0
+        )
+        teacher_net_action_dim = action_dim
     teacher_network = TeacherActorCritic(
         num_actions=teacher_num_goal_points * teacher_num_goal_points,
-        obs_dim=base_obs_dim,
-        competence_dim=num_competence if condition_teacher_on_competence else 0,
-        student_action_dim=action_dim,
+        obs_dim=teacher_net_obs_dim,
+        competence_dim=teacher_net_competence_dim,
+        student_action_dim=teacher_net_action_dim,
         activation=config["TEACHER_ACTIVATION"],
         hidden_dim=config["TEACHER_HIDDEN_DIM"],
         use_encoders=config["TEACHER_USE_ENCODERS"],
@@ -1298,19 +1397,8 @@ def make_train(config):
 
     def _extract_obs_norm_stats(env_state, expected_obs_dim):
         """Find observation normalization stats in nested wrapped env state."""
-        current = env_state
-        while hasattr(current, "env_state"):
-            if hasattr(current, "mean") and hasattr(current, "var"):
-                mean = current.mean
-                # Only keep stats whose trailing dim matches observation dim.
-                if jnp.ndim(mean) > 0 and mean.shape[-1] == expected_obs_dim:
-                    if mean.ndim > 1:
-                        flat_mean = mean.reshape((-1, expected_obs_dim))
-                        flat_var = current.var.reshape((-1, expected_obs_dim))
-                        return flat_mean[0], flat_var[0]
-                    return mean, current.var
-            current = current.env_state
-        return None, None
+        mean, var, _count = extract_obs_norm_stats(env_state, expected_obs_dim)
+        return mean, var
 
     def _normalize_eval_obs(obs, obs_mean, obs_var):
         if obs_mean is None or obs_var is None:
@@ -1320,6 +1408,17 @@ def make_train(config):
         return (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
 
     def _build_teacher_input(obs, competence_vector, action):
+        if condition_teacher_only_on_competence:
+            if obs.ndim == 1:
+                batch_size = 1
+            else:
+                batch_size = obs.shape[0]
+            competence_vector = jnp.asarray(competence_vector)
+            if competence_vector.ndim == 1:
+                competence_vector = jnp.broadcast_to(
+                    competence_vector, (batch_size, competence_vector.shape[0])
+                )
+            return competence_vector
         if obs.ndim == 1:
             obs = obs[None, :]
         if action.ndim == 1:
@@ -1744,10 +1843,11 @@ def make_train(config):
                 optax.clip_by_global_norm(config["TEACHER_MAX_GRAD_NORM"]),
                 optax.adam(config["TEACHER_LR"], eps=1e-5),
             )
-        teacher_train_state = TrainState.create(
+        teacher_train_state = TeacherTrainState.create(
             apply_fn=teacher_network.apply,
             params=teacher_init_params,
             tx=teacher_tx,
+            ema_params=teacher_init_params,
         )
 
         def sample_teacher_goals(obs, competence_vector, action, rng):
@@ -2605,6 +2705,26 @@ def make_train(config):
             teacher_entropy = teacher_metrics[3]
             teacher_did_update = teacher_metrics[4]
             teacher_update_batch_size = teacher_metrics[5]
+            teacher_ema_coeff = float(config.get("TEACHER_EMA_COEFF", 0.99))
+
+            def _update_teacher_ema(operands):
+                t_state = operands
+                new_ema = jax.tree_util.tree_map(
+                    lambda e, p: teacher_ema_coeff * e + (1.0 - teacher_ema_coeff) * p,
+                    t_state.ema_params,
+                    t_state.params,
+                )
+                return t_state.replace(ema_params=new_ema)
+
+            def _keep_teacher_ema(operands):
+                return operands
+
+            teacher_train_state = jax.lax.cond(
+                teacher_did_update > 0.0,
+                _update_teacher_ema,
+                _keep_teacher_ema,
+                teacher_train_state,
+            )
             teacher_current_lr = (
                 teacher_lr_schedule(
                     update_idx
@@ -3296,16 +3416,61 @@ def main():
                 step=int(config["TOTAL_TIMESTEPS"]),
             )
     if config["SAVE_MODEL"]:
-        scratch = os.environ.get("SCRATCH")   
-        random_name = RandomWord().word()
-        random_id = np.random.randint(1000000)
-        while os.path.exists(os.path.join(scratch, "purejaxrl", "checkpoints", random_name + f"_{random_id}")):
-            random_name = RandomWord().word()
-            random_id = np.random.randint(1000000)
-        model_save_path =os.path.join(scratch, "purejaxrl", "checkpoints", random_name + f"_{random_id}")
-        os.makedirs(model_save_path, exist_ok=False)
-        save_checkpoint(final_train_state, model_save_path)
-        # load_checkpoint(final_train_state, model_save_path)
+        checkpoint_root = os.path.join(exp_dir, config.get("checkpoint_dir", "checkpoints"))
+        student_ckpt_dir = os.path.join(checkpoint_root, "student")
+        teacher_ckpt_dir = os.path.join(checkpoint_root, "teacher")
+        teacher_ema_ckpt_dir = os.path.join(checkpoint_root, "teacher_ema")
+        os.makedirs(student_ckpt_dir, exist_ok=True)
+        os.makedirs(teacher_ckpt_dir, exist_ok=True)
+        os.makedirs(teacher_ema_ckpt_dir, exist_ok=True)
+        config_path = os.path.join(exp_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        save_checkpoint(final_train_state, student_ckpt_dir)
+        # Save plain TrainState (no ema_params) for backward-compatible loading.
+        teacher_ckpt_state = TrainState(
+            step=_final_teacher_train_state.step,
+            apply_fn=_final_teacher_train_state.apply_fn,
+            params=_final_teacher_train_state.params,
+            tx=_final_teacher_train_state.tx,
+            opt_state=_final_teacher_train_state.opt_state,
+        )
+        teacher_ema_ckpt_state = TrainState(
+            step=_final_teacher_train_state.step,
+            apply_fn=_final_teacher_train_state.apply_fn,
+            params=_final_teacher_train_state.ema_params,
+            tx=_final_teacher_train_state.tx,
+            opt_state=_final_teacher_train_state.opt_state,
+        )
+        save_checkpoint(teacher_ckpt_state, teacher_ckpt_dir)
+        save_checkpoint(teacher_ema_ckpt_state, teacher_ema_ckpt_dir)
+        print(f"[checkpoint] saved student model to {student_ckpt_dir}")
+        print(f"[checkpoint] saved teacher model to {teacher_ckpt_dir}")
+        print(f"[checkpoint] saved teacher EMA model to {teacher_ema_ckpt_dir}")
+        print(f"[checkpoint] saved config to {config_path}")
+        if config.get("NORMALIZE_ENV", False):
+            # Observation dim is the trailing dim of the running mean in env_state.
+            expected_obs_dim = None
+            current = final_env_state
+            while current is not None:
+                if hasattr(current, "mean") and jnp.ndim(current.mean) > 0:
+                    expected_obs_dim = int(current.mean.shape[-1])
+                    break
+                current = getattr(current, "env_state", None)
+            if expected_obs_dim is not None:
+                obs_mean, obs_var, obs_count = extract_obs_norm_stats(
+                    final_env_state, expected_obs_dim
+                )
+                if obs_mean is not None and obs_var is not None:
+                    stats_path = os.path.join(checkpoint_root, "obs_norm_stats.npz")
+                    save_kwargs = {
+                        "mean": np.asarray(jax.device_get(obs_mean)),
+                        "var": np.asarray(jax.device_get(obs_var)),
+                    }
+                    if obs_count is not None:
+                        save_kwargs["count"] = np.asarray(jax.device_get(obs_count))
+                    np.savez(stats_path, **save_kwargs)
+                    print(f"[checkpoint] saved obs norm stats to {stats_path}")
     # render_eval_episode(
     #     final_train_state.params,
     #     teacher_params,
