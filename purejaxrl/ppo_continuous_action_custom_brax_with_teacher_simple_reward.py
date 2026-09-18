@@ -160,13 +160,19 @@ def _success_metric(wrapped_state):
 def _normalize_xy(goal, mean, var):
     mean_xy = mean[..., :2]
     var_xy = var[..., :2]
-    return (goal - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+    xy = (goal[..., :2] - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+    if goal.shape[-1] > 2:
+        return jnp.concatenate([xy, goal[..., 2:]], axis=-1)
+    return xy
 
 
 def _denorm_xy(xy, mean, var):
     mean_xy = mean[..., :2]
     var_xy = var[..., :2]
-    return xy * jnp.sqrt(var_xy + 1e-8) + mean_xy
+    denorm_xy = xy[..., :2] * jnp.sqrt(var_xy + 1e-8) + mean_xy
+    if xy.shape[-1] > 2:
+        return jnp.concatenate([denorm_xy, xy[..., 2:]], axis=-1)
+    return denorm_xy
 
 
 def _agent_world_xy(obsv, env_state, env_index, *, normalize_env, base_obs_dim):
@@ -334,12 +340,12 @@ def evaluate_multiple_goals(
             obsv, env_state, reward, done, info = env.step(
                 step_rngs, env_state, action, env_params
             )
-            current_xy = env_state.org_obs[..., :2]
+            current_pos = env_state.org_obs[..., : raw_goal_batch.shape[-1]]
             if config["USE_MAX_IN_LP_REWARD"]:
                 # print("Using max in LP reward")
-                dist_success = jnp.linalg.norm(current_xy - raw_goal_batch, axis=-1)
+                dist_success = jnp.linalg.norm(current_pos - raw_goal_batch, axis=-1)
             else:
-                dist_success = jnp.linalg.norm(current_xy - raw_goal_batch)
+                dist_success = jnp.linalg.norm(current_pos - raw_goal_batch)
             # import pdb; pdb.set_trace()
             success = (
                 dist_success
@@ -376,7 +382,8 @@ def evaluate_student_env_goal(
 ):
     """Evaluate student on env goals (no teacher sampling).
 
-    Conditions the policy on each env's own maze goal from ``org_obs[..., -2:]``.
+    Conditions the policy on each env's own maze goal from
+    ``org_obs[..., -goal_dim:]`` (2D for ant, 3D for humanoid).
     Returns ``(success_rate, episodic_return)`` averaged over ``num_envs``.
     """
     env_params = None
@@ -405,7 +412,8 @@ def evaluate_student_env_goal(
         obsv = brax_state.obs
 
     # Teacher/conditioning goal equals the environment goal (no teacher sampling).
-    env_goals = org_obs[..., -2:]
+    env_goal_dim = int(getattr(brax_env, "goal_indices", jnp.array([0, 1])).shape[0])
+    env_goals = org_obs[..., -env_goal_dim:]
     # jax.debug.print("env_goals is {x}", x=env_goals)
     if condition_on_goal:
         if normalize_obs:
@@ -974,11 +982,11 @@ class TeacherFlatBatch(NamedTuple):
     log_prob: jnp.ndarray
 
 
-def init_teacher_episode_carry(num_envs, teacher_obs_dim, dtype):
+def init_teacher_episode_carry(num_envs, teacher_obs_dim, goal_dim, dtype):
     return TeacherEpisodeCarry(
         teacher_obs=jnp.zeros((num_envs, teacher_obs_dim), dtype=dtype),
         goal_idx=jnp.zeros((num_envs,), dtype=jnp.int32),
-        raw_goal=jnp.zeros((num_envs, 2), dtype=dtype),
+        raw_goal=jnp.zeros((num_envs, goal_dim), dtype=dtype),
         log_prob=jnp.zeros((num_envs,), dtype=dtype),
         value=jnp.zeros((num_envs,), dtype=dtype),
     )
@@ -994,11 +1002,11 @@ def teacher_carry_from_act(raw_goal, goal_idx, log_prob, value, teacher_obs):
     )
 
 
-def init_teacher_rollout_buffer(buffer_size, num_envs, teacher_obs_dim, dtype):
+def init_teacher_rollout_buffer(buffer_size, num_envs, teacher_obs_dim, goal_dim, dtype):
     return TeacherRolloutBuffer(
         teacher_obs=jnp.zeros((buffer_size, num_envs, teacher_obs_dim), dtype=dtype),
         goal_idx=jnp.zeros((buffer_size, num_envs), dtype=jnp.int32),
-        raw_goal=jnp.zeros((buffer_size, num_envs, 2), dtype=dtype),
+        raw_goal=jnp.zeros((buffer_size, num_envs, goal_dim), dtype=dtype),
         log_prob=jnp.zeros((buffer_size, num_envs), dtype=dtype),
         value=jnp.zeros((buffer_size, num_envs), dtype=dtype),
         reward=jnp.zeros((buffer_size, num_envs), dtype=dtype),
@@ -1154,32 +1162,24 @@ def load_agent_positions(save_dir: str, index: int):
 
 
 def make_teacher_goal_set(config):
-    from envs.ant_maze import all_possible_goals, get_maze_xy_bounds
-    from envs.ant_maze import  U_MAZE, BIG_MAZE, BIG_MAZE_ALL_GOALS, U_MAZE_ALL_STATES
-    # import pdb;pdb.set_trace()
-    if "u_maze" in config["ENV_NAME"]:
-        maze_layout = U_MAZE
-        all_goals_layout = U_MAZE_ALL_STATES
-    elif "big_maze" in config["ENV_NAME"]:
-        maze_layout = BIG_MAZE
-        all_goals_layout = BIG_MAZE_ALL_GOALS
-    else:
-        raise ValueError(f"Unknown maze layout: {config['ENV_NAME']}")
-    min_x, max_x, min_y, max_y = get_maze_xy_bounds(maze_layout)
-    # import pdb;pdb.set_trace()
     env_name = config["ENV_NAME"]
     teacher_num_goal_points = int(config["TEACHER_NUM_GOAL_POINTS"])
-    xs = jnp.linspace(
-        min_x,
-        max_x,
-        teacher_num_goal_points,
-    )
-    ys = jnp.linspace(
-        min_y,
-        max_y,
-        teacher_num_goal_points,
-    )
+
     if "ant" in env_name:
+        from envs.ant_maze import all_possible_goals, get_maze_xy_bounds
+        from envs.ant_maze import U_MAZE, BIG_MAZE, BIG_MAZE_ALL_GOALS, U_MAZE_ALL_STATES
+
+        if "u_maze" in env_name:
+            maze_layout = U_MAZE
+            all_goals_layout = U_MAZE_ALL_STATES
+        elif "big_maze" in env_name:
+            maze_layout = BIG_MAZE
+            all_goals_layout = BIG_MAZE_ALL_GOALS
+        else:
+            raise ValueError(f"Unknown maze layout: {env_name}")
+        min_x, max_x, min_y, max_y = get_maze_xy_bounds(maze_layout)
+        xs = jnp.linspace(min_x, max_x, teacher_num_goal_points)
+        ys = jnp.linspace(min_y, max_y, teacher_num_goal_points)
         gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
         goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
         custom_goal = jnp.array([12.0, 8.0])
@@ -1188,15 +1188,42 @@ def make_teacher_goal_set(config):
         num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
         all_goals = all_possible_goals(all_goals_layout)
         num_competence = int(all_goals.shape[0])
-        # import pdb;pdb.set_trace()
     elif "humanoid" in env_name:
+        from envs.humanoid_maze import (
+            TARGET_Z_COORD,
+            all_possible_goals,
+            get_maze_xy_bounds,
+            U_MAZE,
+            BIG_MAZE,
+            BIG_MAZE_ALL_GOALS,
+            U_MAZE_ALL_STATES,
+        )
+
+        if "u_maze" in env_name:
+            maze_layout = U_MAZE
+            all_goals_layout = U_MAZE_ALL_STATES
+        elif "big_maze" in env_name:
+            maze_layout = BIG_MAZE
+            all_goals_layout = BIG_MAZE_ALL_GOALS
+        else:
+            raise ValueError(f"Unknown maze layout: {env_name}")
+        min_x, max_x, min_y, max_y = get_maze_xy_bounds(
+            maze_layout, size_scaling=2.0
+        )
+        xs = jnp.linspace(min_x, max_x, teacher_num_goal_points)
+        ys = jnp.linspace(min_y, max_y, teacher_num_goal_points)
         gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
-        goal_grid = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
-        custom_goal = jnp.array([12.0, 8.0])
+        zs = jnp.full(gx.size, TARGET_Z_COORD)
+        goal_grid = jnp.stack([gx.ravel(), gy.ravel(), zs], axis=-1)
+        custom_goal = jnp.array([6.0, 4.0, TARGET_Z_COORD])
         replace_idx = jnp.argmin(jnp.sum((goal_grid - custom_goal) ** 2, axis=-1))
         goal_grid = goal_grid.at[replace_idx].set(custom_goal)
         num_teacher_goals = teacher_num_goal_points * teacher_num_goal_points
-        all_goals = all_possible_goals(all_goals_layout)
+        all_goals = all_possible_goals(all_goals_layout, size_scaling=2.0)
+        num_competence = int(all_goals.shape[0])
+    else:
+        raise ValueError(f"Unknown env for teacher goal set: {env_name}")
+
     return (
         goal_grid,
         teacher_num_goal_points,
@@ -1358,6 +1385,7 @@ def make_train(config):
         all_goals,
         num_competence,
     ) = make_teacher_goal_set(config)
+    goal_dim = int(goal_grid.shape[-1])
     condition_teacher_only_on_competence = bool(
         config.get("TEACHER_CONDITION_ONLY_ON_COMPETENCE", False)
     )
@@ -1490,7 +1518,7 @@ def make_train(config):
         policy_obs = base_obs
         if condition_on_goal:
             policy_obs = jnp.concatenate(
-                [base_obs, jnp.zeros((2,), dtype=base_obs.dtype)], axis=-1
+                [base_obs, jnp.zeros((goal_dim,), dtype=base_obs.dtype)], axis=-1
             )
         pi, _ = network.apply(student_params, policy_obs)
         return pi.sample(seed=rng)
@@ -1500,8 +1528,8 @@ def make_train(config):
     ):
         rng, reset_rng = jax.random.split(rng)
         state = base_env.reset(reset_rng)
-        raw_goal = jnp.zeros((2,), dtype=jnp.float32)
-        policy_goal = jnp.zeros((2,), dtype=jnp.float32)
+        raw_goal = jnp.zeros((goal_dim,), dtype=jnp.float32)
+        policy_goal = jnp.zeros((goal_dim,), dtype=jnp.float32)
         if condition_on_goal:
             rng, action_rng, teacher_rng = jax.random.split(rng, 3)
             norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
@@ -1810,7 +1838,6 @@ def make_train(config):
         # INIT NETWORK
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
-        goal_dim = 2
         if condition_on_goal:
             init_x = jnp.concatenate([init_x, jnp.zeros((goal_dim, ))], axis=-1)
         network_params = network.init(_rng, init_x)
@@ -1961,14 +1988,13 @@ def make_train(config):
             teacher_rollout_buffer_size,
             config["NUM_ENVS"],
             teacher_obs_dim,
+            goal_dim,
             obsv.dtype,
         )
         goals = raw_goals
         if condition_on_goal:
             if config["NORMALIZE_ENV"]:
-                mean_xy = env_state.mean[..., :2]
-                var_xy = env_state.var[..., :2]
-                goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+                goals = _normalize_xy(raw_goals, env_state.mean, env_state.var)
             obsv = jnp.concatenate([obsv, goals], axis=-1)
 
         goal_competence_table = jnp.zeros(
@@ -2203,10 +2229,12 @@ def make_train(config):
                 if add_goal_reward or use_learning_progress_reward:
                     if config["NORMALIZE_ENV"]:
                         dist = jnp.linalg.norm(
-                            env_state.org_obs[..., :2] - raw_goals, axis=-1
+                            env_state.org_obs[..., :goal_dim] - raw_goals, axis=-1
                         )
                     else:
-                        dist = jnp.linalg.norm(obsv[..., :2] - raw_goals, axis=-1)
+                        dist = jnp.linalg.norm(
+                            obsv[..., :goal_dim] - raw_goals, axis=-1
+                        )
                     teacher_goal_reach = (
                         dist <= goal_reach_epsilon
                     ).astype(task_reward.dtype)
@@ -2323,9 +2351,7 @@ def make_train(config):
                 # )
                 def normalize_goals(raw_goals, env_state):
                     if config["NORMALIZE_ENV"]:
-                        mean_xy = env_state.mean[..., :2]
-                        var_xy = env_state.var[..., :2]
-                        return (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+                        return _normalize_xy(raw_goals, env_state.mean, env_state.var)
                     else:
                         return raw_goals
                 goals = normalize_goals(raw_goals, env_state)

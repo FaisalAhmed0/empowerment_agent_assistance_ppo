@@ -26,11 +26,19 @@ U_MAZE = [
     [1, 1, 1, 1, 1],
 ]
 
+U_MAZE_ALL_STATES = [
+    [1, 1, 1, 1, 1],
+    [1, G, G, G, 1],
+    [1, 1, 1, G, 1],
+    [1, G, G, G, 1],
+    [1, 1, 1, 1, 1],
+]
+
 U_MAZE_SINGLE_GOAL = [
     [1, 1, 1, 1, 1],
     [1, R, 0, 0, 1],
     [1, 1, 1, 0, 1],
-    [1, G, 0, 0, 1],
+    [1, G, G, 0, 1],
     [1, 1, 1, 1, 1],
 ]
 
@@ -45,6 +53,17 @@ U_MAZE_EVAL = [
 BIG_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1],
     [1, R, G, 1, 1, G, G, 1],
+    [1, G, G, 1, G, G, G, 1],
+    [1, 1, G, G, G, 1, 1, 1],
+    [1, G, G, 1, G, G, G, 1],
+    [1, G, 1, G, G, 1, G, 1],
+    [1, G, G, G, 1, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIG_MAZE_ALL_GOALS = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, G, G, 1, 1, G, G, 1],
     [1, G, G, 1, G, G, G, 1],
     [1, 1, G, G, G, 1, 1, 1],
     [1, G, G, 1, G, G, G, 1],
@@ -97,6 +116,28 @@ def find_goals(structure, size_scaling):
                 goals.append([i * size_scaling, j * size_scaling])
 
     return jnp.array(goals)
+
+
+def all_possible_goals(structure=U_MAZE_ALL_STATES, size_scaling=2.0):
+    """Return layout goals as 3D positions with fixed target height."""
+    possible_goals = find_goals(structure, size_scaling)
+    z = jnp.full((possible_goals.shape[0], 1), TARGET_Z_COORD)
+    return jnp.concatenate([possible_goals, z], axis=-1)
+
+
+def get_maze_xy_bounds(structure, size_scaling=2.0):
+    """Return (min_x, max_x, min_y, max_y) over free-cell centers.
+
+    Free cells are non-wall entries (0, RESET, GOAL). Coordinates use the
+    same mapping as find_starts/find_goals: (i * s, j * s).
+    """
+    xs, ys = [], []
+    for i in range(len(structure)):
+        for j in range(len(structure[0])):
+            if structure[i][j] != 1:
+                xs.append(i * size_scaling)
+                ys.append(j * size_scaling)
+    return float(min(xs)), float(max(xs)), float(min(ys)), float(max(ys))
 
 
 # Create a xml with maze and a list of possible goal positions
@@ -170,6 +211,7 @@ class HumanoidMaze(PipelineEnv):
         backend="generalized",
         maze_layout_name="u_maze",
         maze_size_scaling=2.0,  # Was 4.0 for antmaze -- just trying to make it tractable
+        dense_reward: bool = False,
         **kwargs,
     ):
         xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
@@ -177,6 +219,7 @@ class HumanoidMaze(PipelineEnv):
         self.possible_starts = possible_starts
         self.possible_goals = possible_goals
         self.maze_layout_name = maze_layout_name
+        self.dense_reward = dense_reward
 
 
         if "u_maze" in self.maze_layout_name:
@@ -311,7 +354,10 @@ class HumanoidMaze(PipelineEnv):
         distance_to_target = jnp.linalg.norm(obs[:3] - obs[-3:])
 
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
-        reward = -distance_to_target + healthy_reward - ctrl_cost
+        if self.dense_reward:
+            reward = -distance_to_target + healthy_reward - ctrl_cost
+        else:
+            reward = jnp.array(distance_to_target < 0.5, dtype=float)
         success = jnp.array(distance_to_target < 0.5, dtype=float)
         success_easy = jnp.array(distance_to_target < 2.0, dtype=float)
         state.metrics.update(
