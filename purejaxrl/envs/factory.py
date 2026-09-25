@@ -111,7 +111,11 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
                 )
         elif "humanoid" in env_name:
             # Possible env_name = {'humanoid_u_maze', 'humanoid_big_maze', 'humanoid_hardest_maze'}
-            env = HumanoidMaze(backend=backend or "spring", maze_layout_name=env_name[9:])
+            env = HumanoidMaze(
+                backend=backend or "spring",
+                maze_layout_name=env_name[9:],
+                **_filter_supported_kwargs(HumanoidMaze, kwargs),
+            )
         else:
             # Possible env_name = {'simple_u_maze', 'simple_big_maze', 'simple_hardest_maze'}
             env = SimpleMaze(backend=backend or "spring", maze_layout_name=env_name[7:])
@@ -149,5 +153,5 @@ def make_custom_env(
     backend: str | None = None,
     env_kwargs: dict[str, Any] | None = None,
 ):
-    env = create_env(env_name, backend, **env_kwargs)
+    env = create_env(env_name, backend, **(env_kwargs or {}))
     return env

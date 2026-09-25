@@ -319,7 +319,7 @@ def evaluate_multiple_goals(
             )
 
         def step_fn(carry, _):
-            obsv, env_state, rng = carry
+            obsv, env_state, rng, ever_done = carry
             rng, step_rng, action_rng = jax.random.split(rng, 3)
             step_rngs = jax.random.split(step_rng, num_envs_per_goal)
             if condition_on_goal:
@@ -332,27 +332,26 @@ def evaluate_multiple_goals(
                 step_rngs, env_state, action, env_params
             )
             current_xy = env_state.org_obs[..., :2]
-            if config["USE_MAX_IN_LP_REWARD"]:
-                # print("Using max in LP reward")
-                dist_success = jnp.linalg.norm(current_xy - raw_goal_batch, axis=-1)
+            dist = jnp.linalg.norm(current_xy - raw_goal_batch, axis=-1)
+            active = 1.0 - ever_done
+            # Ignore post-auto-reset steps after the first episode done.
+            if use_distance_in_competence:
+                success = jnp.where(active > 0, dist, jnp.inf)
             else:
-                dist_success = jnp.linalg.norm(current_xy - raw_goal_batch)
-            # import pdb; pdb.set_trace()
-            success = (
-                dist_success
-                if use_distance_in_competence
-                else dist_success <= 0.5
-            )
-            return (obsv, env_state, rng), success
+                success = (dist <= 0.5).astype(dist.dtype) * active
+            ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
+            return (obsv, env_state, rng, ever_done), success
 
+        init_ever_done = jnp.zeros((num_envs_per_goal,), dtype=obsv.dtype)
         _, successes = jax.lax.scan(
-            step_fn, (obsv, env_state, rng), None, length=max_steps
+            step_fn,
+            (obsv, env_state, rng, init_ever_done),
+            None,
+            length=max_steps,
         )
-        if config["USE_MAX_IN_LP_REWARD"]:
-            # print("Using max in LP reward")
-            return successes.max(axis=0).mean()
-        else:
-            return successes.mean(axis=0).mean()
+        if use_distance_in_competence:
+            return successes.min(axis=0).mean()
+        return successes.max(axis=0).mean()
 
     vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
     goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])

@@ -6,11 +6,17 @@ Expected layout (created when training with --SAVE_MODEL):
     checkpoints/
       teacher/       # Orbax StandardCheckpointer of teacher TrainState
       teacher_ema/   # EMA teacher params (same TrainState layout)
-      student/       # (not loaded by this script unless requested)
+      teacher_avg/   # Uniform-average teacher params (same TrainState layout)
+      teacher_max_log_sum_competence/  # teacher at max log(sum(competence))
+      student/       # final student TrainState
+      student_max_log_sum_competence/  # student paired with max-log-sum teacher
+      obs_norm_stats.npz  # written with max-log-sum saves and at end of run
 
 Example:
   python purejaxrl/load_teacher_model.py --exp_dir $SCRATCH/purejaxrl_simple_teachers/<name>_<id>
   python purejaxrl/load_teacher_model.py --exp_dir $SCRATCH/purejaxrl_simple_teachers/<name>_<id> --use_ema
+  python purejaxrl/load_teacher_model.py --exp_dir $SCRATCH/purejaxrl_simple_teachers/<name>_<id> --use_avg
+  python purejaxrl/load_teacher_model.py --exp_dir $SCRATCH/purejaxrl_simple_teachers/<name>_<id> --use_max_log_sum_competence
 """
 
 from __future__ import annotations
@@ -52,6 +58,11 @@ except ImportError:
         load_checkpoint,
     )
 
+try:
+    from purejaxrl.conditional_teacher_models import ConditionalTeacherActorCritic
+except ImportError:
+    from conditional_teacher_models import ConditionalTeacherActorCritic
+
 
 @dataclass
 class LoadTeacherConfig:
@@ -59,6 +70,26 @@ class LoadTeacherConfig:
     checkpoint_dir: str = "checkpoints"
     seed: int = 30
     use_ema: bool = False
+    use_avg: bool = False
+    use_max_log_sum_competence: bool = False
+
+
+def _teacher_checkpoint_subdir(
+    use_ema: bool = False,
+    use_avg: bool = False,
+    use_max_log_sum_competence: bool = False,
+) -> str:
+    """Select teacher Orbax subdir.
+
+    Precedence: max-log-sum competence > avg > EMA > teacher.
+    """
+    if use_max_log_sum_competence:
+        return "teacher_max_log_sum_competence"
+    if use_avg:
+        return "teacher_avg"
+    if use_ema:
+        return "teacher_ema"
+    return "teacher"
 
 
 def _load_config(exp_dir: str) -> dict[str, Any]:
@@ -123,13 +154,18 @@ def _teacher_obs_dim(config: dict[str, Any], base_obs_dim: int, action_dim: int)
     condition_teacher_on_competence = bool(
         config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
     ) or only_competence
+    condition_teacher_on_action = bool(
+        config.get("CONDITION_TEACHER_ON_ACTION", True)
+    )
+    teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", False))
     num_competence = int(all_possible_goals().shape[0])
     if only_competence:
         return num_competence
+    state_obs_dim = 2 if teacher_obs_goal_only else base_obs_dim
     return (
-        base_obs_dim
+        state_obs_dim
         + (num_competence if condition_teacher_on_competence else 0)
-        + action_dim
+        + (action_dim if condition_teacher_on_action else 0)
     )
 
 
@@ -161,25 +197,44 @@ def _build_student_tx(config: dict[str, Any]):
     else:
         lr_schedule = linear_schedule
 
-    if config.get("ANNEAL_LR", True):
-        return optax.chain(
-            optax.clip_by_global_norm(config.get("MAX_GRAD_NORM", 0.5)),
-            optax.adam(learning_rate=lr_schedule, eps=1e-5),
+    agent_lr = lr_schedule if config.get("ANNEAL_LR", True) else config["LR"]
+    if config.get("USE_ADAMW", False):
+        agent_opt = optax.adamw(
+            learning_rate=agent_lr,
+            eps=1e-5,
+            weight_decay=config.get("WEIGHT_DECAY", 1e-4),
         )
+    else:
+        agent_opt = optax.adam(learning_rate=agent_lr, eps=1e-5)
     return optax.chain(
         optax.clip_by_global_norm(config.get("MAX_GRAD_NORM", 0.5)),
-        optax.adam(config["LR"], eps=1e-5),
+        agent_opt,
     )
+
+
+def _student_checkpoint_subdir(use_max_log_sum_competence: bool = False) -> str:
+    """Select student Orbax subdir."""
+    if use_max_log_sum_competence:
+        return "student_max_log_sum_competence"
+    return "student"
 
 
 def load_student_model(
     exp_dir: str,
     checkpoint_dir: str = "checkpoints",
     seed: int = 0,
+    use_max_log_sum_competence: bool = False,
 ) -> TrainState:
-    """Rebuild ActorCritic and restore its TrainState from EXP_DIR."""
+    """Rebuild ActorCritic and restore its TrainState from EXP_DIR.
+
+    If ``use_max_log_sum_competence`` is set, loads
+    ``student_max_log_sum_competence`` (paired with the max-log-sum teacher).
+    """
     config = _load_config(exp_dir)
-    student_ckpt_dir = os.path.join(exp_dir, checkpoint_dir, "student")
+    student_subdir = _student_checkpoint_subdir(
+        use_max_log_sum_competence=use_max_log_sum_competence,
+    )
+    student_ckpt_dir = os.path.join(exp_dir, checkpoint_dir, student_subdir)
     if not os.path.isdir(student_ckpt_dir):
         raise FileNotFoundError(
             f"Student checkpoint directory not found: {student_ckpt_dir}"
@@ -240,14 +295,22 @@ def _build_teacher_tx(config: dict[str, Any]):
     else:
         teacher_lr_schedule = teacher_linear_schedule
 
-    if config.get("ANNEAL_LR", True):
-        return optax.chain(
-            optax.clip_by_global_norm(config.get("TEACHER_MAX_GRAD_NORM", 1.0)),
-            optax.adam(learning_rate=teacher_lr_schedule, eps=1e-5),
+    teacher_lr = (
+        teacher_lr_schedule
+        if config.get("ANNEAL_LR", True)
+        else config["TEACHER_LR"]
+    )
+    if config.get("TEACHER_USE_ADAMW", False):
+        teacher_opt = optax.adamw(
+            learning_rate=teacher_lr,
+            eps=1e-5,
+            weight_decay=config.get("TEACHER_WEIGHT_DECAY", 1e-4),
         )
+    else:
+        teacher_opt = optax.adam(learning_rate=teacher_lr, eps=1e-5)
     return optax.chain(
         optax.clip_by_global_norm(config.get("TEACHER_MAX_GRAD_NORM", 1.0)),
-        optax.adam(config["TEACHER_LR"], eps=1e-5),
+        teacher_opt,
     )
 
 
@@ -256,10 +319,25 @@ def load_teacher_model(
     checkpoint_dir: str = "checkpoints",
     seed: int = 0,
     use_ema: bool = False,
+    use_avg: bool = False,
+    use_max_log_sum_competence: bool = False,
 ) -> TrainState:
-    """Rebuild TeacherActorCritic and restore its TrainState from EXP_DIR."""
+    """Rebuild teacher network and restore its TrainState from EXP_DIR.
+
+    Uses ``ConditionalTeacherActorCritic`` when ``USE_CONDITIONAL_TEACHER`` is
+    set in the experiment config; otherwise ``TeacherActorCritic``.
+
+    If ``use_max_log_sum_competence`` is set, loads
+    ``teacher_max_log_sum_competence`` (takes precedence over ``use_avg`` /
+    ``use_ema``). Otherwise ``use_avg`` selects ``teacher_avg``, then
+    ``use_ema`` selects ``teacher_ema``.
+    """
     config = _load_config(exp_dir)
-    teacher_subdir = "teacher_ema" if use_ema else "teacher"
+    teacher_subdir = _teacher_checkpoint_subdir(
+        use_ema=use_ema,
+        use_avg=use_avg,
+        use_max_log_sum_competence=use_max_log_sum_competence,
+    )
     teacher_ckpt_dir = os.path.join(exp_dir, checkpoint_dir, teacher_subdir)
     if not os.path.isdir(teacher_ckpt_dir):
         raise FileNotFoundError(
@@ -276,6 +354,10 @@ def load_teacher_model(
     condition_teacher_on_competence = bool(
         config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
     ) or only_competence
+    condition_teacher_on_action = bool(
+        config.get("CONDITION_TEACHER_ON_ACTION", True)
+    )
+    teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", False))
     num_competence = int(all_possible_goals().shape[0])
     teacher_obs_dim = _teacher_obs_dim(config, base_obs_dim, action_dim)
 
@@ -284,21 +366,38 @@ def load_teacher_model(
         teacher_net_competence_dim = num_competence
         teacher_net_action_dim = 0
     else:
-        teacher_net_obs_dim = base_obs_dim
+        teacher_net_obs_dim = 2 if teacher_obs_goal_only else base_obs_dim
         teacher_net_competence_dim = (
             num_competence if condition_teacher_on_competence else 0
         )
-        teacher_net_action_dim = action_dim
+        teacher_net_action_dim = (
+            action_dim if condition_teacher_on_action else 0
+        )
 
-    teacher_network = TeacherActorCritic(
-        num_actions=teacher_num_goal_points * teacher_num_goal_points,
-        obs_dim=teacher_net_obs_dim,
-        competence_dim=teacher_net_competence_dim,
-        student_action_dim=teacher_net_action_dim,
-        activation=config.get("TEACHER_ACTIVATION", "tanh"),
-        hidden_dim=int(config.get("TEACHER_HIDDEN_DIM", 256)),
-        use_encoders=bool(config.get("TEACHER_USE_ENCODERS", True)),
-    )
+    if config.get("USE_CONDITIONAL_TEACHER", False):
+        conditional_concatenate = bool(
+            config.get("CONDITIONAL_TEACHER_CONCATENATE", False)
+        )
+        teacher_network = ConditionalTeacherActorCritic(
+            num_actions=teacher_num_goal_points * teacher_num_goal_points,
+            obs_dim=teacher_net_obs_dim,
+            competence_dim=teacher_net_competence_dim,
+            student_action_dim=teacher_net_action_dim,
+            activation=config.get("TEACHER_ACTIVATION", "tanh"),
+            hidden_dim=int(config.get("TEACHER_HIDDEN_DIM", 256)),
+            add=not conditional_concatenate,
+            concatenate=conditional_concatenate,
+        )
+    else:
+        teacher_network = TeacherActorCritic(
+            num_actions=teacher_num_goal_points * teacher_num_goal_points,
+            obs_dim=teacher_net_obs_dim,
+            competence_dim=teacher_net_competence_dim,
+            student_action_dim=teacher_net_action_dim,
+            activation=config.get("TEACHER_ACTIVATION", "tanh"),
+            hidden_dim=int(config.get("TEACHER_HIDDEN_DIM", 256)),
+            use_encoders=bool(config.get("TEACHER_USE_ENCODERS", True)),
+        )
 
     rng = jax.random.PRNGKey(seed)
     teacher_init_params = teacher_network.init(
@@ -320,11 +419,17 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         seed=args.seed,
         use_ema=args.use_ema,
+        use_avg=args.use_avg,
+        use_max_log_sum_competence=args.use_max_log_sum_competence,
     )
     num_leaves = sum(
         1 for _ in jax.tree_util.tree_leaves(teacher_train_state.params)
     )
-    teacher_subdir = "teacher_ema" if args.use_ema else "teacher"
+    teacher_subdir = _teacher_checkpoint_subdir(
+        use_ema=args.use_ema,
+        use_avg=args.use_avg,
+        use_max_log_sum_competence=args.use_max_log_sum_competence,
+    )
     ckpt_path = os.path.join(args.exp_dir, args.checkpoint_dir, teacher_subdir)
     print(f"Loaded teacher TrainState from {ckpt_path}")
     print(f"Teacher params leaves: {num_leaves}")

@@ -26,6 +26,21 @@ U_MAZE = [
 
 # Ordered free-cell centers along the U-corridor (grid i, j indices).
 U_MAZE_PATH_CELLS = [(1, 1), (1, 2), (1, 3), (2, 3), (3, 3), (3, 2), (3, 1)]
+# Shortest left-then-center route from R=(6,1) to the goal cluster.
+BIG_MAZE_SINGLE_GOAL_PATH_CELLS = [
+    (6, 1),
+    (5, 1),
+    (4, 1),
+    (4, 2),
+    (3, 2),
+    (3, 3),
+    (3, 4),
+    (2, 4),
+    (2, 5),
+    (1, 5),
+    (1, 6),
+    (2, 6),
+]
 ORACLE_PATH_PASS_MARGIN = 2.0
 
 U_MAZE_ALL_STATES = [
@@ -202,6 +217,30 @@ HARDEST_MAZE = [
     [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
+HARDEST_MAZE_SINGLE_GOAL = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, R, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+    [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+    [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+    [1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1],
+    [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1],
+    [1, 1, 0, 1, 0, 1, 0, 1, G, 1, 1, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1, G, G, G, 1], # goal coordinate is (28, 40)
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+HARDEST_MAZE_ALL_GOALS = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, G, G, G, G, 1, G, G, G, G, G, 1],
+    [1, G, 1, 1, G, 1, G, 1, G, 1, G, 1],
+    [1, G, G, G, G, G, G, 1, G, G, G, 1],
+    [1, G, 1, 1, 1, 1, G, 1, 1, 1, G, 1],
+    [1, G, G, 1, G, 1, G, G, G, G, G, 1],
+    [1, 1, G, 1, G, 1, G, 1, G, 1, 1, 1],
+    [1, G, G, 1, G, G, G, 1, G, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+]
+
 HARDEST_MAZE_50_PERCENT = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                         [1, R, G, G, G, 1, 0, 0, 0, 0, 0, 1],
                         [1, G, 1, 1, G, 1, 0, 1, 0, 1, 0, 1],
@@ -301,6 +340,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
         maze_layout = HARDEST_MAZE
+    elif maze_layout_name == "hardest_maze_single_goal":
+        maze_layout = HARDEST_MAZE_SINGLE_GOAL
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
@@ -407,8 +448,12 @@ class AntMaze(PipelineEnv):
         self.dense_reward = dense_reward
         self.use_oracle_reward = use_oracle_reward
         self._oracle_reward_coef = oracle_reward_coef
+        if maze_layout_name == "big_maze_single_goal":
+            oracle_path_cells = BIG_MAZE_SINGLE_GOAL_PATH_CELLS
+        else:
+            oracle_path_cells = U_MAZE_PATH_CELLS
         self._oracle_path = jnp.array(
-            [(i * maze_size_scaling, j * maze_size_scaling) for i, j in U_MAZE_PATH_CELLS],
+            [(i * maze_size_scaling, j * maze_size_scaling) for i, j in oracle_path_cells],
             dtype=jnp.float32,
         )
         path_seg_len = jnp.linalg.norm(self._oracle_path[1:] - self._oracle_path[:-1], axis=-1)
@@ -420,9 +465,12 @@ class AntMaze(PipelineEnv):
         self.goal_indices = jnp.array([0, 1])
         self.goal_reach_thresh = 0.5
 
-        if use_oracle_reward and not maze_layout_name.startswith("u_maze"):
+        if use_oracle_reward and not (
+            maze_layout_name.startswith("u_maze") or maze_layout_name == "big_maze_single_goal"
+        ):
             raise ValueError(
-                f"use_oracle_reward is only supported for u_maze layouts, got {maze_layout_name!r}"
+                "use_oracle_reward is only supported for u_maze layouts or "
+                f"big_maze_single_goal, got {maze_layout_name!r}"
             )
 
         if self._use_contact_forces:

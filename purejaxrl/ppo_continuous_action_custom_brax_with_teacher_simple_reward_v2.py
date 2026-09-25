@@ -104,7 +104,8 @@ class TrainConfig:
     NUM_EVAL_ENVS: int = 10
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
     TEACHER_CONDITION_ONLY_ON_COMPETENCE: bool = False
-    CONDITION_TEACHER_ON_ACTION: bool = True
+    CONDITION_TEACHER_ON_ACTION: bool = False
+    TEACHER_OBS_GOAL_ONLY: bool = True
     TEACHER_EMA_COEFF: float = 0.999
     USE_DISTANCE_IN_COMPETENCE: bool = False
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
@@ -772,9 +773,11 @@ class ActorCritic(nn.Module):
 
 
 class TeacherTrainState(TrainState):
-    """TrainState that also tracks an exponential moving average of params."""
+    """TrainState that also tracks EMA and uniform-average params."""
 
     ema_params: Any
+    avg_params: Any
+    avg_count: jnp.ndarray
 
 
 class TeacherActorCritic(nn.Module):
@@ -1422,13 +1425,15 @@ def make_train(config):
         config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
     ) or condition_teacher_only_on_competence
     condition_teacher_on_action = bool(
-        config.get("CONDITION_TEACHER_ON_ACTION", True)
+        config.get("CONDITION_TEACHER_ON_ACTION", False)
     )
+    teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", True))
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     update_competence = (
         condition_teacher_on_competence or use_average_competence_reward
     )
+    teacher_state_obs_dim = 2 if teacher_obs_goal_only else base_obs_dim
     if condition_teacher_only_on_competence:
         teacher_obs_dim = num_competence
         teacher_net_obs_dim = 0
@@ -1436,11 +1441,11 @@ def make_train(config):
         teacher_net_action_dim = 0
     else:
         teacher_obs_dim = (
-            base_obs_dim
+            teacher_state_obs_dim
             + (num_competence if condition_teacher_on_competence else 0)
             + (action_dim if condition_teacher_on_action else 0)
         )
-        teacher_net_obs_dim = base_obs_dim
+        teacher_net_obs_dim = teacher_state_obs_dim
         teacher_net_competence_dim = (
             num_competence if condition_teacher_on_competence else 0
         )
@@ -1497,6 +1502,8 @@ def make_train(config):
             return competence_vector
         if obs.ndim == 1:
             obs = obs[None, :]
+        if teacher_obs_goal_only:
+            obs = obs[..., -2:]
         inputs = [obs]
         if condition_teacher_on_competence:
             comp_batch = jnp.broadcast_to(
@@ -1522,7 +1529,7 @@ def make_train(config):
         """Frobenius norms / mean-|grad| of d(logits)/d(input) per input block.
 
         Differentiates teacher Categorical logits (not the discrete sample) w.r.t.
-        the concatenated teacher input ``[obs | competence | action]``, then
+        the concatenated teacher input ``[goal | competence | action]``, then
         slices by ``teacher_net_*_dim``. Missing blocks return NaN.
         """
         x = jnp.asarray(teacher_obs).reshape(-1)
@@ -2009,6 +2016,8 @@ def make_train(config):
             params=teacher_init_params,
             tx=teacher_tx,
             ema_params=teacher_init_params,
+            avg_params=teacher_init_params,
+            avg_count=jnp.asarray(0, dtype=jnp.int32),
         )
         _teacher_ckpt_host["apply_fn"] = teacher_train_state.apply_fn
         _teacher_ckpt_host["tx"] = teacher_train_state.tx
@@ -2929,7 +2938,17 @@ def make_train(config):
                     t_state.ema_params,
                     t_state.params,
                 )
-                return t_state.replace(ema_params=new_ema)
+                n = t_state.avg_count.astype(jnp.float32)
+                new_avg = jax.tree_util.tree_map(
+                    lambda a, p: (n * a + p) / (n + 1.0),
+                    t_state.avg_params,
+                    t_state.params,
+                )
+                return t_state.replace(
+                    ema_params=new_ema,
+                    avg_params=new_avg,
+                    avg_count=t_state.avg_count + 1,
+                )
 
             def _keep_teacher_ema(operands):
                 return operands
@@ -3220,6 +3239,7 @@ def make_train(config):
                         global_step,
                         teacher_step,
                         teacher_params,
+                        teacher_avg_params,
                         teacher_opt_state,
                         student_step,
                         student_params,
@@ -3240,15 +3260,26 @@ def make_train(config):
                     teacher_ckpt_dir = os.path.join(
                         checkpoint_root, "teacher_max_log_sum_competence"
                     )
+                    teacher_avg_ckpt_dir = os.path.join(
+                        checkpoint_root, "teacher_avg"
+                    )
                     student_ckpt_dir = os.path.join(
                         checkpoint_root, "student_max_log_sum_competence"
                     )
                     os.makedirs(teacher_ckpt_dir, exist_ok=True)
+                    os.makedirs(teacher_avg_ckpt_dir, exist_ok=True)
                     os.makedirs(student_ckpt_dir, exist_ok=True)
                     teacher_ckpt_state = TrainState(
                         step=int(teacher_step),
                         apply_fn=_teacher_ckpt_host["apply_fn"],
                         params=teacher_params,
+                        tx=_teacher_ckpt_host["tx"],
+                        opt_state=teacher_opt_state,
+                    )
+                    teacher_avg_ckpt_state = TrainState(
+                        step=int(teacher_step),
+                        apply_fn=_teacher_ckpt_host["apply_fn"],
+                        params=teacher_avg_params,
                         tx=_teacher_ckpt_host["tx"],
                         opt_state=teacher_opt_state,
                     )
@@ -3260,6 +3291,7 @@ def make_train(config):
                         opt_state=student_opt_state,
                     )
                     save_checkpoint(teacher_ckpt_state, teacher_ckpt_dir)
+                    save_checkpoint(teacher_avg_ckpt_state, teacher_avg_ckpt_dir)
                     save_checkpoint(student_ckpt_state, student_ckpt_dir)
                     if config.get("NORMALIZE_ENV", False) and len(obs_norm_args) == 3:
                         obs_mean, obs_var, obs_count = obs_norm_args
@@ -3290,6 +3322,7 @@ def make_train(config):
                                 "step": int(global_step),
                                 "competence_mean": float(competence_mean_val),
                                 "teacher_checkpoint": teacher_ckpt_dir,
+                                "teacher_avg_checkpoint": teacher_avg_ckpt_dir,
                                 "student_checkpoint": student_ckpt_dir,
                             },
                             f,
@@ -3298,7 +3331,8 @@ def make_train(config):
                     print(
                         f"[checkpoint] new max log-sum competence={score:.6f} "
                         f"at step={int(global_step)}; saved teacher to "
-                        f"{teacher_ckpt_dir} and student to {student_ckpt_dir}"
+                        f"{teacher_ckpt_dir}, teacher avg to "
+                        f"{teacher_avg_ckpt_dir}, and student to {student_ckpt_dir}"
                     )
                     if config.get("WANDB_MODE", "disabled") == "online":
                         wandb.log(
@@ -3317,6 +3351,7 @@ def make_train(config):
                     save_step,
                     teacher_train_state.step,
                     teacher_train_state.params,
+                    teacher_train_state.avg_params,
                     teacher_train_state.opt_state,
                     train_state.step,
                     train_state.params,
@@ -3848,14 +3883,16 @@ def main():
         student_ckpt_dir = os.path.join(checkpoint_root, "student")
         teacher_ckpt_dir = os.path.join(checkpoint_root, "teacher")
         teacher_ema_ckpt_dir = os.path.join(checkpoint_root, "teacher_ema")
+        teacher_avg_ckpt_dir = os.path.join(checkpoint_root, "teacher_avg")
         os.makedirs(student_ckpt_dir, exist_ok=True)
         os.makedirs(teacher_ckpt_dir, exist_ok=True)
         os.makedirs(teacher_ema_ckpt_dir, exist_ok=True)
+        os.makedirs(teacher_avg_ckpt_dir, exist_ok=True)
         config_path = os.path.join(exp_dir, "config.json")
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2, default=str)
         save_checkpoint(final_train_state, student_ckpt_dir)
-        # Save plain TrainState (no ema_params) for backward-compatible loading.
+        # Save plain TrainState (no ema_params/avg_params) for backward-compatible loading.
         teacher_ckpt_state = TrainState(
             step=_final_teacher_train_state.step,
             apply_fn=_final_teacher_train_state.apply_fn,
@@ -3870,11 +3907,20 @@ def main():
             tx=_final_teacher_train_state.tx,
             opt_state=_final_teacher_train_state.opt_state,
         )
+        teacher_avg_ckpt_state = TrainState(
+            step=_final_teacher_train_state.step,
+            apply_fn=_final_teacher_train_state.apply_fn,
+            params=_final_teacher_train_state.avg_params,
+            tx=_final_teacher_train_state.tx,
+            opt_state=_final_teacher_train_state.opt_state,
+        )
         save_checkpoint(teacher_ckpt_state, teacher_ckpt_dir)
         save_checkpoint(teacher_ema_ckpt_state, teacher_ema_ckpt_dir)
+        save_checkpoint(teacher_avg_ckpt_state, teacher_avg_ckpt_dir)
         print(f"[checkpoint] saved student model to {student_ckpt_dir}")
         print(f"[checkpoint] saved teacher model to {teacher_ckpt_dir}")
         print(f"[checkpoint] saved teacher EMA model to {teacher_ema_ckpt_dir}")
+        print(f"[checkpoint] saved teacher avg model to {teacher_avg_ckpt_dir}")
         print(f"[checkpoint] saved config to {config_path}")
         if config.get("NORMALIZE_ENV", False):
             # Observation dim is the trailing dim of the running mean in env_state.

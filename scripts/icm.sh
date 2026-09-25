@@ -2,21 +2,21 @@
 
 # Define common parameters (fixed values)
 # This is also reading for running.
-WANDB_PROJECT_NAME="purejaxrl_ant_u_maze_single_goal_no_teacher_icm_baseline"
+WANDB_PROJECT_NAME="purejaxrl_all_envs_no_teacher_icm_baseline"
 
-ENV_NAMES=("ant_u_maze_single_goal")
+ENV_NAMES=("ant_u_maze_single_goal" "ant_big_maze_single_goal")
 SAVE_MODEL="--SAVE_MODEL"
 TOTAL_TIMESTEPS_=(350000000)
 LRS=(0.0003)
-SEEDS=(30 75937 123)
+SEEDS=(30 75937 123 1 842434353)
 COMMENT="no_teacher_icm_baseline"
 USE_ICM="--USE_ICM"
 
 # PPO teacher-specific sweep args from
 # purejaxrl/ppo_continuous_action_custom_brax_with_teacher.py
-NUM_ENVSS=(256)
+NUM_ENVSS=(512)
 NUM_STEPS_=(64)
-STUDENT_ENTROPY_COFFS=(0)
+STUDENT_ENTROPY_COFFS=(0.001)
 GAE_LAMBDA=(0.8)
 CLIP_EPS=(0.2)
 MAX_GRAD_NORM=(1.0)

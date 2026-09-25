@@ -26,6 +26,26 @@ U_MAZE = [
     [1, 1, 1, 1, 1],
 ]
 
+# Ordered free-cell centers along the U-corridor (grid i, j indices).
+U_MAZE_PATH_CELLS = [(1, 1), (1, 2), (1, 3), (2, 3), (3, 3), (3, 2), (3, 1)]
+# Shortest left-then-center route from R to the goal cluster (same cells as ant).
+BIG_MAZE_SINGLE_GOAL_PATH_CELLS = [
+    (6, 1),
+    (5, 1),
+    (4, 1),
+    (4, 2),
+    (3, 2),
+    (3, 3),
+    (3, 4),
+    (2, 4),
+    (2, 5),
+    (1, 5),
+    (1, 6),
+    (2, 6),
+]
+# Half a humanoid cell at maze_size_scaling=2.0 (ant uses 2.0 at scale 4.0).
+ORACLE_PATH_PASS_MARGIN = 1.0
+
 U_MAZE_ALL_STATES = [
     [1, 1, 1, 1, 1],
     [1, G, G, G, 1],
@@ -58,6 +78,17 @@ BIG_MAZE = [
     [1, G, G, 1, G, G, G, 1],
     [1, G, 1, G, G, 1, G, 1],
     [1, G, G, G, 1, G, G, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1],
+]
+
+BIG_MAZE_SINGLE_GOAL = [
+    [1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 1, 1, G, G, 1],
+    [1, 0, 0, 1, 0, 0, G, 1],
+    [1, 1, 0, 0, 0, 1, 1, 1],
+    [1, 0, 0, 1, 0, 0, 0, 1],
+    [1, 0, 1, 0, 0, 1, 0, 1],
+    [1, R, 0, 0, 1, 0, 0, 1],
     [1, 1, 1, 1, 1, 1, 1, 1],
 ]
 
@@ -150,6 +181,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = U_MAZE_EVAL
     elif maze_layout_name == "big_maze":
         maze_layout = BIG_MAZE
+    elif maze_layout_name == "big_maze_single_goal":
+        maze_layout = BIG_MAZE_SINGLE_GOAL
     elif maze_layout_name == "big_maze_eval":
         maze_layout = BIG_MAZE_EVAL
     elif maze_layout_name == "hardest_maze":
@@ -212,6 +245,8 @@ class HumanoidMaze(PipelineEnv):
         maze_layout_name="u_maze",
         maze_size_scaling=2.0,  # Was 4.0 for antmaze -- just trying to make it tractable
         dense_reward: bool = False,
+        use_oracle_reward: bool = False,
+        oracle_reward_coef: float = 1.0,
         **kwargs,
     ):
         xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
@@ -220,7 +255,8 @@ class HumanoidMaze(PipelineEnv):
         self.possible_goals = possible_goals
         self.maze_layout_name = maze_layout_name
         self.dense_reward = dense_reward
-
+        self.use_oracle_reward = use_oracle_reward
+        self._oracle_reward_coef = oracle_reward_coef
 
         if "u_maze" in self.maze_layout_name:
             self.max_x = jnp.array([8,8,TARGET_Z_COORD])
@@ -283,8 +319,35 @@ class HumanoidMaze(PipelineEnv):
         self._exclude_current_positions_from_observation = exclude_current_positions_from_observation
         self._target_ind = self.sys.link_names.index("target")
 
-        self.state_dim = 268
+        if maze_layout_name == "big_maze_single_goal":
+            oracle_path_cells = BIG_MAZE_SINGLE_GOAL_PATH_CELLS
+        else:
+            oracle_path_cells = U_MAZE_PATH_CELLS
+        # 3D path at target height so maze distance includes torso z vs TARGET_Z_COORD.
+        self._oracle_path = jnp.array(
+            [
+                (i * maze_size_scaling, j * maze_size_scaling, TARGET_Z_COORD)
+                for i, j in oracle_path_cells
+            ],
+            dtype=jnp.float32,
+        )
+        path_seg_len = jnp.linalg.norm(self._oracle_path[1:] - self._oracle_path[:-1], axis=-1)
+        self._oracle_path_s = jnp.concatenate(
+            [jnp.zeros((1,), dtype=path_seg_len.dtype), jnp.cumsum(path_seg_len)]
+        )
+        self._oracle_pass_margin = ORACLE_PATH_PASS_MARGIN
+
+        # Base obs is 271; oracle appends a 3D subgoal before the true goal xyz.
+        self.state_dim = 274 if use_oracle_reward else 271
         self.goal_indices = jnp.array([0, 1, 2])
+
+        if use_oracle_reward and not (
+            maze_layout_name.startswith("u_maze") or maze_layout_name == "big_maze_single_goal"
+        ):
+            raise ValueError(
+                "use_oracle_reward is only supported for u_maze layouts or "
+                f"big_maze_single_goal, got {maze_layout_name!r}"
+            )
 
     def reset(self, rng: jax.Array) -> State:
         """Resets the environment to an initial state."""
@@ -319,11 +382,44 @@ class HumanoidMaze(PipelineEnv):
             "y_velocity": zero,
             "success": zero,
             "success_easy": zero,
+            "oracle_subgoal_dist": zero,
+            "oracle_vel_reward": zero,
         }
 
         state = State(pipeline_state, obs, reward, done, metrics)
 
         return state
+
+    def _project_to_path(self, pos: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Project `pos` onto the oracle corridor polyline.
+
+        Returns ``(nearest_point, arc_length, dist_to_path)``.
+        """
+        starts = self._oracle_path[:-1]
+        ends = self._oracle_path[1:]
+        seg = ends - starts
+        seg_len_sq = jnp.maximum(jnp.sum(seg * seg, axis=-1), 1e-8)
+        t = jnp.clip(jnp.sum((pos - starts) * seg, axis=-1) / seg_len_sq, 0.0, 1.0)
+        proj = starts + t[:, None] * seg
+        dist = jnp.linalg.norm(pos - proj, axis=-1)
+        seg_len = jnp.sqrt(seg_len_sq)
+        s = self._oracle_path_s[:-1] + t * seg_len
+        idx = jnp.argmin(dist)
+        return proj[idx], s[idx], dist[idx]
+
+    def _maze_distance(self, pos: jax.Array, goal: jax.Array) -> jax.Array:
+        _, s_pos, dist_to_path = self._project_to_path(pos)
+        _, s_goal, _ = self._project_to_path(goal)
+        return dist_to_path + jnp.abs(s_pos - s_goal)
+
+    def _oracle_subgoal(self, pos: jax.Array, goal: jax.Array) -> jax.Array:
+        """Next unpassed path cell at or before the goal, else the true goal."""
+        _, s_pos, _ = self._project_to_path(pos)
+        _, s_goal, _ = self._project_to_path(goal)
+        unpassed = s_pos < (self._oracle_path_s - self._oracle_pass_margin)
+        valid = unpassed & (self._oracle_path_s <= s_goal + 1e-3)
+        idx = jnp.argmax(valid)
+        return jnp.where(jnp.any(valid), self._oracle_path[idx], goal)
 
     def step(self, state: State, action: jax.Array) -> State:
         """Runs one timestep of the environment's dynamics."""
@@ -350,6 +446,7 @@ class HumanoidMaze(PipelineEnv):
 
         ctrl_cost = self._ctrl_cost_weight * jnp.sum(jnp.square(action))
 
+        old_obs = self._get_obs(pipeline_state0, action)
         obs = self._get_obs(pipeline_state, action)
         distance_to_target = jnp.linalg.norm(obs[:3] - obs[-3:])
 
@@ -360,6 +457,19 @@ class HumanoidMaze(PipelineEnv):
             reward = jnp.array(distance_to_target < 0.5, dtype=float)
         success = jnp.array(distance_to_target < 0.5, dtype=float)
         success_easy = jnp.array(distance_to_target < 2.0, dtype=float)
+
+        oracle_subgoal_dist = state.metrics["oracle_subgoal_dist"]
+        oracle_vel_reward = state.metrics["oracle_vel_reward"]
+        if self.use_oracle_reward:
+            goal_xyz = obs[-3:]
+            old_maze_dist = self._maze_distance(old_obs[:3], goal_xyz)
+            new_maze_dist = self._maze_distance(obs[:3], goal_xyz)
+            oracle_vel_reward = (
+                self._oracle_reward_coef * (old_maze_dist - new_maze_dist) / self.dt
+            )
+            oracle_subgoal_dist = new_maze_dist
+            reward = reward + oracle_vel_reward
+
         state.metrics.update(
             forward_reward=forward_reward,
             reward_linvel=forward_reward,
@@ -373,6 +483,8 @@ class HumanoidMaze(PipelineEnv):
             y_velocity=velocity[1],
             success=success,
             success_easy=success_easy,
+            oracle_subgoal_dist=oracle_subgoal_dist,
+            oracle_vel_reward=oracle_vel_reward,
         )
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done)
 
@@ -396,6 +508,16 @@ class HumanoidMaze(PipelineEnv):
         qfrc_actuator = actuator.to_tau(self.sys, action, pipeline_state.q, pipeline_state.qd)
 
         target_pos = pipeline_state.x.pos[-1][:2]
+        target_xyz = jnp.concatenate(
+            [target_pos, jnp.array([TARGET_Z_COORD])]
+        )
+        if self.use_oracle_reward:
+            xyz = pipeline_state.q[:3]
+            subgoal = self._oracle_subgoal(xyz, target_xyz)
+            goal_suffix = [subgoal, target_xyz]
+        else:
+            goal_suffix = [target_xyz]
+
         # external_contact_forces are excluded
         return jnp.concatenate(
             [
@@ -404,8 +526,7 @@ class HumanoidMaze(PipelineEnv):
                 com_inertia.ravel(),
                 com_velocity.ravel(),
                 qfrc_actuator,
-                target_pos,
-                jnp.array([TARGET_Z_COORD]),  # Height of the target is fixed
+                *goal_suffix,
             ]
         )
 
