@@ -91,6 +91,9 @@ class TrainConfig:
     RND_LR: float = 1e-4
     RND_HIDDEN_DIM: int = 256
     RND_OUTPUT_DIM: int = 128
+    CONDITION_RND_ON_COMPETENCE: bool = False
+    NUM_EVAL_ENVS: int = 10
+    USE_DISTANCE_IN_COMPETENCE: bool = False
     USE_ICM: bool = False
     ICM_COEF: float = 1.0
     ICM_LR: float = 1e-4
@@ -204,8 +207,169 @@ def _inner_brax_state(state):
     return current
 
 
+def _replace_inner_brax_state(wrapped_state, brax_state):
+    """Replace the inner Brax state, updating ``org_obs`` when present."""
+    if hasattr(wrapped_state, "pipeline_state"):
+        return brax_state
+    new_inner = _replace_inner_brax_state(wrapped_state.env_state, brax_state)
+    updates = {"env_state": new_inner}
+    if hasattr(wrapped_state, "org_obs"):
+        updates["org_obs"] = brax_state.obs
+    return wrapped_state.replace(**updates)
+
+
 def _success_metric(wrapped_state):
     return _inner_brax_state(wrapped_state).metrics["success"]
+
+
+def make_competence_goal_set(config):
+    """Discrete goal set used to build the student competence vector."""
+    env_name = config["ENV_NAME"]
+
+    if "ant" in env_name:
+        from envs.ant_maze import all_possible_goals
+        from envs.ant_maze import (
+            BIG_MAZE_ALL_GOALS,
+            HARDEST_MAZE_ALL_GOALS,
+            U_MAZE_ALL_STATES,
+        )
+
+        if "u_maze" in env_name:
+            all_goals_layout = U_MAZE_ALL_STATES
+        elif "big_maze" in env_name:
+            all_goals_layout = BIG_MAZE_ALL_GOALS
+        elif "hardest_maze" in env_name:
+            all_goals_layout = HARDEST_MAZE_ALL_GOALS
+        else:
+            raise ValueError(f"Unknown maze layout: {env_name}")
+        all_goals = all_possible_goals(all_goals_layout)
+    elif "humanoid" in env_name:
+        from envs.humanoid_maze import (
+            BIG_MAZE_ALL_GOALS,
+            U_MAZE_ALL_STATES,
+            all_possible_goals,
+        )
+
+        if "u_maze" in env_name:
+            all_goals_layout = U_MAZE_ALL_STATES
+        elif "big_maze" in env_name:
+            all_goals_layout = BIG_MAZE_ALL_GOALS
+        else:
+            raise ValueError(f"Unknown maze layout: {env_name}")
+        all_goals = all_possible_goals(all_goals_layout, size_scaling=2.0)
+    else:
+        raise ValueError(f"Unknown env for competence goal set: {env_name}")
+
+    num_competence = int(all_goals.shape[0])
+    return all_goals, num_competence
+
+
+def evaluate_multiple_goals(
+    env,
+    brax_env,
+    network,
+    params,
+    goals,
+    num_envs_per_goal,
+    max_steps=1000,
+    warmup_env_state=None,
+    normalize_obs=False,
+    condition_on_goal=True,
+    use_distance_in_competence=False,
+    config=None,
+):
+    """Evaluate success rate for each goal over multiple random starts.
+
+    Uses the full wrapped env stack (VecEnv + LogWrapper + ...). VecEnv.reset
+    already vmaps over envs, so each goal is evaluated with a batched reset of
+    ``num_envs_per_goal`` keys rather than vmapping over scalar keys.
+
+    ``goals`` must be raw world coordinates. When ``normalize_obs`` is True,
+    observations and conditioned goals are normalized using collapsed warmup
+    stats so eval can use a different batch size than training.
+    """
+    env_params = None
+    obs_dim = brax_env.observation_size
+    eval_stats = (
+        _collapse_obs_norm_stats(warmup_env_state, obs_dim)
+        if normalize_obs and warmup_env_state is not None
+        else warmup_env_state
+    )
+    norm_mean = eval_stats.mean if eval_stats is not None else None
+    norm_var = eval_stats.var if eval_stats is not None else None
+
+    def eval_one_goal(rng, specific_goal):
+        rng, reset_rng = jax.random.split(rng)
+        reset_rngs = jax.random.split(reset_rng, num_envs_per_goal)
+        if eval_stats is not None:
+            obsv, env_state = env.reset_with_stats(
+                reset_rngs, eval_stats, env_params
+            )
+        else:
+            obsv, env_state = env.reset(reset_rngs, env_params)
+
+        brax_state = _inner_brax_state(env_state)
+        env_state = _replace_inner_brax_state(env_state, brax_state)
+
+        if normalize_obs:
+            obsv = (brax_state.obs - norm_mean) / jnp.sqrt(norm_var + 1e-8)
+        else:
+            obsv = brax_state.obs
+
+        # Always needed for competence success / distance metrics.
+        raw_goal_batch = jnp.broadcast_to(
+            specific_goal, (num_envs_per_goal, specific_goal.shape[-1])
+        )
+        if condition_on_goal:
+            if normalize_obs:
+                policy_goal = _normalize_xy(specific_goal, norm_mean, norm_var)
+            else:
+                policy_goal = specific_goal
+            goal_batch = jnp.broadcast_to(
+                policy_goal, (num_envs_per_goal, policy_goal.shape[-1])
+            )
+
+        def step_fn(carry, _):
+            obsv, env_state, rng, ever_done = carry
+            rng, step_rng, action_rng = jax.random.split(rng, 3)
+            step_rngs = jax.random.split(step_rng, num_envs_per_goal)
+            if condition_on_goal:
+                policy_obs = jnp.concatenate([obsv, goal_batch], axis=-1)
+            else:
+                policy_obs = obsv
+            pi, _ = network.apply(params, policy_obs)
+            action = pi.sample(seed=action_rng)
+            obsv, env_state, reward, done, info = env.step(
+                step_rngs, env_state, action, env_params
+            )
+            if normalize_obs:
+                current_pos = env_state.org_obs[..., : raw_goal_batch.shape[-1]]
+            else:
+                current_pos = obsv[..., : raw_goal_batch.shape[-1]]
+            dist = jnp.linalg.norm(current_pos - raw_goal_batch, axis=-1)
+            active = 1.0 - ever_done
+            # Ignore post-auto-reset steps after the first episode done.
+            if use_distance_in_competence:
+                success = jnp.where(active > 0, dist, jnp.inf)
+            else:
+                success = (dist <= 1.0).astype(dist.dtype) * active
+            ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
+            return (obsv, env_state, rng, ever_done), success
+
+        init_ever_done = jnp.zeros((num_envs_per_goal,), dtype=obsv.dtype)
+        _, successes = jax.lax.scan(
+            step_fn,
+            (obsv, env_state, rng, init_ever_done),
+            None,
+            length=max_steps,
+        )
+        if use_distance_in_competence:
+            return successes.min(axis=0).mean()
+        return successes.max(axis=0).mean()
+
+    vmap_goals = jax.vmap(eval_one_goal, in_axes=(0, 0))
+    goal_rngs = jax.random.split(jax.random.PRNGKey(42), goals.shape[0])
+    return vmap_goals(goal_rngs, goals)
 
 
 class TrainRenderBuffer(NamedTuple):
@@ -295,7 +459,11 @@ def update_train_render_buffer(
 def _normalize_xy(goal, mean, var):
     mean_xy = mean[..., :2]
     var_xy = var[..., :2]
-    return (goal - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+    xy = (goal[..., :2] - mean_xy) / jnp.sqrt(var_xy + 1e-8)
+    if goal.shape[-1] > 2:
+        z = (goal[..., 2:3] - mean[..., 2:3]) / jnp.sqrt(var[..., 2:3] + 1e-8)
+        return jnp.concatenate([xy, z], axis=-1)
+    return xy
 
 
 def _collapse_obs_norm_stats(stats_state, obs_dim):
@@ -441,6 +609,14 @@ def make_train(config):
     condition_on_goal = config.get("CONDITION_ON_GOAL", False)
     goal_reach_epsilon = config.get("GOAL_REACH_EPSILON", 0.5)
     use_rnd = config.get("USE_RND", False)
+    condition_rnd_on_competence = use_rnd and config.get(
+        "CONDITION_RND_ON_COMPETENCE", False
+    )
+    if condition_rnd_on_competence:
+        all_goals, num_competence = make_competence_goal_set(config)
+    else:
+        all_goals = None
+        num_competence = 0
     rnd_network = RNDNetwork(
         hidden_dim=config.get("RND_HIDDEN_DIM", 256),
         output_dim=config.get("RND_OUTPUT_DIM", 128),
@@ -656,11 +832,12 @@ def make_train(config):
         )
 
         obs_dim = int(env.observation_space(env_params).shape[0])
+        rnd_input_dim = obs_dim + num_competence
         rng, rnd_rng = jax.random.split(rng)
         rnd_state = init_rnd_state(
             rnd_rng,
             rnd_network,
-            obs_dim,
+            rnd_input_dim,
             config["NUM_ENVS"],
             config.get("RND_LR", 1e-4),
             max_grad_norm=config["MAX_GRAD_NORM"],
@@ -691,6 +868,22 @@ def make_train(config):
                 normalize_obs=config["NORMALIZE_ENV"],
                 condition_on_goal=condition_on_goal,
                 exclude_oracle_reward=config.get("USE_ORACLE_REWARD", False),
+            )
+
+        def compute_competence_vector(student_params, stats_state):
+            return evaluate_multiple_goals(
+                env_2,
+                base_env_2,
+                network,
+                student_params,
+                all_goals,
+                config["NUM_EVAL_ENVS"],
+                max_steps=config.get("EPISODE_LENGTH", 1000),
+                warmup_env_state=stats_state,
+                normalize_obs=config["NORMALIZE_ENV"],
+                condition_on_goal=condition_on_goal,
+                use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"],
+                config=config,
             )
 
         rng, goal_rng,  _rng = jax.random.split(rng, 3)
@@ -751,6 +944,13 @@ def make_train(config):
                 var_xy = env_state.var[..., :2]
                 goals = (raw_goals - mean_xy) / jnp.sqrt(var_xy + 1e-8)
             obsv = jnp.concatenate([obsv, goals], axis=-1)
+
+        if condition_rnd_on_competence:
+            competence_vector = compute_competence_vector(
+                train_state.params, env_state
+            )
+        else:
+            competence_vector = jnp.zeros((num_competence,), dtype=obsv.dtype)
             
         train_render_freq = int(config.get("TRAIN_RENDER_FREQ", 0))
         enable_train_render = train_render_freq > 0
@@ -798,6 +998,7 @@ def make_train(config):
                     ep_goal_success,
                     returned_ep_goal_success,
                     rnd_state,
+                    competence_vector,
                     icm_state,
                 ) = body
 
@@ -842,6 +1043,14 @@ def make_train(config):
                     rnd_obs = (
                         env_state.org_obs if config["NORMALIZE_ENV"] else obsv
                     )
+                    if condition_rnd_on_competence:
+                        competence_batch = jnp.broadcast_to(
+                            competence_vector,
+                            (config["NUM_ENVS"], num_competence),
+                        )
+                        rnd_obs = jnp.concatenate(
+                            [rnd_obs, competence_batch], axis=-1
+                        )
                     rnd_state, rnd_reward, rnd_raw_intrinsic = rnd_step(
                         rnd_state,
                         rnd_network,
@@ -849,9 +1058,18 @@ def make_train(config):
                         done,
                         config["GAMMA"],
                     )
+                    if condition_rnd_on_competence:
+                        competence_vector = jax.lax.cond(
+                            jnp.any(done),
+                            lambda _: compute_competence_vector(
+                                train_state.params, env_state
+                            ),
+                            lambda _: competence_vector,
+                            operand=None,
+                        )
                 else:
                     rnd_obs = jnp.zeros(
-                        (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
+                        (config["NUM_ENVS"], rnd_input_dim), dtype=task_reward.dtype
                     )
                     rnd_reward = jnp.zeros_like(task_reward)
                     rnd_raw_intrinsic = jnp.zeros_like(task_reward)
@@ -947,6 +1165,7 @@ def make_train(config):
                     ep_goal_success,
                     returned_ep_goal_success,
                     rnd_state,
+                    competence_vector,
                     icm_state,
                 )
                 if enable_train_render:
@@ -977,6 +1196,7 @@ def make_train(config):
                 ep_goal_success,
                 returned_ep_goal_success,
                 rnd_state,
+                competence_vector,
                 icm_state,
             ) = body
             _, last_val = network.apply(train_state.params, last_obs)
@@ -984,7 +1204,7 @@ def make_train(config):
             if use_rnd:
                 batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
                 rnd_obs_batch = traj_batch.rnd_obs.reshape(
-                    (batch_size, obs_dim)
+                    (batch_size, rnd_input_dim)
                 )
                 rnd_state, rnd_predictor_loss = train_predictor(
                     rnd_state, rnd_network, rnd_obs_batch
@@ -1526,6 +1746,7 @@ def make_train(config):
                 ep_goal_success,
                 returned_ep_goal_success,
                 rnd_state,
+                competence_vector,
                 icm_state,
             )
             if enable_train_render:
@@ -1550,6 +1771,7 @@ def make_train(config):
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             jnp.zeros((config["NUM_ENVS"],), dtype=reward_dtype),
             rnd_state,
+            competence_vector,
             icm_state,
         )
         if enable_train_render:

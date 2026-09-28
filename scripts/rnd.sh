@@ -8,6 +8,7 @@ ENV_NAMES=("ant_u_maze_single_goal" "ant_big_maze_single_goal")
 SAVE_MODEL="--SAVE_MODEL"
 TOTAL_TIMESTEPS_=(350000000)
 LRS=(0.0003)
+CONDITION_RND_ON_COMPETENCE="--CONDITION_RND_ON_COMPETENCE"
 SEEDS=(30 75937 123 1 842434353)
 COMMENT="no_teacher_rnd_baseline"
 USE_RND="--USE_RND"
@@ -58,6 +59,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --MAX_GRAD_NORM=${max_grad_norm} \
                         --UPDATE_EPOCHS=${update_epochs} \
                         ${SAVE_MODEL} \
+                        ${CONDITION_RND_ON_COMPETENCE} \
                         --COMMENT=${COMMENT} \
                         --RND_COEF=${rnd_coef} \
                         --NUM_ENVS=${num_envs} \
