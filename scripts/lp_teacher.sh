@@ -85,7 +85,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         for teacher_goal_y_max in "${TEACHER_GOAL_Y_MAXS[@]}"; do
                         for teacher_num_goal_points in "${TEACHER_NUM_GOAL_POINTS[@]}"; do
                       RUN_NAME="${ENV_NAME}_steps${TOTAL_TIMESTEPS}_lr${LR}_entropy${student_entropy_coef}_num_envs${num_envs}_num_steps${num_steps}_gae_lambda${gae_lambda}_clip_eps${clip_eps}"
-                      CMD="sbatch scripts/submit_job purejaxrl/ppo_continuous_action_custom_brax_with_teacher_simple_reward.py \
+                      CMD="sbatch scripts/submit_job purejaxrl/ppo_lp_teacher.py \
                         --ENV_NAME=${ENV_NAME} \
                         --TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS} \
                         --LR=${LR} \
