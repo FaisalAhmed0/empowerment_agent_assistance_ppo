@@ -102,6 +102,7 @@ class TrainConfig:
     TASK_REWARD_COEF: float = 1.0
     INTERPOLATED_REWARD: bool = False
     NUM_EVAL_ENVS: int = 10
+    CONDITION_TEACHER_ON_STATE: bool = True
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
     TEACHER_CONDITION_ONLY_ON_COMPETENCE: bool = False
     CONDITION_TEACHER_ON_ACTION: bool = True
@@ -1424,6 +1425,9 @@ def make_train(config):
     condition_teacher_on_action = bool(
         config.get("CONDITION_TEACHER_ON_ACTION", True)
     )
+    condition_teacher_on_state = bool(
+        config.get("CONDITION_TEACHER_ON_STATE", True)
+    )
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     update_competence = (
@@ -1436,15 +1440,20 @@ def make_train(config):
         teacher_net_action_dim = 0
     else:
         teacher_obs_dim = (
-            base_obs_dim
+            (base_obs_dim if condition_teacher_on_state else 0)
             + (num_competence if condition_teacher_on_competence else 0)
             + (action_dim if condition_teacher_on_action else 0)
         )
-        teacher_net_obs_dim = base_obs_dim
+        teacher_net_obs_dim = base_obs_dim if condition_teacher_on_state else 0
         teacher_net_competence_dim = (
             num_competence if condition_teacher_on_competence else 0
         )
         teacher_net_action_dim = action_dim if condition_teacher_on_action else 0
+    if teacher_obs_dim == 0:
+        raise ValueError(
+            "Teacher has no inputs: enable at least one of CONDITION_TEACHER_ON_STATE, "
+            "CONDITION_TEACHER_ON_COMPETENCE, or CONDITION_TEACHER_ON_ACTION."
+        )
     if config.get("USE_CONDITIONAL_TEACHER", False):
         conditional_concatenate = bool(
             config.get("CONDITIONAL_TEACHER_CONCATENATE", False)
@@ -1497,16 +1506,17 @@ def make_train(config):
             return competence_vector
         if obs.ndim == 1:
             obs = obs[None, :]
-        inputs = [obs]
+        batch_size = obs.shape[0]
+        inputs = [obs] if condition_teacher_on_state else []
         if condition_teacher_on_competence:
             comp_batch = jnp.broadcast_to(
-                competence_vector, (obs.shape[0], competence_vector.shape[0])
+                competence_vector, (batch_size, competence_vector.shape[0])
             )
             inputs.append(comp_batch)
         if condition_teacher_on_action:
             if action.ndim == 1:
                 action = action[None, :]
-            action_batch = jnp.broadcast_to(action, (obs.shape[0], action.shape[-1]))
+            action_batch = jnp.broadcast_to(action, (batch_size, action.shape[-1]))
             inputs.append(action_batch)
         return jnp.concatenate(inputs, axis=-1)
 
