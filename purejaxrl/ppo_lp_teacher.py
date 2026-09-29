@@ -83,8 +83,10 @@ class TrainConfig:
     ADD_GOAL_REWARD: bool = True
     CONDITION_ON_GOAL: bool = True
     GOAL_REACH_EPSILON: float = 1.0
-    # When True and goal_dim > 2: XY-sparse reach + dense -|dz|. When False: sparse on full goal dim.
+    # When True and goal_dim > 2: XY-sparse reach + env healthy reward. When False: sparse on full goal dim.
     SEPARATE_Z_GOAL_PENALTY: bool = False
+    # Scales env metrics["reward_alive"] (humanoid maze: 5.0 when healthy, else 0).
+    HEALTHY_REWARD_COEF: float = 1.0
     TEACHER_GOAL_X_MIN: float = 4.0
     TEACHER_GOAL_X_MAX: float = 12.0
     TEACHER_GOAL_Y_MIN: float = 4.0
@@ -169,6 +171,10 @@ def _replace_inner_brax_state(wrapped_state, brax_state):
 
 def _success_metric(wrapped_state):
     return _inner_brax_state(wrapped_state).metrics["success"]
+
+
+def _healthy_reward_metric(wrapped_state):
+    return _inner_brax_state(wrapped_state).metrics["reward_alive"]
 
 
 def _normalize_xy(goal, mean, var):
@@ -1296,6 +1302,7 @@ def make_train(config):
     condition_on_goal = config.get("CONDITION_ON_GOAL", False)
     goal_reach_epsilon = config.get("GOAL_REACH_EPSILON", 0.5)
     separate_z_goal_penalty = config.get("SEPARATE_Z_GOAL_PENALTY", False)
+    healthy_reward_coef = config.get("HEALTHY_REWARD_COEF", 1.0)
     if custom_env is not None:
         base_env = custom_env
         base_env_2 = custom_env_2
@@ -2412,7 +2419,7 @@ def make_train(config):
                     else:
                         agent_pos = obsv[..., :goal_dim]
                     if separate_z_goal_penalty and goal_dim > 2:
-                        # XY-sparse reach; dense Z penalty added below when ADD_GOAL_REWARD.
+                        # XY-sparse reach; env healthy reward added below when ADD_GOAL_REWARD.
                         dist = jnp.linalg.norm(
                             agent_pos[..., :2] - raw_goals[..., :2], axis=-1
                         )
@@ -2427,8 +2434,9 @@ def make_train(config):
                 if add_goal_reward:
                     goal_reward = teacher_goal_reach
                     if separate_z_goal_penalty and goal_dim > 2:
-                        z_penalty = -jnp.abs(agent_pos[..., 2] - raw_goals[..., 2])
-                        goal_reward = goal_reward + z_penalty
+                        healthy_reward = _healthy_reward_metric(env_state)
+                        # jax.debug.print("healthy_reward: {healthy_reward}", healthy_reward=healthy_reward)
+                        goal_reward = goal_reward + healthy_reward_coef * healthy_reward
                     # jax.debug.print("dist_mean: {dist}", dist=dist.mean())
                     # jax.debug.print("dist: {dist}", dist=dist)
                     # jax.debug.print("goals: {goals}", goals=goals)

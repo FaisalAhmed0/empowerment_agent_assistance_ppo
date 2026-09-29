@@ -11,6 +11,7 @@ USE_MAX_IN_LP_REWARD="--USE_MAX_IN_LP_REWARD"
 TEACHER_NORMALIZE_ADVANTAGES="--TEACHER_NORMALIZE_ADVANTAGES"
 TEACHER_CONDITION_ONLY_ON_COMPETENCE="--no-TEACHER_CONDITION_ONLY_ON_COMPETENCE"
 SEPARATE_Z_GOAL_PENALTY="--no-SEPARATE_Z_GOAL_PENALTY"
+HEALTHY_REWARD_COEF=1.0
 TOTAL_TIMESTEPS_=(500000000)
 LRS=(0.0003)
 TEACHER_LRS=(0.0003)
@@ -104,6 +105,7 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
                         --LP_EMA_ALPHA=${lp_ema_alpha} \
                         ${SAVE_MODEL} \
                         ${SEPARATE_Z_GOAL_PENALTY} \
+                        --HEALTHY_REWARD_COEF=${HEALTHY_REWARD_COEF} \
                         --GAE_LAMBDA=${gae_lambda} \
                         --TEACHER_ROLLOUT_BUFFER_SIZE=${teacher_rollout_buffer_size} \
                         --TEACHER_CLIP_EPS=${teacher_clip_eps} \
