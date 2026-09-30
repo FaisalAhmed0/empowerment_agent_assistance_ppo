@@ -299,6 +299,8 @@ def evaluate_multiple_goals(
     condition_on_goal=True,
     use_distance_in_competence=False,
     config=None,
+    goal_reach_epsilon=1.0,
+    separate_z_goal_penalty=False,
 ):
     """Evaluate success rate for each goal over multiple random starts.
 
@@ -364,13 +366,18 @@ def evaluate_multiple_goals(
                 step_rngs, env_state, action, env_params
             )
             current_pos = env_state.org_obs[..., : raw_goal_batch.shape[-1]]
-            dist = jnp.linalg.norm(current_pos - raw_goal_batch, axis=-1)
+            if separate_z_goal_penalty and raw_goal_batch.shape[-1] > 2:
+                dist = jnp.linalg.norm(
+                    current_pos[..., :2] - raw_goal_batch[..., :2], axis=-1
+                )
+            else:
+                dist = jnp.linalg.norm(current_pos - raw_goal_batch, axis=-1)
             active = 1.0 - ever_done
             # Ignore post-auto-reset steps after the first episode done.
             if use_distance_in_competence:
                 success = jnp.where(active > 0, dist, jnp.inf)
             else:
-                success = (dist <= 1.0).astype(dist.dtype) * active
+                success = (dist <= goal_reach_epsilon).astype(dist.dtype) * active
             ever_done = jnp.maximum(ever_done, done.astype(ever_done.dtype))
             return (obsv, env_state, rng, ever_done), success
 
@@ -1244,6 +1251,7 @@ def make_teacher_goal_set(config):
         min_x, max_x, min_y, max_y = get_maze_xy_bounds(
             maze_layout, size_scaling=2.0
         )
+        # import pdb;pdb.set_trace()
         xs = jnp.linspace(min_x, max_x, teacher_num_goal_points)
         ys = jnp.linspace(min_y, max_y, teacher_num_goal_points)
         gx, gy = jnp.meshgrid(xs, ys, indexing="ij")
@@ -2054,6 +2062,8 @@ def make_train(config):
                 condition_on_goal=condition_on_goal,
                 use_distance_in_competence=config["USE_DISTANCE_IN_COMPETENCE"],
                 config=config,
+                goal_reach_epsilon=goal_reach_epsilon,
+                separate_z_goal_penalty=separate_z_goal_penalty,
             )
 
         def evaluate_student_on_env_goal(student_params, stats_state, rng):

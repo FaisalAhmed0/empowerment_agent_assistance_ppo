@@ -7,6 +7,7 @@ from functools import partial
 from typing import Optional, Tuple, Union, Any
 from gymnax.environments import environment, spaces
 from brax import envs
+from brax.envs.base import Wrapper as BraxWrapper
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
 import navix as nx
 
@@ -114,6 +115,24 @@ class LogWrapper(GymnaxWrapper):
         return obs, state, reward, done, info
 
 
+class RecordTerminalObsWrapper(BraxWrapper):
+    """Stores each step's observation in ``state.info["terminal_obs"]``.
+
+    Must sit inside ``AutoResetWrapper``, which overwrites ``state.obs`` with
+    the reset observation on done but leaves ``state.info`` untouched.
+    """
+
+    def reset(self, rng):
+        state = self.env.reset(rng)
+        state.info["terminal_obs"] = state.obs
+        return state
+
+    def step(self, state, action):
+        state = self.env.step(state, action)
+        state.info["terminal_obs"] = state.obs
+        return state
+
+
 class BraxGymnaxWrapper:
     def __init__(
         self,
@@ -122,14 +141,18 @@ class BraxGymnaxWrapper:
         env=None,
         episode_length=1000,
         action_repeat=1,
+        expose_terminal_obs=False,
     ):
         if env is None:
             if env_name is None:
                 raise ValueError("Either env or env_name must be provided.")
             env = envs.get_environment(env_name=env_name, backend=backend)
         env = EpisodeWrapper(env, episode_length=episode_length, action_repeat=action_repeat)
+        if expose_terminal_obs:
+            env = RecordTerminalObsWrapper(env)
         env = AutoResetWrapper(env)
         self._env = env
+        self._expose_terminal_obs = expose_terminal_obs
         self.action_size = env.action_size
         self.observation_size = (env.observation_size,)
 
@@ -139,7 +162,10 @@ class BraxGymnaxWrapper:
 
     def step(self, key, state, action, params=None):
         next_state = self._env.step(state, action)
-        return next_state.obs, next_state, next_state.reward, next_state.done > 0.5, {}
+        info = {}
+        if self._expose_terminal_obs:
+            info["terminal_obs"] = next_state.info["terminal_obs"]
+        return next_state.obs, next_state, next_state.reward, next_state.done > 0.5, info
 
     def observation_space(self, params):
         return spaces.Box(

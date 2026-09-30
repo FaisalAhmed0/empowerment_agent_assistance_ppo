@@ -551,7 +551,6 @@ class HumanoidMaze(PipelineEnv):
 
     def _random_target(self, rng: jax.Array) -> jax.Array:
         """Returns a random target location chosen from possibilities specified in the maze layout."""
-        # import pdb;pdb.set_trace()
         idx = jax.random.randint(rng, (1,), 0, len(self.possible_goals))
         return jnp.array(self.possible_goals[idx])[0]
 

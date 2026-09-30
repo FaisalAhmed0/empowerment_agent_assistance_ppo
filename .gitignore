@@ -26,3 +26,23 @@ slurm*
 *.out
 *.csv
 *.zip
+# Launch scripts
+scripts/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.svg
+*.webp
+*.tif
+*.tiff
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
