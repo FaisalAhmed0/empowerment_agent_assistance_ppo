@@ -252,17 +252,6 @@ HARDEST_MAZE_50_PERCENT = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                         [1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1]]
 
 
-HARDEST_MAZE_SINGLE_GOAL = \
-                [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                [1, R, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
-                [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
-                [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
-                [1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1],
-                [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1],
-                [1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
-                [1, 0, 0, 1, 0, 0, 0, 1, G, G, G, 1], # goal coordinate is (28, 40)
-                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]
-
 HARDEST_MAZE_HARD_GOALS = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                 [1, R, 0, 0, 0, 1, 0, 0, 0, 0, G, 1],
                 [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1],
@@ -307,6 +296,32 @@ def find_goals(structure, size_scaling):
     return jnp.array(goals)
 
 
+def scale_maze_layout(structure, factor):
+    """Upsample a layout so each cell becomes a factor x factor block.
+
+    RESET is kept only in the top-left cell of its block so there is still a
+    single start; GOAL fills the whole block.
+    """
+    factor = int(factor)
+    if factor < 1:
+        raise ValueError(f"maze_scale_factor must be >= 1, got {factor}")
+    if factor == 1:
+        return structure
+    scaled = []
+    for row in structure:
+        for di in range(factor):
+            new_row = []
+            for cell in row:
+                for dj in range(factor):
+                    if cell == RESET and (di, dj) != (0, 0):
+                        new_row.append(0)
+                    else:
+                        new_row.append(cell)
+            scaled.append(new_row)
+    # import pdb; pdb.set_trace()
+    return scaled
+
+
 def get_maze_xy_bounds(structure, size_scaling=4.0):
     """Return (min_x, max_x, min_y, max_y) over free-cell centers.
 
@@ -325,7 +340,7 @@ def get_maze_xy_bounds(structure, size_scaling=4.0):
 
 
 # Create a xml with maze and a list of possible goal positions
-def make_maze(maze_layout_name, maze_size_scaling):
+def make_maze(maze_layout_name, maze_size_scaling, maze_scale_factor=1):
     if maze_layout_name == "u_maze":
         maze_layout = U_MAZE
     elif maze_layout_name == "u_maze_single_goal":
@@ -344,6 +359,8 @@ def make_maze(maze_layout_name, maze_size_scaling):
         maze_layout = HARDEST_MAZE_SINGLE_GOAL
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
+
+    maze_layout = scale_maze_layout(maze_layout, maze_scale_factor)
 
     xml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", "ant_maze.xml")
 
@@ -401,12 +418,17 @@ class AntMaze(PipelineEnv):
         backend="generalized",
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
+        maze_scale_factor: int = 1,
         dense_reward: bool = False,
         use_oracle_reward: bool = False,
         oracle_reward_coef: float = 1.0,
         **kwargs,
     ):
-        xml_string, possible_starts, possible_goals = make_maze(maze_layout_name, maze_size_scaling)
+        if use_oracle_reward and int(maze_scale_factor) != 1:
+            raise ValueError("use_oracle_reward is not supported with maze_scale_factor != 1")
+        xml_string, possible_starts, possible_goals = make_maze(
+            maze_layout_name, maze_size_scaling, maze_scale_factor
+        )
 
         sys = mjcf.loads(xml_string)
         self.possible_starts = possible_starts
