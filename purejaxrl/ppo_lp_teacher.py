@@ -1755,6 +1755,9 @@ def make_train(config):
     action_low = jnp.asarray(env.action_space(env_params).low)
     action_high = jnp.asarray(env.action_space(env_params).high)
     _render_obs_dim = int(env.observation_space(env_params).shape[0])
+    _render_env_goal_dim = int(
+        getattr(base_env, "goal_indices", jnp.array([0, 1])).shape[0]
+    )
 
     def _obs_norm_stats_for_render(final_env_state):
         obs_mean, obs_var = _extract_obs_norm_stats(final_env_state, _render_obs_dim)
@@ -1784,26 +1787,23 @@ def make_train(config):
     def _render_rollout_impl(
         params, teacher_params, competence_vector, rng, obs_mean, obs_var
     ):
+        def _env_goal(state):
+            raw = state.obs[..., -_render_env_goal_dim:]
+            return raw, _policy_goal_from_raw(raw, obs_mean, obs_var)
+
         rng, reset_rng = jax.random.split(rng)
         state = base_env.reset(reset_rng)
         raw_goal = jnp.zeros((goal_dim,), dtype=jnp.float32)
         policy_goal = jnp.zeros((goal_dim,), dtype=jnp.float32)
         if condition_on_goal:
-            rng, teacher_rng = jax.random.split(rng)
-            norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
-            raw_goal = _sample_teacher_goals(
-                teacher_params,
-                norm_obs,
-                competence_vector,
-                teacher_rng,
+            assert _render_env_goal_dim == goal_dim, (
+                f"env goal dim {_render_env_goal_dim} != teacher goal dim {goal_dim}"
             )
-            if raw_goal.ndim > 1:
-                raw_goal = raw_goal[0]
-            policy_goal = _policy_goal_from_raw(raw_goal, obs_mean, obs_var)
+            raw_goal, policy_goal = _env_goal(state)
 
         def step_fn(carry, _):
             state, raw_goal, policy_goal, rng = carry
-            rng, action_rng, goal_rng = jax.random.split(rng, 3)
+            rng, action_rng = jax.random.split(rng)
             action = _sample_render_action(
                 params, state.obs, obs_mean, obs_var, policy_goal, action_rng
             )
@@ -1815,20 +1815,7 @@ def make_train(config):
                 repeat_step, state, None, length=render_action_repeat
             )
             if condition_on_goal:
-                norm_obs = _normalize_eval_obs(state.obs, obs_mean, obs_var)
-                new_raw_goal = _sample_teacher_goals(
-                    teacher_params,
-                    norm_obs,
-                    competence_vector,
-                    goal_rng,
-                )
-                if new_raw_goal.ndim > 1:
-                    new_raw_goal = new_raw_goal[0]
-                new_policy_goal = _policy_goal_from_raw(
-                    new_raw_goal, obs_mean, obs_var
-                )
-                raw_goal = jnp.where(state.done, new_raw_goal, raw_goal)
-                policy_goal = jnp.where(state.done, new_policy_goal, policy_goal)
+                raw_goal, policy_goal = _env_goal(state)
             return (state, raw_goal, policy_goal, rng), state.pipeline_state
 
         _, pipeline_states = jax.lax.scan(
