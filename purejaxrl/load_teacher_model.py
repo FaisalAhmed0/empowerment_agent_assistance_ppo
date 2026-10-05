@@ -6,7 +6,8 @@ Expected layout (created when training with --SAVE_MODEL):
     checkpoints/
       teacher/       # Orbax StandardCheckpointer of teacher TrainState
       teacher_ema/   # EMA teacher params (same TrainState layout)
-      teacher_avg/   # Uniform-average teacher params (same TrainState layout)
+      teacher_avg/   # Uniform-average teacher params (same TrainState layout);
+                     # written at every max-log-sum save, overwritten at end of run
       teacher_max_log_sum_competence/  # teacher at max log(sum(competence))
       student/       # final student TrainState
       student_max_log_sum_competence/  # student paired with max-log-sum teacher
@@ -39,20 +40,20 @@ except ImportError:
     from envs.factory import make_custom_env
 
 try:
-    from envs.ant_maze import all_possible_goals
+    from envs import ant_maze
 except ImportError:
-    from purejaxrl.envs.ant_maze import all_possible_goals
+    from purejaxrl.envs import ant_maze
 
 from wrappers import BraxGymnaxWrapper
 
 try:
-    from purejaxrl.ppo_continuous_action_custom_brax_with_teacher_simple_reward import (
+    from purejaxrl.ppo_lp_teacher import (
         ActorCritic,
         TeacherActorCritic,
         load_checkpoint,
     )
 except ImportError:
-    from ppo_continuous_action_custom_brax_with_teacher_simple_reward import (
+    from ppo_lp_teacher import (
         ActorCritic,
         TeacherActorCritic,
         load_checkpoint,
@@ -125,6 +126,57 @@ def load_obs_norm_stats(
     return mean, var
 
 
+def teacher_goal_set_from_config(
+    config: dict[str, Any],
+) -> tuple[np.ndarray, int, np.ndarray, list]:
+    """Rebuild the teacher goal grid and competence goals used in training.
+
+    Mirrors the ant branch of ``make_teacher_goal_set`` in the training
+    scripts. Returns ``(goal_grid, num_points, competence_goals, maze_layout)``
+    where ``maze_layout`` is the (scaled) layout containing the reset cell.
+    """
+    env_name = config["ENV_NAME"]
+    if "ant" not in env_name:
+        raise ValueError(f"Only ant maze envs are supported, got {env_name!r}")
+    if "u_maze" in env_name:
+        maze_layout = ant_maze.U_MAZE
+        all_goals_layout = ant_maze.U_MAZE_ALL_STATES
+        custom_goal = np.array([12.0, 8.0], dtype=np.float32)
+    elif "big_maze" in env_name:
+        maze_layout = ant_maze.BIG_MAZE
+        all_goals_layout = ant_maze.BIG_MAZE_ALL_GOALS
+        custom_goal = np.array([12.0, 8.0], dtype=np.float32)
+    elif "hardest_maze" in env_name:
+        maze_layout = ant_maze.HARDEST_MAZE
+        all_goals_layout = ant_maze.HARDEST_MAZE_ALL_GOALS
+        custom_goal = np.array([28.0, 40.0], dtype=np.float32)
+    else:
+        raise ValueError(f"Unknown maze layout: {env_name}")
+
+    maze_scale_factor = int(config.get("MAZE_SCALE_FACTOR", 1))
+    maze_layout = ant_maze.scale_maze_layout(maze_layout, maze_scale_factor)
+    all_goals_layout = ant_maze.scale_maze_layout(all_goals_layout, maze_scale_factor)
+    custom_goal = custom_goal * maze_scale_factor
+
+    num_points = int(config["TEACHER_NUM_GOAL_POINTS"])
+    min_x, max_x, min_y, max_y = ant_maze.get_maze_xy_bounds(maze_layout)
+    xs = np.linspace(min_x, max_x, num_points)
+    ys = np.linspace(min_y, max_y, num_points)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    goal_grid = np.stack([gx.ravel(), gy.ravel()], axis=-1).astype(np.float32)
+    replace_idx = int(np.argmin(np.sum((goal_grid - custom_goal) ** 2, axis=-1)))
+    goal_grid[replace_idx] = custom_goal
+
+    competence_goals = np.asarray(
+        ant_maze.all_possible_goals(all_goals_layout), dtype=np.float32
+    )
+    return goal_grid, num_points, competence_goals, maze_layout
+
+
+def _num_competence(config: dict[str, Any]) -> int:
+    return int(teacher_goal_set_from_config(config)[2].shape[0])
+
+
 def _make_env(config: dict[str, Any]):
     env_kwargs = config.get("ENV_KWARGS", {}) or {}
     custom_env = make_custom_env(
@@ -158,7 +210,7 @@ def _teacher_obs_dim(config: dict[str, Any], base_obs_dim: int, action_dim: int)
         config.get("CONDITION_TEACHER_ON_ACTION", True)
     )
     teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", False))
-    num_competence = int(all_possible_goals().shape[0])
+    num_competence = _num_competence(config)
     if only_competence:
         return num_competence
     state_obs_dim = 2 if teacher_obs_goal_only else base_obs_dim
@@ -358,7 +410,7 @@ def load_teacher_model(
         config.get("CONDITION_TEACHER_ON_ACTION", True)
     )
     teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", False))
-    num_competence = int(all_possible_goals().shape[0])
+    num_competence = _num_competence(config)
     teacher_obs_dim = _teacher_obs_dim(config, base_obs_dim, action_dim)
 
     if only_competence:
@@ -389,15 +441,23 @@ def load_teacher_model(
             concatenate=conditional_concatenate,
         )
     else:
-        teacher_network = TeacherActorCritic(
+        teacher_kwargs = dict(
             num_actions=teacher_num_goal_points * teacher_num_goal_points,
             obs_dim=teacher_net_obs_dim,
             competence_dim=teacher_net_competence_dim,
-            student_action_dim=teacher_net_action_dim,
             activation=config.get("TEACHER_ACTIVATION", "tanh"),
             hidden_dim=int(config.get("TEACHER_HIDDEN_DIM", 256)),
             use_encoders=bool(config.get("TEACHER_USE_ENCODERS", True)),
         )
+        # ppo_lp_teacher's TeacherActorCritic never conditions on the action.
+        if "student_action_dim" in TeacherActorCritic.__dataclass_fields__:
+            teacher_kwargs["student_action_dim"] = teacher_net_action_dim
+        elif teacher_net_action_dim:
+            raise ValueError(
+                "Experiment conditions the teacher on the action, but "
+                "TeacherActorCritic has no student_action_dim field"
+            )
+        teacher_network = TeacherActorCritic(**teacher_kwargs)
 
     rng = jax.random.PRNGKey(seed)
     teacher_init_params = teacher_network.init(

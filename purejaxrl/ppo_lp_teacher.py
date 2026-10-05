@@ -169,6 +169,9 @@ class TrainConfig:
     TEACHER_USE_ENCODERS: bool = True
     TEACHER_ACTIVATION: str = "tanh"
     TEACHER_NORMALIZE_ADVANTAGES: bool = True
+    # Save every teacher PPO batch (state, competence, goal, sampling logits, update idx)
+    # to EXP_DIR/teacher_interactions/ for distill_teacher.py.
+    SAVE_TEACHER_INTERACTIONS: bool = False
     # Agent XY logging
     AGENT_POSITIONS_LOG_FREQ: int = 100
     AGENT_POSITIONS_REF_ENV_INDEX: int = 0
@@ -911,9 +914,11 @@ class ActorCritic(nn.Module):
 
 
 class TeacherTrainState(TrainState):
-    """TrainState that also tracks an exponential moving average of params."""
+    """TrainState that also tracks EMA and uniform-average copies of params."""
 
     ema_params: Any
+    avg_params: Any
+    avg_count: Any
 
 
 class TeacherActorCritic(nn.Module):
@@ -1095,6 +1100,9 @@ class TeacherEpisodeCarry(NamedTuple):
     raw_goal: jnp.ndarray
     log_prob: jnp.ndarray
     value: jnp.ndarray
+    base_obs: jnp.ndarray
+    competence: jnp.ndarray
+    logits: jnp.ndarray
 
 
 class TeacherRolloutTransition(NamedTuple):
@@ -1104,6 +1112,9 @@ class TeacherRolloutTransition(NamedTuple):
     log_prob: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
+    base_obs: jnp.ndarray
+    competence: jnp.ndarray
+    logits: jnp.ndarray
 
 
 class TeacherRolloutBuffer(NamedTuple):
@@ -1113,6 +1124,9 @@ class TeacherRolloutBuffer(NamedTuple):
     log_prob: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
+    base_obs: jnp.ndarray
+    competence: jnp.ndarray
+    logits: jnp.ndarray
     write_idx: jnp.ndarray
     count: jnp.ndarray
 
@@ -1125,27 +1139,62 @@ class TeacherFlatBatch(NamedTuple):
     log_prob: jnp.ndarray
 
 
-def init_teacher_episode_carry(num_envs, teacher_obs_dim, goal_dim, dtype):
+class TeacherInteractionBatch(NamedTuple):
+    """Raw teacher inputs/outputs for a PPO batch, in TeacherFlatBatch row order."""
+
+    teacher_obs: jnp.ndarray
+    base_obs: jnp.ndarray
+    competence: jnp.ndarray
+    goal_idx: jnp.ndarray
+    raw_goal: jnp.ndarray
+    logits: jnp.ndarray
+
+
+def init_teacher_episode_carry(
+    num_envs, teacher_obs_dim, goal_dim, base_obs_dim, num_competence, num_goals, dtype
+):
     return TeacherEpisodeCarry(
         teacher_obs=jnp.zeros((num_envs, teacher_obs_dim), dtype=dtype),
         goal_idx=jnp.zeros((num_envs,), dtype=jnp.int32),
         raw_goal=jnp.zeros((num_envs, goal_dim), dtype=dtype),
         log_prob=jnp.zeros((num_envs,), dtype=dtype),
         value=jnp.zeros((num_envs,), dtype=dtype),
+        base_obs=jnp.zeros((num_envs, base_obs_dim), dtype=dtype),
+        competence=jnp.zeros((num_envs, num_competence), dtype=dtype),
+        logits=jnp.zeros((num_envs, num_goals), dtype=dtype),
     )
 
 
-def teacher_carry_from_act(raw_goal, goal_idx, log_prob, value, teacher_obs):
+def teacher_carry_from_act(
+    raw_goal, goal_idx, log_prob, value, teacher_obs, base_obs, competence, logits
+):
+    num_envs = goal_idx.shape[0]
+    competence = jnp.asarray(competence)
+    competence = jnp.broadcast_to(
+        competence, (num_envs, competence.shape[-1])
+    ).astype(teacher_obs.dtype)
     return TeacherEpisodeCarry(
         teacher_obs=teacher_obs,
         goal_idx=goal_idx,
         raw_goal=raw_goal,
         log_prob=log_prob,
         value=value,
+        base_obs=base_obs.astype(teacher_obs.dtype),
+        competence=competence,
+        logits=logits.astype(teacher_obs.dtype),
     )
 
 
-def init_teacher_rollout_buffer(buffer_size, num_envs, teacher_obs_dim, goal_dim, dtype):
+def init_teacher_rollout_buffer(
+    buffer_size,
+    num_envs,
+    teacher_obs_dim,
+    goal_dim,
+    base_obs_dim,
+    num_competence,
+    num_goals,
+    dtype,
+):
     return TeacherRolloutBuffer(
         teacher_obs=jnp.zeros((buffer_size, num_envs, teacher_obs_dim), dtype=dtype),
         goal_idx=jnp.zeros((buffer_size, num_envs), dtype=jnp.int32),
@@ -1153,6 +1202,9 @@ def init_teacher_rollout_buffer(buffer_size, num_envs, teacher_obs_dim, goal_dim
         log_prob=jnp.zeros((buffer_size, num_envs), dtype=dtype),
         value=jnp.zeros((buffer_size, num_envs), dtype=dtype),
         reward=jnp.zeros((buffer_size, num_envs), dtype=dtype),
+        base_obs=jnp.zeros((buffer_size, num_envs, base_obs_dim), dtype=dtype),
+        competence=jnp.zeros((buffer_size, num_envs, num_competence), dtype=dtype),
+        logits=jnp.zeros((buffer_size, num_envs, num_goals), dtype=dtype),
         write_idx=jnp.array(0, dtype=jnp.int32),
         count=jnp.array(0, dtype=jnp.int32),
     )
@@ -1168,6 +1220,9 @@ def push_teacher_transition(buffer, transition):
         log_prob=buffer.log_prob.at[idx].set(transition.log_prob),
         value=buffer.value.at[idx].set(transition.value),
         reward=buffer.reward.at[idx].set(transition.reward),
+        base_obs=buffer.base_obs.at[idx].set(transition.base_obs),
+        competence=buffer.competence.at[idx].set(transition.competence),
+        logits=buffer.logits.at[idx].set(transition.logits),
         write_idx=buffer.write_idx + 1,
         count=jnp.minimum(buffer.count + 1, buffer_size),
     )
@@ -1187,6 +1242,9 @@ def push_teacher_rollout_on_done(buffer, carry, teacher_reward, done):
         log_prob=carry.log_prob,
         value=carry.value,
         reward=teacher_reward,
+        base_obs=carry.base_obs,
+        competence=carry.competence,
+        logits=carry.logits,
     )
     return jax.lax.cond(
         jnp.any(done),
@@ -1207,8 +1265,7 @@ def teacher_buffer_mean_reward(buffer):
     return total / jnp.maximum(num_valid.astype(buffer.reward.dtype), 1.0)
 
 
-def flatten_teacher_rollout_buffer(buffer, buffer_size):
-    """Flatten valid ring-buffer slots into a terminal teacher PPO batch."""
+def _teacher_buffer_flattener(buffer, buffer_size):
     num_envs = buffer.teacher_obs.shape[1]
     start = (buffer.write_idx - buffer_size) % buffer_size
     slot_indices = (start + jnp.arange(buffer_size)) % buffer_size
@@ -1217,12 +1274,31 @@ def flatten_teacher_rollout_buffer(buffer, buffer_size):
         gathered = field[slot_indices]
         return gathered.reshape((buffer_size * num_envs,) + gathered.shape[2:])
 
+    return _gather_and_flatten
+
+
+def flatten_teacher_rollout_buffer(buffer, buffer_size):
+    """Flatten valid ring-buffer slots into a terminal teacher PPO batch."""
+    _gather_and_flatten = _teacher_buffer_flattener(buffer, buffer_size)
     return TeacherFlatBatch(
         obs=_gather_and_flatten(buffer.teacher_obs),
         action=_gather_and_flatten(buffer.goal_idx),
         value=_gather_and_flatten(buffer.value),
         reward=_gather_and_flatten(buffer.reward),
         log_prob=_gather_and_flatten(buffer.log_prob),
+    )
+
+
+def flatten_teacher_interactions(buffer, buffer_size):
+    """Same row order as ``flatten_teacher_rollout_buffer``."""
+    _gather_and_flatten = _teacher_buffer_flattener(buffer, buffer_size)
+    return TeacherInteractionBatch(
+        teacher_obs=_gather_and_flatten(buffer.teacher_obs),
+        base_obs=_gather_and_flatten(buffer.base_obs),
+        competence=_gather_and_flatten(buffer.competence),
+        goal_idx=_gather_and_flatten(buffer.goal_idx),
+        raw_goal=_gather_and_flatten(buffer.raw_goal),
+        logits=_gather_and_flatten(buffer.logits),
     )
 
 
@@ -1234,6 +1310,9 @@ def reset_teacher_rollout_buffer(buffer):
         log_prob=jnp.zeros_like(buffer.log_prob),
         value=jnp.zeros_like(buffer.value),
         reward=jnp.zeros_like(buffer.reward),
+        base_obs=jnp.zeros_like(buffer.base_obs),
+        competence=jnp.zeros_like(buffer.competence),
+        logits=jnp.zeros_like(buffer.logits),
         write_idx=jnp.array(0, dtype=jnp.int32),
         count=jnp.array(0, dtype=jnp.int32),
     )
@@ -1512,6 +1591,25 @@ def make_train(config):
     teacher_vf_coef = config["TEACHER_VF_COEF"]
     teacher_ent_coef = config["TEACHER_ENT_COEF"]
     teacher_rollout_buffer_size = int(config["TEACHER_ROLLOUT_BUFFER_SIZE"])
+    save_teacher_interactions = bool(config.get("SAVE_TEACHER_INTERACTIONS", False))
+    teacher_interactions_dir = os.path.join(
+        config.get("EXP_DIR", "."), "teacher_interactions"
+    )
+
+    def _save_teacher_interactions_host(batch, uidx):
+        try:
+            uidx = int(uidx)
+            os.makedirs(teacher_interactions_dir, exist_ok=True)
+            arrays = {k: np.asarray(v) for k, v in batch._asdict().items()}
+            num_rows = arrays["goal_idx"].shape[0]
+            np.savez(
+                os.path.join(teacher_interactions_dir, f"update_{uidx:07d}.npz"),
+                update_idx=np.full((num_rows,), uidx, dtype=np.int64),
+                **arrays,
+            )
+        except Exception as err:
+            print(f"[save_teacher_interactions] skipped update {uidx}: {err}")
+            traceback.print_exc()
     should_save_agent_trajectory_xy = bool(
         config.get("SAVE_AGENT_TRAJECTORY_XY", False)
     )
@@ -1678,7 +1776,7 @@ def make_train(config):
         goal_idx = pi.sample(seed=rng)
         raw_goal = goal_grid[goal_idx].astype(jnp.float32)
         log_prob = pi.log_prob(goal_idx)
-        return raw_goal, goal_idx, log_prob, value, teacher_obs
+        return raw_goal, goal_idx, log_prob, value, teacher_obs, pi.logits
 
     def _teacher_input_grad_norms(teacher_params, teacher_obs):
         """Frobenius norms / mean-|grad| of d(logits)/d(input) per input block.
@@ -1739,7 +1837,7 @@ def make_train(config):
             wandb.log(payload, step=int(step))
 
     def _sample_teacher_goals(teacher_params, obs, competence_vector, rng):
-        raw_goal, _, _, _, _ = _teacher_act(
+        raw_goal, *_ = _teacher_act(
             teacher_params, obs, competence_vector, rng
         )
         return raw_goal
@@ -2134,21 +2232,35 @@ def make_train(config):
             params=teacher_init_params,
             tx=teacher_tx,
             ema_params=teacher_init_params,
+            avg_params=teacher_init_params,
+            avg_count=jnp.array(0.0, dtype=jnp.float32),
         )
         _teacher_ckpt_host["apply_fn"] = teacher_train_state.apply_fn
         _teacher_ckpt_host["tx"] = teacher_train_state.tx
 
         def teacher_act_and_carry(obs, competence_vector, rng):
-            raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs = (
-                _teacher_act(
-                    teacher_train_state.params,
-                    obs,
-                    competence_vector,
-                    rng,
-                )
+            (
+                raw_goal,
+                goal_idx,
+                teacher_log_prob,
+                teacher_value,
+                teacher_obs,
+                teacher_logits,
+            ) = _teacher_act(
+                teacher_train_state.params,
+                obs,
+                competence_vector,
+                rng,
             )
             carry = teacher_carry_from_act(
-                raw_goal, goal_idx, teacher_log_prob, teacher_value, teacher_obs
+                raw_goal,
+                goal_idx,
+                teacher_log_prob,
+                teacher_value,
+                teacher_obs,
+                obs,
+                competence_vector,
+                teacher_logits,
             )
             return raw_goal, carry
 
@@ -2241,6 +2353,9 @@ def make_train(config):
             config["NUM_ENVS"],
             teacher_obs_dim,
             goal_dim,
+            base_obs_dim,
+            num_competence,
+            num_teacher_goals,
             obsv.dtype,
         )
         goals = raw_goals
@@ -2646,6 +2761,7 @@ def make_train(config):
                     teacher_log_prob,
                     teacher_value,
                     teacher_obs,
+                    teacher_logits,
                 ) = _teacher_act(
                     teacher_train_state.params,
                     obsv[..., :base_obs_dim],
@@ -2658,6 +2774,9 @@ def make_train(config):
                     teacher_log_prob,
                     teacher_value,
                     teacher_obs,
+                    obsv[..., :base_obs_dim],
+                    competence_vector,
+                    teacher_logits,
                 )
                 teacher_episode_carry = jax.tree.map(
                     lambda f, o: _where_done(done, f, o),
@@ -2938,6 +3057,14 @@ def make_train(config):
                 flat_batch = flatten_teacher_rollout_buffer(
                     t_buffer, teacher_rollout_buffer_size
                 )
+                if save_teacher_interactions:
+                    jax.debug.callback(
+                        _save_teacher_interactions_host,
+                        flatten_teacher_interactions(
+                            t_buffer, teacher_rollout_buffer_size
+                        ),
+                        update_idx,
+                    )
                 last_val = jnp.array(0.0, dtype=flat_batch.value.dtype)
                 advantages, targets = _teacher_calculate_gae(flat_batch, last_val)
 
@@ -3066,7 +3193,15 @@ def make_train(config):
                     t_state.ema_params,
                     t_state.params,
                 )
-                return t_state.replace(ema_params=new_ema)
+                new_count = t_state.avg_count + 1.0
+                new_avg = jax.tree_util.tree_map(
+                    lambda a, p: a + (p - a) / new_count,
+                    t_state.avg_params,
+                    t_state.params,
+                )
+                return t_state.replace(
+                    ema_params=new_ema, avg_params=new_avg, avg_count=new_count
+                )
 
             def _keep_teacher_ema(operands):
                 return operands
@@ -3368,6 +3503,7 @@ def make_train(config):
                         teacher_step,
                         teacher_params,
                         teacher_opt_state,
+                        teacher_avg_params,
                         student_step,
                         student_params,
                         student_opt_state,
@@ -3390,12 +3526,21 @@ def make_train(config):
                     student_ckpt_dir = os.path.join(
                         checkpoint_root, "student_max_log_sum_competence"
                     )
+                    teacher_avg_ckpt_dir = os.path.join(checkpoint_root, "teacher_avg")
                     os.makedirs(teacher_ckpt_dir, exist_ok=True)
                     os.makedirs(student_ckpt_dir, exist_ok=True)
+                    os.makedirs(teacher_avg_ckpt_dir, exist_ok=True)
                     teacher_ckpt_state = TrainState(
                         step=int(teacher_step),
                         apply_fn=_teacher_ckpt_host["apply_fn"],
                         params=teacher_params,
+                        tx=_teacher_ckpt_host["tx"],
+                        opt_state=teacher_opt_state,
+                    )
+                    teacher_avg_ckpt_state = TrainState(
+                        step=int(teacher_step),
+                        apply_fn=_teacher_ckpt_host["apply_fn"],
+                        params=teacher_avg_params,
                         tx=_teacher_ckpt_host["tx"],
                         opt_state=teacher_opt_state,
                     )
@@ -3407,6 +3552,7 @@ def make_train(config):
                         opt_state=student_opt_state,
                     )
                     save_checkpoint(teacher_ckpt_state, teacher_ckpt_dir)
+                    save_checkpoint(teacher_avg_ckpt_state, teacher_avg_ckpt_dir)
                     save_checkpoint(student_ckpt_state, student_ckpt_dir)
                     if config.get("NORMALIZE_ENV", False) and len(obs_norm_args) == 3:
                         obs_mean, obs_var, obs_count = obs_norm_args
@@ -3437,6 +3583,7 @@ def make_train(config):
                                 "step": int(global_step),
                                 "competence_mean": float(competence_mean_val),
                                 "teacher_checkpoint": teacher_ckpt_dir,
+                                "teacher_avg_checkpoint": teacher_avg_ckpt_dir,
                                 "student_checkpoint": student_ckpt_dir,
                             },
                             f,
@@ -3445,7 +3592,8 @@ def make_train(config):
                     print(
                         f"[checkpoint] new max log-sum competence={score:.6f} "
                         f"at step={int(global_step)}; saved teacher to "
-                        f"{teacher_ckpt_dir} and student to {student_ckpt_dir}"
+                        f"{teacher_ckpt_dir}, average teacher to "
+                        f"{teacher_avg_ckpt_dir} and student to {student_ckpt_dir}"
                     )
                     if config.get("WANDB_MODE", "disabled") == "online":
                         wandb.log(
@@ -3462,6 +3610,7 @@ def make_train(config):
                     teacher_train_state.step,
                     teacher_train_state.params,
                     teacher_train_state.opt_state,
+                    teacher_train_state.avg_params,
                     train_state.step,
                     train_state.params,
                     train_state.opt_state,
@@ -3970,9 +4119,11 @@ def main():
         student_ckpt_dir = os.path.join(checkpoint_root, "student")
         teacher_ckpt_dir = os.path.join(checkpoint_root, "teacher")
         teacher_ema_ckpt_dir = os.path.join(checkpoint_root, "teacher_ema")
+        teacher_avg_ckpt_dir = os.path.join(checkpoint_root, "teacher_avg")
         os.makedirs(student_ckpt_dir, exist_ok=True)
         os.makedirs(teacher_ckpt_dir, exist_ok=True)
         os.makedirs(teacher_ema_ckpt_dir, exist_ok=True)
+        os.makedirs(teacher_avg_ckpt_dir, exist_ok=True)
         config_path = os.path.join(exp_dir, "config.json")
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2, default=str)
@@ -3993,10 +4144,19 @@ def main():
             opt_state=_final_teacher_train_state.opt_state,
         )
         save_checkpoint(teacher_ckpt_state, teacher_ckpt_dir)
+        teacher_avg_ckpt_state = TrainState(
+            step=_final_teacher_train_state.step,
+            apply_fn=_final_teacher_train_state.apply_fn,
+            params=_final_teacher_train_state.avg_params,
+            tx=_final_teacher_train_state.tx,
+            opt_state=_final_teacher_train_state.opt_state,
+        )
         save_checkpoint(teacher_ema_ckpt_state, teacher_ema_ckpt_dir)
+        save_checkpoint(teacher_avg_ckpt_state, teacher_avg_ckpt_dir)
         print(f"[checkpoint] saved student model to {student_ckpt_dir}")
         print(f"[checkpoint] saved teacher model to {teacher_ckpt_dir}")
         print(f"[checkpoint] saved teacher EMA model to {teacher_ema_ckpt_dir}")
+        print(f"[checkpoint] saved teacher average model to {teacher_avg_ckpt_dir}")
         print(f"[checkpoint] saved config to {config_path}")
         if config.get("NORMALIZE_ENV", False):
             # Observation dim is the trailing dim of the running mean in env_state.
