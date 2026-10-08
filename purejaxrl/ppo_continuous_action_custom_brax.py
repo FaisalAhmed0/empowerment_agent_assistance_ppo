@@ -45,7 +45,7 @@ from wonderwords import RandomWord
 @dataclass
 class TrainConfig:
     LR: float = 3e-4
-    NUM_ENVS: int = 245
+    NUM_ENVS: int = 256
     NUM_STEPS: int = 64
     TOTAL_TIMESTEPS: int = int(5e7)
     UPDATE_EPOCHS: int = 4
@@ -65,6 +65,7 @@ class TrainConfig:
     ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
     ANNEAL_LR: bool = True
     NORMALIZE_ENV: bool = True
+    OBS_NORM_WARMUP_STEPS: int = 5000
     DEBUG: bool = False
     SEED: int = 30
     WANDB_MODE: str = "online"
@@ -82,7 +83,7 @@ class TrainConfig:
     USE_ORACLE_REWARD: bool = False
     ORACLE_REWARD_COEF: float = 1.0
     CONDITION_ON_GOAL: bool = False
-    GOAL_REACH_EPSILON: float = 0.5
+    GOAL_REACH_EPSILON: float = 1.0
     HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
@@ -92,6 +93,7 @@ class TrainConfig:
     RND_HIDDEN_DIM: int = 256
     RND_OUTPUT_DIM: int = 128
     CONDITION_RND_ON_COMPETENCE: bool = False
+    RND_XY_ONLY: bool = False
     NUM_EVAL_ENVS: int = 10
     USE_DISTANCE_IN_COMPETENCE: bool = False
     USE_ICM: bool = False
@@ -100,6 +102,7 @@ class TrainConfig:
     ICM_HIDDEN_DIM: int = 256
     ICM_FEATURE_DIM: int = 128
     ICM_BETA: float = 0.2
+    ICM_XY_ONLY: bool = False
     TASK_REWARD_COEF: float = 1.0
     LOG_CSV: bool = True
     CSV_LOG_FREQ: int = 1
@@ -622,6 +625,8 @@ def make_train(config):
         output_dim=config.get("RND_OUTPUT_DIM", 128),
     )
     use_icm = config.get("USE_ICM", False)
+    rnd_xy_only = config.get("RND_XY_ONLY", False)
+    icm_xy_only = config.get("ICM_XY_ONLY", False)
     if custom_env is not None:
         base_env = custom_env
         base_env_2 = custom_env_2
@@ -832,7 +837,9 @@ def make_train(config):
         )
 
         obs_dim = int(env.observation_space(env_params).shape[0])
-        rnd_input_dim = obs_dim + num_competence
+        rnd_state_dim = 2 if rnd_xy_only else obs_dim
+        icm_obs_dim = 2 if icm_xy_only else obs_dim
+        rnd_input_dim = rnd_state_dim + num_competence
         rng, rnd_rng = jax.random.split(rng)
         rnd_state = init_rnd_state(
             rnd_rng,
@@ -847,7 +854,7 @@ def make_train(config):
         icm_state = init_icm_state(
             icm_rng,
             icm_network,
-            obs_dim,
+            icm_obs_dim,
             action_dim,
             config["NUM_ENVS"],
             config.get("ICM_LR", 1e-4),
@@ -909,10 +916,14 @@ def make_train(config):
                         obsv = jnp.concatenate([obsv, jnp.zeros((config["NUM_ENVS"], goal_dim))], axis=-1)
                     return (obsv, env_state, rng), None
                 _, pipeline_states = jax.lax.scan(
-                    step_fn, (obsv, env_state, rng), None, length=5000
+                    step_fn,
+                    (obsv, env_state, rng),
+                    None,
+                    length=config["OBS_NORM_WARMUP_STEPS"],
                 )
                 return env_state
-            warmup_env_state = run_policy(network_params, rng)
+            rng, warmup_rng = jax.random.split(rng)
+            warmup_env_state = run_policy(network_params, warmup_rng)
             obs_mean = warmup_env_state.mean
             obs_var = warmup_env_state.var
             # jax.debug.print("obs_mean: {obs_mean}", obs_mean=obs_mean[0])
@@ -1013,6 +1024,7 @@ def make_train(config):
                     icm_obs_t = env_state.org_obs
                 else:
                     icm_obs_t = last_obs[..., :obs_dim]
+                icm_obs_t = icm_obs_t[..., :icm_obs_dim]
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -1042,7 +1054,7 @@ def make_train(config):
                 if use_rnd:
                     rnd_obs = (
                         env_state.org_obs if config["NORMALIZE_ENV"] else obsv
-                    )
+                    )[..., :rnd_state_dim]
                     if condition_rnd_on_competence:
                         competence_batch = jnp.broadcast_to(
                             competence_vector,
@@ -1077,7 +1089,7 @@ def make_train(config):
                 if use_icm:
                     icm_next_obs = (
                         env_state.org_obs if config["NORMALIZE_ENV"] else obsv
-                    )
+                    )[..., :icm_obs_dim]
                     icm_state, icm_reward, icm_raw_intrinsic = icm_step(
                         icm_state,
                         icm_network,
@@ -1089,10 +1101,10 @@ def make_train(config):
                     )
                 else:
                     icm_next_obs = jnp.zeros(
-                        (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
+                        (config["NUM_ENVS"], icm_obs_dim), dtype=task_reward.dtype
                     )
                     icm_obs_t = jnp.zeros(
-                        (config["NUM_ENVS"], obs_dim), dtype=task_reward.dtype
+                        (config["NUM_ENVS"], icm_obs_dim), dtype=task_reward.dtype
                     )
                     icm_reward = jnp.zeros_like(task_reward)
                     icm_raw_intrinsic = jnp.zeros_like(task_reward)
@@ -1214,9 +1226,9 @@ def make_train(config):
 
             if use_icm:
                 batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
-                icm_obs_batch = traj_batch.icm_obs.reshape((batch_size, obs_dim))
+                icm_obs_batch = traj_batch.icm_obs.reshape((batch_size, icm_obs_dim))
                 icm_next_obs_batch = traj_batch.icm_next_obs.reshape(
-                    (batch_size, obs_dim)
+                    (batch_size, icm_obs_dim)
                 )
                 icm_action_batch = traj_batch.action.reshape(
                     (batch_size, action_dim)

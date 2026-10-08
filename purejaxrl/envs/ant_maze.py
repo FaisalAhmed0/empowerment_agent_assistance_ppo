@@ -41,7 +41,28 @@ BIG_MAZE_SINGLE_GOAL_PATH_CELLS = [
     (1, 6),
     (2, 6),
 ]
-ORACLE_PATH_PASS_MARGIN = 2.0
+# Shortest route from R=(1,1) through the goal chain; ties with the top-row
+# route via (1,4) are broken toward fewer turns.
+HARDEST_MAZE_SINGLE_GOAL_PATH_CELLS = [
+    (1, 1),
+    (2, 1),
+    (3, 1),
+    (3, 2),
+    (3, 3),
+    (3, 4),
+    (3, 5),
+    (3, 6),
+    (4, 6),
+    (5, 6),
+    (5, 7),
+    (5, 8),
+    (6, 8),
+    (7, 8),
+    (7, 9),
+    (7, 10),
+]
+# Fraction of a (scaled) cell the agent must move past a path cell to count it as passed.
+ORACLE_PATH_PASS_MARGIN_CELLS = 0.5
 
 U_MAZE_ALL_STATES = [
     [1, 1, 1, 1, 1],
@@ -339,6 +360,12 @@ def get_maze_xy_bounds(structure, size_scaling=4.0):
     return float(min(xs)), float(max(xs)), float(min(ys)), float(max(ys))
 
 
+def base_cell_to_world(i, j, size_scaling, scale_factor=1):
+    """World (x, y) of the center of base cell (i, j) after scale_maze_layout."""
+    off = (scale_factor - 1) / 2.0
+    return ((i * scale_factor + off) * size_scaling, (j * scale_factor + off) * size_scaling)
+
+
 # Create a xml with maze and a list of possible goal positions
 def make_maze(maze_layout_name, maze_size_scaling, maze_scale_factor=1):
     if maze_layout_name == "u_maze":
@@ -424,8 +451,7 @@ class AntMaze(PipelineEnv):
         oracle_reward_coef: float = 1.0,
         **kwargs,
     ):
-        if use_oracle_reward and int(maze_scale_factor) != 1:
-            raise ValueError("use_oracle_reward is not supported with maze_scale_factor != 1")
+        maze_scale_factor = int(maze_scale_factor)
         xml_string, possible_starts, possible_goals = make_maze(
             maze_layout_name, maze_size_scaling, maze_scale_factor
         )
@@ -472,27 +498,35 @@ class AntMaze(PipelineEnv):
         self._oracle_reward_coef = oracle_reward_coef
         if maze_layout_name == "big_maze_single_goal":
             oracle_path_cells = BIG_MAZE_SINGLE_GOAL_PATH_CELLS
+        elif maze_layout_name == "hardest_maze_single_goal":
+            oracle_path_cells = HARDEST_MAZE_SINGLE_GOAL_PATH_CELLS
         else:
             oracle_path_cells = U_MAZE_PATH_CELLS
-        self._oracle_path = jnp.array(
-            [(i * maze_size_scaling, j * maze_size_scaling) for i, j in oracle_path_cells],
-            dtype=jnp.float32,
-        )
+        oracle_path = [
+            base_cell_to_world(i, j, maze_size_scaling, maze_scale_factor) for i, j in oracle_path_cells
+        ]
+        if maze_scale_factor > 1:
+            # scale_maze_layout keeps RESET only in the top-left cell of its block.
+            i0, j0 = oracle_path_cells[0]
+            start = (i0 * maze_scale_factor * maze_size_scaling, j0 * maze_scale_factor * maze_size_scaling)
+            oracle_path = [start] + oracle_path
+        self._oracle_path = jnp.array(oracle_path, dtype=jnp.float32)
         path_seg_len = jnp.linalg.norm(self._oracle_path[1:] - self._oracle_path[:-1], axis=-1)
         self._oracle_path_s = jnp.concatenate(
             [jnp.zeros((1,), dtype=path_seg_len.dtype), jnp.cumsum(path_seg_len)]
         )
-        self._oracle_pass_margin = ORACLE_PATH_PASS_MARGIN
+        self._oracle_pass_margin = ORACLE_PATH_PASS_MARGIN_CELLS * maze_size_scaling * maze_scale_factor
         self.state_dim = 31 if use_oracle_reward else 29
         self.goal_indices = jnp.array([0, 1])
         self.goal_reach_thresh = 0.5
 
         if use_oracle_reward and not (
-            maze_layout_name.startswith("u_maze") or maze_layout_name == "big_maze_single_goal"
+            maze_layout_name.startswith("u_maze")
+            or maze_layout_name in ("big_maze_single_goal", "hardest_maze_single_goal")
         ):
             raise ValueError(
-                "use_oracle_reward is only supported for u_maze layouts or "
-                f"big_maze_single_goal, got {maze_layout_name!r}"
+                "use_oracle_reward is only supported for u_maze layouts, "
+                f"big_maze_single_goal or hardest_maze_single_goal, got {maze_layout_name!r}"
             )
 
         if self._use_contact_forces:

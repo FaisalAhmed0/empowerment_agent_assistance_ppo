@@ -65,19 +65,25 @@ class DistillConfig:
     # update has weight 1 and weights halve every
     # RECENCY_HALF_LIFE_FRAC * (max_update_idx - min_update_idx) updates.
     RECENCY_WEIGHTING: bool = False
-    RECENCY_HALF_LIFE_FRAC: float = 0.25
+    RECENCY_HALF_LIFE_FRAC: float = 1.0
     LR: float = 3e-4
+    # "constant" | "cosine" | "linear"; annealed over NUM_EPOCHS * batches_per_epoch steps.
+    LR_SCHEDULE: str = "constant"
+    # Fraction of total steps spent linearly warming up from 0 to LR.
+    LR_WARMUP_FRAC: float = 0.05
+    # Final LR = LR * LR_FINAL_FRAC.
+    LR_FINAL_FRAC: float = 0.01
     MAX_GRAD_NORM: float = 1.0
-    NUM_EPOCHS: int = 50
-    BATCH_SIZE: int = 1024
+    NUM_EPOCHS: int = 500
+    BATCH_SIZE: int = 256
     VAL_FRAC: float = 0.1
     # None => inherit TEACHER_HIDDEN_DIM / TEACHER_ACTIVATION / TEACHER_USE_ENCODERS
     # from the source experiment config.
     HIDDEN_DIM: int | None = None
     ACTIVATION: str | None = None
     USE_ENCODERS: bool | None = None
-    SEED: int = 0
-    WANDB_MODE: str = "disabled"
+    SEED: int = 30
+    WANDB_MODE: str = "online"
     ENTITY: str = ""
     PROJECT: str = "purejaxrl_distill"
 
@@ -140,10 +146,39 @@ def _input_dim(distill_cfg: dict[str, Any]) -> int:
     return int(distill_cfg["base_obs_dim"]) + int(distill_cfg["num_competence"])
 
 
+def _make_lr_schedule(distill_cfg: dict[str, Any]):
+    # Configs saved before LR annealing lack these keys; they must rebuild a
+    # constant-LR optimizer so the restored opt_state structure matches.
+    lr = float(distill_cfg["lr"])
+    kind = distill_cfg.get("lr_schedule", "constant")
+    if kind == "constant":
+        return lr
+    warmup = int(distill_cfg["lr_warmup_steps"])
+    total = max(int(distill_cfg["lr_decay_steps"]), warmup + 1)
+    end_value = lr * float(distill_cfg["lr_final_frac"])
+    if kind == "cosine":
+        return optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=lr,
+            warmup_steps=warmup,
+            decay_steps=total,
+            end_value=end_value,
+        )
+    if kind == "linear":
+        return optax.join_schedules(
+            [
+                optax.linear_schedule(0.0, lr, warmup),
+                optax.linear_schedule(lr, end_value, total - warmup),
+            ],
+            boundaries=[warmup],
+        )
+    raise ValueError(f"Unknown lr_schedule {kind!r}; expected constant|cosine|linear.")
+
+
 def _make_tx(distill_cfg: dict[str, Any]):
     return optax.chain(
         optax.clip_by_global_norm(float(distill_cfg["max_grad_norm"])),
-        optax.adam(learning_rate=float(distill_cfg["lr"]), eps=1e-5),
+        optax.adam(learning_rate=_make_lr_schedule(distill_cfg), eps=1e-5),
     )
 
 
@@ -239,10 +274,22 @@ def main():
     num_train = int(train_idx.shape[0])
     batch_size = min(int(args.BATCH_SIZE), num_train)
     num_batches = max(num_train // batch_size, 1)
+    total_steps = int(args.NUM_EPOCHS) * num_batches
+    distill_cfg.update(
+        {
+            "lr_schedule": args.LR_SCHEDULE,
+            "lr_warmup_steps": int(round(args.LR_WARMUP_FRAC * total_steps)),
+            "lr_decay_steps": total_steps,
+            "lr_final_frac": float(args.LR_FINAL_FRAC),
+        }
+    )
+    lr_schedule = _make_lr_schedule(distill_cfg)
     print(
         f"[distill] train={num_train} val={num_val} batch_size={batch_size} "
         f"input_dim={inputs.shape[-1]} only_competence={distill_cfg['only_competence_input']} "
-        f"recency_weighting={distill_cfg['recency_weighting']}"
+        f"recency_weighting={distill_cfg['recency_weighting']} "
+        f"lr_schedule={args.LR_SCHEDULE} total_steps={total_steps} "
+        f"warmup_steps={distill_cfg['lr_warmup_steps']}"
     )
 
     x_train = jnp.asarray(inputs[train_idx])
@@ -298,7 +345,13 @@ def main():
             y_train,
             w_train,
         )
-        log = {"epoch": epoch, "train/weighted_kl": float(train_loss)}
+        log = {
+            "epoch": epoch,
+            "train/weighted_kl": float(train_loss),
+            "train/lr": float(
+                lr_schedule(train_state.step) if callable(lr_schedule) else lr_schedule
+            ),
+        }
         if num_val > 0:
             val_kl, val_weighted_kl, val_top1 = evaluate(
                 train_state.params, x_val, y_val, w_val

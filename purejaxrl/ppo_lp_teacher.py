@@ -17,6 +17,10 @@ from typing import Sequence, NamedTuple, Any
 from dataclasses import dataclass, asdict, field
 from flax.training.train_state import TrainState
 from conditional_teacher_models import ConditionalTeacherActorCritic
+from teacher_checkpoint_schedule import (
+    compute_teacher_checkpoint_indices,
+    split_teacher_checkpoint_budget,
+)
 from copy import deepcopy
 import distrax
 from envs.ant_maze import all_possible_goals
@@ -103,7 +107,7 @@ class TrainConfig:
     TEACHER_GOAL_X_MAX: float = 12.0
     TEACHER_GOAL_Y_MIN: float = 4.0
     TEACHER_GOAL_Y_MAX: float = 12.0
-    TEACHER_NUM_GOAL_POINTS: int = 30
+    TEACHER_NUM_GOAL_POINTS: int = 50
     # Humanoid only: also grid the goal z over [Z_MIN, Z_MAX] with TEACHER_NUM_Z_POINTS levels.
     # Redundant if SEPARATE_Z_GOAL_PENALTY=True (goal reward then ignores z).
     TEACHER_DISCRETIZE_Z: bool = False
@@ -118,6 +122,12 @@ class TrainConfig:
     TEACHER_HIDDEN_DIM: int = 256
     SAVE_MODEL: bool = False
     checkpoint_dir: str = "checkpoints"
+    # Save N teacher checkpoints during training (0 disables). Training is split into segments
+    # at TEACHER_CHECKPOINT_BOUNDS (fractions of training, from 0.0 to 1.0); segment i gets a
+    # TEACHER_CHECKPOINT_WEIGHTS[i] share of the N checkpoints, evenly spaced within it.
+    NUM_TEACHER_CHECKPOINTS: int = 0
+    TEACHER_CHECKPOINT_BOUNDS: tuple[float, ...] = (0.0, 0.1, 0.7, 1.0)
+    TEACHER_CHECKPOINT_WEIGHTS: tuple[float, ...] = (0.2, 0.6, 0.2)
     GOAL_REWARD_COEF: float = 1.0
     TASK_REWARD_COEF: float = 1.0
     INTERPOLATED_REWARD: bool = False
@@ -130,7 +140,7 @@ class TrainConfig:
     USE_LEARNING_PROGRESS_REWARD: bool = True
     ABSOLUTE_LEARNING_PROGRESS: bool = False
     USE_RAW_LP_TABLE: bool = False
-    LP_EMA_ALPHA: float = 0.1
+    LP_EMA_ALPHA: float = 0.85
     # "single_ema": LP = EMA (LP_EMA_ALPHA) of lp_latest = s_new - s_prev, where s is
     #   the raw per-goal mean success (|lp_latest| if ABSOLUTE_LEARNING_PROGRESS).
     #   USE_RAW_LP_TABLE has no effect on this estimator.
@@ -2016,6 +2026,27 @@ def make_train(config):
             f"last={snapshot_indices[-3:].tolist()}"
         )
 
+    num_teacher_ckpts = int(config.get("NUM_TEACHER_CHECKPOINTS", 0))
+    teacher_ckpt_bounds = tuple(config["TEACHER_CHECKPOINT_BOUNDS"])
+    teacher_ckpt_weights = tuple(config["TEACHER_CHECKPOINT_WEIGHTS"])
+    teacher_ckpt_indices = compute_teacher_checkpoint_indices(
+        num_updates,
+        num_teacher_ckpts,
+        teacher_ckpt_bounds,
+        teacher_ckpt_weights,
+    )
+    teacher_ckpt_indices_jnp = jnp.asarray(teacher_ckpt_indices, dtype=jnp.int32)
+    if num_teacher_ckpts > 0:
+        segment_counts = split_teacher_checkpoint_budget(
+            len(teacher_ckpt_indices), teacher_ckpt_bounds, teacher_ckpt_weights
+        )
+        print(
+            f"[teacher_ckpt] scheduling {len(teacher_ckpt_indices)} checkpoints "
+            f"over {num_updates} updates; bounds={list(teacher_ckpt_bounds)} "
+            f"per-segment counts={segment_counts.tolist()}; "
+            f"indices={teacher_ckpt_indices.tolist()}"
+        )
+
     def log_teacher_softmax_viz(
         probs,
         ref_obs,
@@ -3624,6 +3655,113 @@ def make_train(config):
                 jax.debug.callback(
                     _maybe_save_max_log_sum_teacher,
                     max_log_sum_ckpt_args,
+                )
+
+            if num_teacher_ckpts > 0:
+
+                def _save_teacher_ckpt_host(args):
+                    (
+                        uidx,
+                        global_step,
+                        teacher_step,
+                        teacher_params,
+                        teacher_ema_params,
+                        teacher_avg_params,
+                        teacher_opt_state,
+                        *obs_norm_args,
+                    ) = args
+                    uidx = int(uidx)
+                    global_step = int(global_step)
+                    try:
+                        schedule_root = os.path.join(
+                            config["EXP_DIR"],
+                            config.get("checkpoint_dir", "checkpoints"),
+                            "teacher_schedule",
+                        )
+                        ckpt_dir = os.path.join(
+                            schedule_root,
+                            f"update_{uidx:06d}_step_{global_step}",
+                        )
+                        for name, params in (
+                            ("teacher", teacher_params),
+                            ("teacher_ema", teacher_ema_params),
+                            ("teacher_avg", teacher_avg_params),
+                        ):
+                            sub_dir = os.path.abspath(os.path.join(ckpt_dir, name))
+                            os.makedirs(sub_dir, exist_ok=True)
+                            save_checkpoint(
+                                TrainState(
+                                    step=int(teacher_step),
+                                    apply_fn=_teacher_ckpt_host["apply_fn"],
+                                    params=params,
+                                    tx=_teacher_ckpt_host["tx"],
+                                    opt_state=teacher_opt_state,
+                                ),
+                                sub_dir,
+                            )
+                        if len(obs_norm_args) == 3:
+                            obs_mean, obs_var, obs_count = obs_norm_args
+                            obs_mean = np.asarray(obs_mean)
+                            obs_var = np.asarray(obs_var)
+                            if obs_mean.ndim > 1:
+                                obs_mean = obs_mean.reshape((-1, obs_mean.shape[-1]))[0]
+                                obs_var = obs_var.reshape((-1, obs_var.shape[-1]))[0]
+                            np.savez(
+                                os.path.join(ckpt_dir, "obs_norm_stats.npz"),
+                                mean=obs_mean,
+                                var=obs_var,
+                                count=np.asarray(obs_count),
+                            )
+                        index_path = os.path.join(schedule_root, "index.json")
+                        entries = []
+                        if os.path.exists(index_path):
+                            with open(index_path) as f:
+                                entries = json.load(f)
+                        entries.append(
+                            {
+                                "update_idx": uidx,
+                                "global_step": global_step,
+                                "teacher_step": int(teacher_step),
+                                "path": ckpt_dir,
+                            }
+                        )
+                        with open(index_path, "w") as f:
+                            json.dump(entries, f, indent=2)
+                        print(
+                            f"[teacher_ckpt] saved update {uidx} "
+                            f"(step={global_step}) to {ckpt_dir}"
+                        )
+                    except Exception as err:
+                        print(f"[teacher_ckpt] skipped update {uidx}: {err}")
+
+                teacher_ckpt_args = (
+                    update_idx,
+                    log_step,
+                    teacher_train_state.step,
+                    teacher_train_state.params,
+                    teacher_train_state.ema_params,
+                    teacher_train_state.avg_params,
+                    teacher_train_state.opt_state,
+                )
+                if config.get("NORMALIZE_ENV", False):
+                    teacher_ckpt_args = teacher_ckpt_args + (
+                        env_state.mean,
+                        env_state.var,
+                        env_state.count,
+                    )
+
+                def _run_teacher_ckpt(ckpt_args):
+                    jax.debug.callback(_save_teacher_ckpt_host, ckpt_args)
+                    return jnp.array(0, dtype=jnp.int32)
+
+                def _skip_teacher_ckpt(ckpt_args):
+                    return jnp.array(0, dtype=jnp.int32)
+
+                jax.lax.cond(
+                    jnp.isin(update_idx, teacher_ckpt_indices_jnp),
+                    _run_teacher_ckpt,
+                    _skip_teacher_ckpt,
+                    teacher_ckpt_args,
                 )
 
             if (
