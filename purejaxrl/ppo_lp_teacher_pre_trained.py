@@ -1385,6 +1385,50 @@ def load_checkpoint(train_state, checkpoint_dir):
     )
 
 
+_PRETRAINED_TEACHER_ENV_KEYS = ("ENV_NAME", "MAZE_SCALE_FACTOR", "ENV_KWARGS")
+
+
+def check_pretrained_teacher_env(checkpoint_dir, config, max_levels_up=4):
+    """Fail unless the run that saved ``checkpoint_dir`` used the same environment.
+
+    The source run's ``config.json`` lives in its EXP_DIR, a few levels above the
+    checkpoint (``checkpoints/teacher*`` or ``checkpoints/teacher_schedule/update_*/teacher*``).
+    """
+    search_dir = os.path.abspath(checkpoint_dir)
+    source_config_path = None
+    for _ in range(max_levels_up + 1):
+        candidate = os.path.join(search_dir, "config.json")
+        if os.path.isfile(candidate):
+            source_config_path = candidate
+            break
+        search_dir = os.path.dirname(search_dir)
+    if source_config_path is None:
+        raise FileNotFoundError(
+            "Could not find the source run's config.json within "
+            f"{max_levels_up} levels above {os.path.abspath(checkpoint_dir)}; "
+            "cannot verify the pretrained teacher's environment."
+        )
+    with open(source_config_path) as f:
+        source_config = json.load(f)
+
+    defaults = asdict(TrainConfig())
+    mismatches = []
+    for key in _PRETRAINED_TEACHER_ENV_KEYS:
+        # JSON round-trip so tuples/lists and non-JSON values compare like the saved config.
+        current = json.loads(json.dumps(config.get(key, defaults[key]), default=str))
+        source = source_config.get(key, defaults[key])
+        if current != source:
+            mismatches.append(f"{key}: checkpoint={source!r}, current={current!r}")
+    if mismatches:
+        raise ValueError(
+            "Pretrained teacher was trained on a different environment "
+            f"(source config {source_config_path}):\n  " + "\n  ".join(mismatches)
+        )
+    print(
+        f"[pretrained_teacher] environment matches source config {source_config_path}"
+    )
+
+
 def load_pretrained_teacher_params(checkpoint_dir, template_params):
     """Load only the ``params`` of a saved teacher TrainState.
 
@@ -1802,6 +1846,7 @@ def make_train(config):
     )
     pretrained_teacher_params = None
     if teacher_pretrained_ckpt:
+        check_pretrained_teacher_env(teacher_pretrained_ckpt, config)
         teacher_param_template = jax.eval_shape(
             teacher_network.init,
             jax.random.PRNGKey(0),
