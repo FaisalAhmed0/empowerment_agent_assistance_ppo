@@ -10,6 +10,10 @@ teacher), ``competence``, ``goal_idx``, ``raw_goal``, ``logits`` (sampling-time
 teacher logits), ``teacher_obs`` and ``update_idx``.
 
 The distilled model minimizes KL(p_teacher || p_distilled) over the goal grid.
+Its input is ``concat(base_obs, competence)`` by default, ``competence`` with
+``--ONLY_COMPETENCE_INPUT``, or ``concat(env_goal, competence)`` with
+``--COMPETENCE_AND_GOAL_INPUT``, where ``env_goal`` is the last ``ENV_GOAL_DIM``
+components of ``base_obs`` (the maze target position).
 
 Writes:
   EXP_DIR/distilled_teacher/
@@ -19,6 +23,7 @@ Writes:
 Example:
   python purejaxrl/distill_teacher.py --EXP_DIR $SCRATCH/purejaxrl_simple_teachers/<name>_<id>
   python purejaxrl/distill_teacher.py --EXP_DIR ... --ONLY_COMPETENCE_INPUT --RECENCY_WEIGHTING
+  python purejaxrl/distill_teacher.py --EXP_DIR ... --COMPETENCE_AND_GOAL_INPUT
 """
 
 from __future__ import annotations
@@ -61,6 +66,9 @@ class DistillConfig:
     OUTPUT_SUBDIR: str = "distilled_teacher"
     # Feed only the competence vector to the distilled teacher (no state).
     ONLY_COMPETENCE_INPUT: bool = False
+    # Feed concat(env goal, competence); env goal = last ENV_GOAL_DIM dims of base_obs.
+    COMPETENCE_AND_GOAL_INPUT: bool = False
+    ENV_GOAL_DIM: int = 2
     # Exponentially up-weight recent transitions in the loss; the most recent
     # update has weight 1 and weights halve every
     # RECENCY_HALF_LIFE_FRAC * (max_update_idx - min_update_idx) updates.
@@ -76,7 +84,7 @@ class DistillConfig:
     MAX_GRAD_NORM: float = 1.0
     NUM_EPOCHS: int = 500
     BATCH_SIZE: int = 256
-    VAL_FRAC: float = 0.1
+    VAL_FRAC: float = 0.1 # Fraction of the validation set
     # None => inherit TEACHER_HIDDEN_DIM / TEACHER_ACTIVATION / TEACHER_USE_ENCODERS
     # from the source experiment config.
     HIDDEN_DIM: int | None = None
@@ -121,18 +129,30 @@ def build_distill_inputs(
     base_obs: np.ndarray | jnp.ndarray,
     competence: np.ndarray | jnp.ndarray,
     only_competence_input: bool,
+    competence_and_goal_input: bool = False,
+    env_goal_dim: int = 2,
 ):
     if only_competence_input:
         return competence
     xp = jnp if isinstance(base_obs, jnp.ndarray) else np
+    if competence_and_goal_input:
+        return xp.concatenate([base_obs[..., -env_goal_dim:], competence], axis=-1)
     return xp.concatenate([base_obs, competence], axis=-1)
 
 
+def _distill_obs_dim(distill_cfg: dict[str, Any]) -> int:
+    """Width of the non-competence part of the distilled teacher input."""
+    if distill_cfg["only_competence_input"]:
+        return 0
+    if distill_cfg.get("competence_and_goal_input", False):
+        return int(distill_cfg.get("env_goal_dim", 2))
+    return int(distill_cfg["base_obs_dim"])
+
+
 def make_distill_network(distill_cfg: dict[str, Any]) -> TeacherActorCritic:
-    only_competence = bool(distill_cfg["only_competence_input"])
     return TeacherActorCritic(
         num_actions=int(distill_cfg["num_goals"]),
-        obs_dim=0 if only_competence else int(distill_cfg["base_obs_dim"]),
+        obs_dim=_distill_obs_dim(distill_cfg),
         competence_dim=int(distill_cfg["num_competence"]),
         activation=distill_cfg["activation"],
         hidden_dim=int(distill_cfg["hidden_dim"]),
@@ -141,9 +161,7 @@ def make_distill_network(distill_cfg: dict[str, Any]) -> TeacherActorCritic:
 
 
 def _input_dim(distill_cfg: dict[str, Any]) -> int:
-    if distill_cfg["only_competence_input"]:
-        return int(distill_cfg["num_competence"])
-    return int(distill_cfg["base_obs_dim"]) + int(distill_cfg["num_competence"])
+    return _distill_obs_dim(distill_cfg) + int(distill_cfg["num_competence"])
 
 
 def _make_lr_schedule(distill_cfg: dict[str, Any]):
@@ -196,9 +214,10 @@ def load_distilled_teacher(
     """Rebuild the distilled TeacherActorCritic and restore its TrainState.
 
     Returns ``(train_state, distill_cfg)``; ``distill_cfg`` includes
-    ``only_competence_input``, ``base_obs_dim``, ``num_competence`` and
-    ``num_goals``. Inputs are ``competence`` or ``concat(base_obs, competence)``
-    (see ``build_distill_inputs``).
+    ``only_competence_input``, ``competence_and_goal_input``, ``env_goal_dim``,
+    ``base_obs_dim``, ``num_competence`` and ``num_goals``. Inputs are
+    ``competence``, ``concat(base_obs[-env_goal_dim:], competence)`` or
+    ``concat(base_obs, competence)`` (see ``build_distill_inputs``).
     """
     out_dir = os.path.join(exp_dir, subdir)
     with open(os.path.join(out_dir, DISTILL_CONFIG_NAME), "r") as f:
@@ -217,6 +236,9 @@ def kl_to_teacher(teacher_logits, student_logits):
 
 def main():
     args = tyro.cli(DistillConfig)
+    assert not (args.ONLY_COMPETENCE_INPUT and args.COMPETENCE_AND_GOAL_INPUT), (
+        "ONLY_COMPETENCE_INPUT and COMPETENCE_AND_GOAL_INPUT are mutually exclusive."
+    )
     source_config = load_experiment_config(args.EXP_DIR)
     data = load_teacher_interactions(args.EXP_DIR, args.INTERACTIONS_SUBDIR)
     num_rows = int(data["goal_idx"].shape[0])
@@ -229,6 +251,8 @@ def main():
     distill_cfg = {
         "source_exp_dir": args.EXP_DIR,
         "only_competence_input": bool(args.ONLY_COMPETENCE_INPUT),
+        "competence_and_goal_input": bool(args.COMPETENCE_AND_GOAL_INPUT),
+        "env_goal_dim": int(args.ENV_GOAL_DIM),
         "recency_weighting": bool(args.RECENCY_WEIGHTING),
         "recency_half_life_frac": float(args.RECENCY_HALF_LIFE_FRAC),
         "base_obs_dim": int(data["base_obs"].shape[-1]),
@@ -258,6 +282,8 @@ def main():
         data["base_obs"].astype(np.float32),
         data["competence"].astype(np.float32),
         distill_cfg["only_competence_input"],
+        competence_and_goal_input=distill_cfg["competence_and_goal_input"],
+        env_goal_dim=distill_cfg["env_goal_dim"],
     )
     targets = data["logits"].astype(np.float32)
     if args.RECENCY_WEIGHTING:
@@ -287,6 +313,7 @@ def main():
     print(
         f"[distill] train={num_train} val={num_val} batch_size={batch_size} "
         f"input_dim={inputs.shape[-1]} only_competence={distill_cfg['only_competence_input']} "
+        f"competence_and_goal={distill_cfg['competence_and_goal_input']} "
         f"recency_weighting={distill_cfg['recency_weighting']} "
         f"lr_schedule={args.LR_SCHEDULE} total_steps={total_steps} "
         f"warmup_steps={distill_cfg['lr_warmup_steps']}"

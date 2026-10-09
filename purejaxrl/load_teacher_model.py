@@ -203,13 +203,20 @@ def _teacher_obs_dim(config: dict[str, Any], base_obs_dim: int, action_dim: int)
     only_competence = bool(
         config.get("TEACHER_CONDITION_ONLY_ON_COMPETENCE", False)
     )
-    condition_teacher_on_competence = bool(
-        config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
-    ) or only_competence
+    competence_and_env_goal = bool(
+        config.get("TEACHER_CONDITION_ON_COMPETENCE_AND_ENV_GOAL", False)
+    )
+    condition_teacher_on_competence = (
+        bool(config.get("CONDITION_TEACHER_ON_COMPETENCE", True))
+        or only_competence
+        or competence_and_env_goal
+    )
     condition_teacher_on_action = bool(
         config.get("CONDITION_TEACHER_ON_ACTION", True)
     )
-    teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", False))
+    teacher_obs_goal_only = (
+        bool(config.get("TEACHER_OBS_GOAL_ONLY", False)) or competence_and_env_goal
+    )
     num_competence = _num_competence(config)
     if only_competence:
         return num_competence
@@ -403,13 +410,20 @@ def load_teacher_model(
     only_competence = bool(
         config.get("TEACHER_CONDITION_ONLY_ON_COMPETENCE", False)
     )
-    condition_teacher_on_competence = bool(
-        config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
-    ) or only_competence
+    competence_and_env_goal = bool(
+        config.get("TEACHER_CONDITION_ON_COMPETENCE_AND_ENV_GOAL", False)
+    )
+    condition_teacher_on_competence = (
+        bool(config.get("CONDITION_TEACHER_ON_COMPETENCE", True))
+        or only_competence
+        or competence_and_env_goal
+    )
     condition_teacher_on_action = bool(
         config.get("CONDITION_TEACHER_ON_ACTION", True)
     )
-    teacher_obs_goal_only = bool(config.get("TEACHER_OBS_GOAL_ONLY", False))
+    teacher_obs_goal_only = (
+        bool(config.get("TEACHER_OBS_GOAL_ONLY", False)) or competence_and_env_goal
+    )
     num_competence = _num_competence(config)
     teacher_obs_dim = _teacher_obs_dim(config, base_obs_dim, action_dim)
 

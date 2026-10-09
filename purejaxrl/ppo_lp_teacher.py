@@ -134,11 +134,13 @@ class TrainConfig:
     NUM_EVAL_ENVS: int = 10
     CONDITION_TEACHER_ON_COMPETENCE: bool = True
     TEACHER_CONDITION_ONLY_ON_COMPETENCE: bool = False
-    TEACHER_EMA_COEFF: float = 0.999
+    # Teacher input = [env goal (last 2 entries of initial obs) | competence].
+    TEACHER_CONDITION_ON_COMPETENCE_AND_ENV_GOAL: bool = False
+    TEACHER_EMA_COEFF: float = 0.99
     USE_DISTANCE_IN_COMPETENCE: bool = False
     USE_AVERAGE_COMPETENCE_REWARD: bool = False
     USE_LEARNING_PROGRESS_REWARD: bool = True
-    ABSOLUTE_LEARNING_PROGRESS: bool = False
+    ABSOLUTE_LEARNING_PROGRESS: bool = True
     USE_RAW_LP_TABLE: bool = False
     LP_EMA_ALPHA: float = 0.85
     # "single_ema": LP = EMA (LP_EMA_ALPHA) of lp_latest = s_new - s_prev, where s is
@@ -1691,9 +1693,21 @@ def make_train(config):
     condition_teacher_only_on_competence = bool(
         config.get("TEACHER_CONDITION_ONLY_ON_COMPETENCE", False)
     )
-    condition_teacher_on_competence = bool(
-        config.get("CONDITION_TEACHER_ON_COMPETENCE", True)
-    ) or condition_teacher_only_on_competence
+    condition_teacher_on_competence_and_env_goal = bool(
+        config.get("TEACHER_CONDITION_ON_COMPETENCE_AND_ENV_GOAL", False)
+    )
+    assert not (
+        condition_teacher_on_competence_and_env_goal
+        and condition_teacher_only_on_competence
+    ), (
+        "TEACHER_CONDITION_ON_COMPETENCE_AND_ENV_GOAL and "
+        "TEACHER_CONDITION_ONLY_ON_COMPETENCE are mutually exclusive"
+    )
+    condition_teacher_on_competence = (
+        bool(config.get("CONDITION_TEACHER_ON_COMPETENCE", True))
+        or condition_teacher_only_on_competence
+        or condition_teacher_on_competence_and_env_goal
+    )
     use_average_competence_reward = config.get("USE_AVERAGE_COMPETENCE_REWARD", False)
     use_learning_progress_reward = config.get("USE_LEARNING_PROGRESS_REWARD", False)
     lp_estimator = config.get("LP_ESTIMATOR", "single_ema")
@@ -1712,6 +1726,10 @@ def make_train(config):
     if condition_teacher_only_on_competence:
         teacher_obs_dim = num_competence
         teacher_net_obs_dim = 0
+        teacher_net_competence_dim = num_competence
+    elif condition_teacher_on_competence_and_env_goal:
+        teacher_obs_dim = 2 + num_competence
+        teacher_net_obs_dim = 2
         teacher_net_competence_dim = num_competence
     else:
         teacher_obs_dim = base_obs_dim + (
@@ -1772,6 +1790,8 @@ def make_train(config):
             return competence_vector
         if obs.ndim == 1:
             obs = obs[None, :]
+        if condition_teacher_on_competence_and_env_goal:
+            obs = obs[..., -2:]
         inputs = [obs]
         if condition_teacher_on_competence:
             comp_batch = jnp.broadcast_to(
