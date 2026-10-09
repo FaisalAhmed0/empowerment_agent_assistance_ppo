@@ -117,6 +117,7 @@ class TrainConfig:
     TEACHER_GOAL_Z_MAX: float = 1.25
     TEACHER_GOAL_COUNT_VIZ_LOG_WANDB: bool = True
     TEACHER_GOAL_COUNT_VIZ_FREQ: int = 500
+    TEACHER_SOFTMAX_GRID_VIZ: bool = True  # also log teacher softmax at the goal-count viz freq
     TEACHER_LP_VIZ_LOG_WANDB: bool = True
     TEACHER_LP_VIZ_FREQ: int = 500
     TEACHER_HEATMAP_CMAP: str = "Blues"
@@ -2660,6 +2661,63 @@ def make_train(config):
                 )
                 traceback.print_exc()
 
+        def log_teacher_softmax_grid(probs, step):
+            """Log the teacher's softmax over goals as a heatmap and a bar chart."""
+            try:
+                if config.get("WANDB_MODE", "disabled") != "online":
+                    return
+                import matplotlib.pyplot as plt
+
+                probs = np.asarray(jax.device_get(probs)).reshape(-1)
+                goal_grid_xy = np.asarray(jax.device_get(goal_grid))
+                exp_dir = config["EXP_DIR"]
+                exp_name = f'purejaxrl_ppo_brax_{config["ENV_NAME"]}'
+                save_path = os.path.join(
+                    exp_dir, "teacher_goal_visuals", f"{exp_name}_teacher_softmax_{int(step)}.png"
+                )
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                np.savez(
+                    save_path.replace(".png", ".npz"),
+                    probs=probs,
+                    goal_grid_xy=goal_grid_xy,
+                    num_points=int(teacher_num_goal_points),
+                    num_z_points=int(teacher_num_z_points),
+                    step=int(step),
+                )
+                fig, _ = plot_teacher_softmax(
+                    goal_grid_xy,
+                    probs,
+                    teacher_num_goal_points,
+                    title=(
+                        f"Teacher softmax @ step {int(step)} "
+                        f"({config['ENV_NAME']})"
+                    ),
+                    save_path=save_path,
+                    cmap=config.get("TEACHER_HEATMAP_CMAP", "jet"),
+                )
+                bar_fig, _ = plot_teacher_softmax_bar(
+                    probs,
+                    title=(
+                        f"Teacher softmax bar @ step {int(step)} "
+                        f"({config['ENV_NAME']})"
+                    ),
+                    save_path=save_path.replace(".png", "_bar.png"),
+                )
+                wandb.log(
+                    {
+                        "teacher/goal_softmax": wandb.Image(fig),
+                        "teacher/goal_softmax_bar": wandb.Image(bar_fig),
+                    },
+                    step=int(step),
+                )
+                plt.close(fig)
+                plt.close(bar_fig)
+            except Exception as err:
+                print(
+                    f"[log_teacher_softmax_grid] skipped softmax visual: {err}"
+                )
+                traceback.print_exc()
+
         def log_teacher_learning_progress_grid(lp_cache, step):
             """Log learning-progress heatmap over the teacher goal grid."""
             try:
@@ -3989,6 +4047,19 @@ def make_train(config):
                             teacher_goal_count_grid,
                             log_step,
                         )
+                        if config.get("TEACHER_SOFTMAX_GRID_VIZ", True):
+                            teacher_obs = _build_teacher_input(
+                                episode_initial_base_obs, competence_vector
+                            )
+                            pi, _ = teacher_network.apply(
+                                teacher_train_state.params, teacher_obs
+                            )
+                            probs = pi.probs.reshape(-1, num_teacher_goals).mean(
+                                axis=0
+                            )
+                            jax.debug.callback(
+                                log_teacher_softmax_grid, probs, log_step
+                            )
                         return jnp.array(0, dtype=jnp.int32)
 
                     def _skip_goal_count_viz(_):
