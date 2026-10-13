@@ -126,6 +126,12 @@ def load_obs_norm_stats(
     return mean, var
 
 
+def _long_maze_length_scale(config: dict[str, Any]) -> float:
+    if config.get("LONG_MAZE_LENGTH_SCALE") is not None:
+        return float(config["LONG_MAZE_LENGTH_SCALE"])
+    return float((config.get("ENV_KWARGS") or {}).get("long_maze_length_scale", 1.0))
+
+
 def teacher_goal_set_from_config(
     config: dict[str, Any],
 ) -> tuple[np.ndarray, int, np.ndarray, list]:
@@ -150,6 +156,11 @@ def teacher_goal_set_from_config(
         maze_layout = ant_maze.HARDEST_MAZE
         all_goals_layout = ant_maze.HARDEST_MAZE_ALL_GOALS
         custom_goal = np.array([28.0, 40.0], dtype=np.float32)
+    elif "long_maze" in env_name:
+        long_scale = _long_maze_length_scale(config)
+        maze_layout = ant_maze.make_long_maze(long_scale)
+        all_goals_layout = ant_maze.make_long_maze(long_scale, all_goals=True)
+        custom_goal = np.array([4.0, 20.0], dtype=np.float32)
     else:
         raise ValueError(f"Unknown maze layout: {env_name}")
 
@@ -178,7 +189,11 @@ def _num_competence(config: dict[str, Any]) -> int:
 
 
 def _make_env(config: dict[str, Any]):
-    env_kwargs = config.get("ENV_KWARGS", {}) or {}
+    env_kwargs = dict(config.get("ENV_KWARGS", {}) or {})
+    if "ant" in config["ENV_NAME"]:
+        env_kwargs["maze_scale_factor"] = int(config.get("MAZE_SCALE_FACTOR", 1))
+    if "long_maze" in config["ENV_NAME"]:
+        env_kwargs["long_maze_length_scale"] = _long_maze_length_scale(config)
     custom_env = make_custom_env(
         env_name=config["ENV_NAME"],
         backend=config.get("ENV_BACKEND"),

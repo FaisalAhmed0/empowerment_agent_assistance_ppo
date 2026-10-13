@@ -74,6 +74,8 @@ class TrainConfig:
     ENV_KWARGS: dict[str, Any] = field(default_factory=dict)
     # Ant maze only: each layout cell becomes a factor x factor block (2 -> twice the size).
     MAZE_SCALE_FACTOR: int = 1
+    # ant_long_maze only: corridor length multiplier (1.3 -> 30% longer, zig-zag repeated).
+    LONG_MAZE_LENGTH_SCALE: float = 1.0
     ANNEAL_LR: bool = True
     USE_OPTAX_LR_SCHEDULE: bool = False
     NORMALIZE_ENV: bool = True
@@ -1452,6 +1454,7 @@ def make_teacher_goal_set(config):
             U_MAZE_ALL_STATES,
             HARDEST_MAZE,
             HARDEST_MAZE_ALL_GOALS,
+            make_long_maze,
         )
 
         if "u_maze" in env_name:
@@ -1466,6 +1469,11 @@ def make_teacher_goal_set(config):
             maze_layout = HARDEST_MAZE
             all_goals_layout = HARDEST_MAZE_ALL_GOALS
             custom_goal = jnp.array([28.0, 40.0])
+        elif "long_maze" in env_name:
+            long_scale = float(config.get("LONG_MAZE_LENGTH_SCALE", 1.0))
+            maze_layout = make_long_maze(long_scale)
+            all_goals_layout = make_long_maze(long_scale, all_goals=True)
+            custom_goal = jnp.array([4.0, 20.0])
         else:
             raise ValueError(f"Unknown maze layout: {env_name}")
         maze_scale_factor = int(config.get("MAZE_SCALE_FACTOR", 1))
@@ -1569,6 +1577,8 @@ def make_train(config):
     env_kwargs = dict(config.get("ENV_KWARGS", {}))
     if "ant" in config["ENV_NAME"]:
         env_kwargs["maze_scale_factor"] = int(config.get("MAZE_SCALE_FACTOR", 1))
+    if "long_maze" in config["ENV_NAME"]:
+        env_kwargs["long_maze_length_scale"] = float(config.get("LONG_MAZE_LENGTH_SCALE", 1.0))
     custom_env = make_custom_env(
         env_name=config["ENV_NAME"],
         backend=config.get("ENV_BACKEND"),

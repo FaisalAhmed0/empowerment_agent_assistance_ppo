@@ -103,7 +103,7 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
                     dense_reward=kwargs["dense_reward"]
                 )
             else:
-                # Possible env_name = {'ant_u_maze', 'ant_big_maze', 'ant_hardest_maze'}
+                # Possible env_name = {'ant_u_maze', 'ant_big_maze', 'ant_hardest_maze', 'ant_long_maze'}
                 env = AntMaze(
                     backend=backend or "spring",
                     maze_layout_name=env_name[4:],

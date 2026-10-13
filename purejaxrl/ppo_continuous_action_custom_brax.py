@@ -235,6 +235,7 @@ def make_competence_goal_set(config):
             BIG_MAZE_ALL_GOALS,
             HARDEST_MAZE_ALL_GOALS,
             U_MAZE_ALL_STATES,
+            make_long_maze,
         )
 
         if "u_maze" in env_name:
@@ -243,6 +244,9 @@ def make_competence_goal_set(config):
             all_goals_layout = BIG_MAZE_ALL_GOALS
         elif "hardest_maze" in env_name:
             all_goals_layout = HARDEST_MAZE_ALL_GOALS
+        elif "long_maze" in env_name:
+            long_scale = float((config.get("ENV_KWARGS") or {}).get("long_maze_length_scale", 1.0))
+            all_goals_layout = make_long_maze(long_scale, all_goals=True)
         else:
             raise ValueError(f"Unknown maze layout: {env_name}")
         all_goals = all_possible_goals(all_goals_layout)

@@ -284,6 +284,43 @@ HARDEST_MAZE_HARD_GOALS = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                 [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]
 
 
+# Repeating zig-zag corridor unit of the long maze; cycled row by row to set its length.
+LONG_MAZE_UNIT = [
+    [1, 1, 1, 0, 0, 0, 1],
+    [1, 0, 0, 0, 0, 0, 1],
+    [1, 0, 0, 0, 1, 1, 1],
+    [1, 0, 0, 0, 0, 0, 1],
+]
+LONG_MAZE_BASE_INTERIOR_ROWS = 10
+
+
+def make_long_maze(length_scale=1.0, all_goals=False):
+    """Build the long maze with round(10 * length_scale) interior rows.
+
+    The first two interior rows (goal row + open row) are fixed; the rest cycle
+    through LONG_MAZE_UNIT. The start is the rightmost free cell of the last row.
+    With all_goals=True every free cell is GOAL (start included).
+    """
+    length_scale = float(length_scale)
+    if length_scale <= 0:
+        raise ValueError(f"long_maze_length_scale must be > 0, got {length_scale}")
+    n_interior = max(3, int(round(LONG_MAZE_BASE_INTERIOR_ROWS * length_scale)))
+    wall = [1] * 7
+    rows = [[1, G, G, G, G, G, 1], [1, 0, 0, 0, 0, 0, 1]]
+    rows += [list(LONG_MAZE_UNIT[k % len(LONG_MAZE_UNIT)]) for k in range(n_interior - 2)]
+    last = rows[-1]
+    start_col = max(j for j, cell in enumerate(last) if cell != 1)
+    last[start_col] = R
+    layout = [wall] + rows + [list(wall)]
+    if all_goals:
+        layout = [[cell if cell == 1 else G for cell in row] for row in layout]
+    return layout
+
+
+LONG_MAZE = make_long_maze()
+LONG_MAZE_ALL_GOALS = make_long_maze(all_goals=True)
+
+
 MAZE_HEIGHT = 0.5
 
 
@@ -367,7 +404,11 @@ def base_cell_to_world(i, j, size_scaling, scale_factor=1):
 
 
 # Create a xml with maze and a list of possible goal positions
-def make_maze(maze_layout_name, maze_size_scaling, maze_scale_factor=1):
+def make_maze(maze_layout_name, maze_size_scaling, maze_scale_factor=1, long_maze_length_scale=1.0):
+    if float(long_maze_length_scale) != 1.0 and maze_layout_name != "long_maze":
+        raise ValueError(
+            f"long_maze_length_scale is only supported for long_maze, got {maze_layout_name!r}"
+        )
     if maze_layout_name == "u_maze":
         maze_layout = U_MAZE
     elif maze_layout_name == "u_maze_single_goal":
@@ -384,6 +425,8 @@ def make_maze(maze_layout_name, maze_size_scaling, maze_scale_factor=1):
         maze_layout = HARDEST_MAZE
     elif maze_layout_name == "hardest_maze_single_goal":
         maze_layout = HARDEST_MAZE_SINGLE_GOAL
+    elif maze_layout_name == "long_maze":
+        maze_layout = make_long_maze(long_maze_length_scale)
     else:
         raise ValueError(f"Unknown maze layout: {maze_layout_name}")
 
@@ -446,6 +489,7 @@ class AntMaze(PipelineEnv):
         maze_layout_name="u_maze",
         maze_size_scaling=4.0,
         maze_scale_factor: int = 1,
+        long_maze_length_scale: float = 1.0,
         dense_reward: bool = False,
         use_oracle_reward: bool = False,
         oracle_reward_coef: float = 1.0,
@@ -453,7 +497,7 @@ class AntMaze(PipelineEnv):
     ):
         maze_scale_factor = int(maze_scale_factor)
         xml_string, possible_starts, possible_goals = make_maze(
-            maze_layout_name, maze_size_scaling, maze_scale_factor
+            maze_layout_name, maze_size_scaling, maze_scale_factor, long_maze_length_scale
         )
 
         sys = mjcf.loads(xml_string)

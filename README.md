@@ -68,7 +68,8 @@ These settings apply to both experiments.
 
 | Parameter        | Default                  | Notes                                                                                                                            |
 | ---------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `ENV_NAME`       | `ant_u_maze_single_goal` | Other ant mazes: `ant_u_maze`, `ant_big_maze`, `ant_hardest_maze` (see `[purejaxrl/envs/factory.py](purejaxrl/envs/factory.py)`) |
+| `ENV_NAME`       | `ant_u_maze_single_goal` | Other ant mazes: `ant_u_maze`, `ant_big_maze`, `ant_hardest_maze`, `ant_long_maze` (see `[purejaxrl/envs/factory.py](purejaxrl/envs/factory.py)`) |
+| `LONG_MAZE_LENGTH_SCALE` | `1.0`            | `ant_long_maze` only: corridor length multiplier (e.g. `1.3` -> 30% longer, zig-zag repeated). Top-level in `ppo_lp_teacher*` and `ppo_uniform_teacher`; other scripts use `ENV_KWARGS={"long_maze_length_scale": 1.3}` |
 | `EPISODE_LENGTH` | `1000`                   | Max steps per episode                                                                                                            |
 | `NORMALIZE_ENV`  | `True`                   | Normalize observations and rewards                                                                                               |
 

@@ -1727,6 +1727,7 @@ def make_teacher_goal_set(config):
             U_MAZE_ALL_STATES,
             HARDEST_MAZE,
             HARDEST_MAZE_ALL_GOALS,
+            make_long_maze,
         )
 
         if "u_maze" in env_name:
@@ -1741,6 +1742,11 @@ def make_teacher_goal_set(config):
             maze_layout = HARDEST_MAZE
             all_goals_layout = HARDEST_MAZE_ALL_GOALS
             custom_goal = jnp.array([28.0, 40.0])
+        elif "long_maze" in env_name:
+            long_scale = float((config.get("ENV_KWARGS") or {}).get("long_maze_length_scale", 1.0))
+            maze_layout = make_long_maze(long_scale)
+            all_goals_layout = make_long_maze(long_scale, all_goals=True)
+            custom_goal = jnp.array([4.0, 20.0])
         else:
             raise ValueError(f"Unknown maze layout: {env_name}")
         min_x, max_x, min_y, max_y = get_maze_xy_bounds(maze_layout)
